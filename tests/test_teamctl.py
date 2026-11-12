@@ -1178,3 +1178,78 @@ def test_set_model_requires_confirmation_and_validates(tc):
         tc.ctl().call("set_model", target="be1", model="gpt-rahasia")
     with pytest.raises(tm.ToolError, match="tidak dikenal"):
         tc.ctl().call("set_model", target="siapa", model="td-normal")
+
+
+# =========================================================================== 18. share_skill / unshare_skill
+def _make_skill(tc, profile="be-be1", name="deploy", body="Langkah deploy.\n"):
+    d = tc.root / "profiles" / profile / "skills" / name
+    d.mkdir(parents=True)
+    (d / "SKILL.md").write_text(f"---\nname: {name}\ndescription: uji\n---\n{body}", encoding="utf-8")
+    for p in ("be-be1", "be-budi", "team-shared"):
+        (tc.root / "profiles" / p).mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def test_share_skill_fails_closed_when_scanner_unavailable(tc):
+    _make_skill(tc)
+    ctl = tc.ctl()
+    with pytest.raises((tm.ToolError, ht.TeamError)) as err:
+        ctl.call("share_skill", skill="deploy", from_member="be1", to=["budi"])
+    assert ctl.previews == []
+    assert "pemindai keamanan Hermes tidak memberi hasil" in str(err.value)
+    assert not (tc.root / "profiles" / "be-budi" / "skills" / "shared").exists()
+
+
+def test_share_skill_allow_unscanned_is_explicit_and_warned(tc):
+    _make_skill(tc)
+    ctl = tc.ctl()
+    out = ctl.call("share_skill", skill="deploy", from_member="be1", to=["budi"], allow_unscanned=True)
+    assert "PERHATIAN" in ctl.previews[0] and "tidak memberi hasil" in ctl.previews[0]
+    assert "budi" in out
+    assert any(p.name == "deploy" for p in (tc.root / "profiles" / "be-budi" / "skills").rglob("deploy"))
+
+
+def test_share_skill_blocks_owner_secret_even_with_allow_unscanned(tc):
+    _make_skill(tc, body="token: sup3r-secret-value-123\n")
+    (tc.root / "profiles" / "be-be1" / ".env").write_text("GH_PAT=sup3r-secret-value-123\n", encoding="utf-8")
+    ctl = tc.ctl()
+    with pytest.raises((tm.ToolError, ht.TeamError)) as err:
+        ctl.call("share_skill", skill="deploy", from_member="be1", to=["budi"], allow_unscanned=True)
+    assert "aman" in str(err.value) or "secret" in str(err.value).lower()
+    assert ctl.previews == []
+    assert "sup3r-secret-value-123" not in str(err.value)
+
+
+def test_share_skill_declined_installs_nothing_and_cleans_staging(tc):
+    _make_skill(tc)
+    ctl = tc.ctl(answer=False)
+    ctl.call("share_skill", skill="deploy", from_member="be1", to=["budi"], allow_unscanned=True)
+    assert not list((tc.root / "profiles" / "be-budi").rglob("deploy"))
+
+
+def test_share_skill_unknown_owner_and_empty_targets_rejected(tc):
+    ctl = tc.ctl()
+    refused(tc, ctl, "share_skill", skill="deploy", from_member="nobody", to=["budi"])
+    _make_skill(tc)
+    refused(tc, ctl, "share_skill", skill="deploy", from_member="be1", to=[], allow_unscanned=True)
+
+
+def test_share_skill_rejects_non_boolean_allow_unscanned(tc):
+    _make_skill(tc)
+    ctl = tc.ctl()
+    with pytest.raises((tm.ToolError, ht.TeamError)):
+        ctl.call("share_skill", skill="deploy", from_member="be1", to=["budi"], allow_unscanned="ya")
+    assert ctl.previews == []
+
+
+def test_unshare_skill_requires_confirmation(tc):
+    _make_skill(tc)
+    ctl = tc.ctl()
+    ctl.call("share_skill", skill="deploy", from_member="be1", to=["all"], allow_unscanned=True)
+    ctl2 = tc.ctl(answer=False)
+    ctl2.call("unshare_skill", skill="deploy")
+    assert ctl2.previews and "deploy" in ctl2.previews[0]
+    assert list((tc.root / "profiles" / "be-budi").rglob("deploy"))
+    ctl3 = tc.ctl()
+    ctl3.call("unshare_skill", skill="deploy")
+    assert not list((tc.root / "profiles" / "be-budi" / "skills").rglob("deploy"))

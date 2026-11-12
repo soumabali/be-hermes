@@ -173,6 +173,7 @@ TOOLS: list[dict] = [
                        "description": "daftar nama anggota, atau [\"all\"] untuk semua anggota + channel bersama, "
                                       "atau [\"shared\"] untuk channel bersama saja"},
                 "overwrite": {"type": "boolean", "description": "timpa kiriman lain dengan nama sama"},
+                "allow_unscanned": {"type": "boolean", "description": "izinkan skill yang TIDAK bisa dipindai pemindai Hermes (pemindai hilang/error). Skill yang dinilai berbahaya tetap ditolak."},
             },
             "required": ["skill", "from_member", "to"],
             "additionalProperties": False,
@@ -1346,6 +1347,7 @@ class TeamCtl:
         owner_name = str(args.get("from_member") or "").strip().lower()
         targets = [str(t) for t in (args.get("to") or [])]
         overwrite = bool(args.get("overwrite", False))
+        allow_unscanned = bool(args.get("allow_unscanned", False))
         box: dict = {}   # salinan staging dibuat SEKALI: yang dipindai = yang dikonfirmasi = yang dipasang
 
         def plan() -> Plan:
@@ -1358,7 +1360,8 @@ class TeamCtl:
                 raise ToolError("isi `to` (nama anggota, atau [\"all\"])")
             if "staged" not in box:
                 box["staged"] = ht.stage_skill(team, hermes, owner, skill)
-                box["report"] = ht.scan_skill(hermes, owner["profile"], box["staged"][1], skipped_symlinks=box["staged"][2])
+                box["report"] = ht.scan_skill(hermes, owner["profile"], box["staged"][1], skipped_symlinks=box["staged"][2],
+                                            allow_unscanned=allow_unscanned)
             staged, report = box["staged"], box["report"]
             skill_dir = staged[1]
             if report["problems"]:
@@ -1369,11 +1372,12 @@ class TeamCtl:
                 else ", ".join(_q(t, 41) for t in targets)
             preview = (f"Bagikan skill {_q(skill_dir.name, 80)} milik {_q(owner['display_name'], 64)} ({owner_name}) ke "
                        f"{who}. {len(report['files'])} file, {kb} KB, pemindai Hermes: {_clean(verdict, 40)}."
-                       + (" Kiriman lama bernama sama akan ditimpa." if overwrite else ""))
+                       + (" Kiriman lama bernama sama akan ditimpa." if overwrite else "")
+                       + (" PERHATIAN: dibagikan walau pemindai Hermes tidak memberi hasil." if allow_unscanned and verdict in ("unknown", "") else ""))
 
             def run() -> str:
                 result = ht.share_skill(team, hermes, skill, owner_name, targets, overwrite,
-                                        staged=staged, scan=report)
+                                        staged=staged, scan=report, allow_unscanned=allow_unscanned)
                 lines = [f"Skill '{result['skill']}' dari {result['from']} ({result['scope']}):"]
                 lines += [f"- {name}: {status}" for name, status in sorted(result["results"].items())]
                 lines.append("Penerima melihatnya di sesi baru (atau setelah /reload-skills), di kategori shared/.")
@@ -1435,7 +1439,9 @@ class TeamCtl:
             waiting = [Server.member_label(x) for x in members
                        if team["member_role"] in (x.get("roles") or []) and str(x["user"]["id"]) not in active
                        and not x["user"].get("bot")]
-            lines.append("Punya @backend tapi belum anggota aktif: " + (", ".join(waiting) if waiting else "-"))
+            lines.append("Punya @backend tapi belum anggota aktif: " + (", ".join(waiting) if waiting else "-")
+                         + (" (PERINGATAN: daftar anggota server terpotong, hasil mungkin tidak lengkap)"
+                            if getattr(members, "truncated", False) else ""))
             if team["entry_role"]:
                 entry = sum(1 for x in members if team["entry_role"] in (x.get("roles") or []))
                 lines.append(f"User ber-role entry (belum onboarding): {entry}")
@@ -1472,7 +1478,7 @@ class TeamCtl:
                         f"profile {existing['profile']} dengan memory & secret lamanya.")
             else:
                 preview_name = name or ht.derive_member_name(str(user.get("username") or ""), uid,
-                                                             {m["name"] for m in team["members"]})
+                                                             ht._taken_names(team, self.hermes()))
                 effective = model or (team["llm"]["default_model"] if team["llm"] else "-")
                 what = (f"Jadikan {label} anggota: channel privat #{team['channel_prefix']}{preview_name} (hanya dia + "
                         f"bot), profile {team['prefix']}{preview_name} (memory, .env, sandbox sendiri), model {effective}.")
