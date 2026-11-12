@@ -1,4 +1,5 @@
-"""Runtime bersama per proses (satu per state_dir): roster, state, rate limit, antrean, jembatan host."""
+"""Runtime bersama per proses (satu per state_dir): roster, state, rate limit, antrean, pelacak LLM,
+pembatas adaptif, metrik, anggaran token, jembatan host."""
 from __future__ import annotations
 
 import time
@@ -6,8 +7,10 @@ from pathlib import Path
 from typing import Any, Optional
 
 from . import shared
+from .budget import Budget
 from .ratelimit import AdmissionQueue, RateLimiter, TurnTracker
 from .roster import Roster, RosterCache
+from .scale import AdaptiveThrottle, LlmTracker, Metrics
 from .state import StateStore
 
 
@@ -19,6 +22,11 @@ class Runtime:
         self.limiter = RateLimiter()
         self.turns = TurnTracker()
         self.queue = AdmissionQueue()
+        self.clock: Any = time.monotonic         # jam untuk hook & pembatas (diganti jam tiruan di uji)
+        self.llm = LlmTracker()                  # panggilan LLM yang sedang berjalan (semua profile)
+        self.throttle = AdaptiveThrottle(lambda: self.clock())
+        self.metrics = Metrics()
+        self.budget = Budget(self.state_dir)
         self.started = time.monotonic()          # dipakai aturan "jangan restart berulang"
         self.host: Any = None                    # HostBridge, diisi saat adapter Discord tersambung
         self.detached: Any = None                # (native, adapter, loop) setelah plugin host di-unload

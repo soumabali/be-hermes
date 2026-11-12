@@ -71,6 +71,7 @@ def sub(plugin: types.ModuleType, name: str) -> types.ModuleType:
 VALID_HOOKS = {
     "pre_tool_call", "post_tool_call", "transform_terminal_output", "transform_tool_result",
     "transform_llm_output", "pre_llm_call", "post_llm_call", "pre_api_request", "post_api_request",
+    "api_request_error", "pre_auxiliary_call", "post_auxiliary_call",
     "on_session_start", "on_session_end", "on_session_finalize", "on_session_reset",
     "pre_gateway_dispatch", "post_gateway_admission", "gateway_platform_event", "pre_command",
 }
@@ -783,6 +784,64 @@ def fake_kit_main(argv: list[str], state_dir: str) -> None:
          channel_id=member.get("channel_id"), model=member.get("model", ""), notes=notes,
          restart_needed=False, live_changed=["gateway.profile_routes"], failures=failures)
     done(3 if failures else 0)
+
+
+# ----------------------------------------------------------------------------- buku besar pemakaian tiruan
+LEDGER_SCHEMA = """
+CREATE TABLE IF NOT EXISTS daily (
+    day TEXT NOT NULL, user_key TEXT NOT NULL, profile TEXT NOT NULL, model TEXT NOT NULL,
+    source TEXT NOT NULL DEFAULT '',
+    requests INTEGER NOT NULL DEFAULT 0, input_tokens INTEGER NOT NULL DEFAULT 0,
+    output_tokens INTEGER NOT NULL DEFAULT 0, cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_write_tokens INTEGER NOT NULL DEFAULT 0, reasoning_tokens INTEGER NOT NULL DEFAULT 0,
+    cost_usd REAL NOT NULL DEFAULT 0,
+    PRIMARY KEY (day, user_key, profile, model, source));
+"""
+
+
+def ledger_add(path: Path, day: str, user_key: str, input_tokens: int = 0, output_tokens: int = 0,
+               profile: str = "be-x", model: str = "td-simple") -> None:
+    """Tambah pemakaian ke buku besar tiruan (skema tabel `daily` sama dengan usage_ledger.py)."""
+    import sqlite3
+    path.parent.mkdir(parents=True, exist_ok=True)
+    con = sqlite3.connect(path)
+    try:
+        con.executescript(LEDGER_SCHEMA)
+        con.execute(
+            "INSERT INTO daily (day, user_key, profile, model, source, requests, input_tokens, output_tokens) "
+            "VALUES (?, ?, ?, ?, '', 1, ?, ?) ON CONFLICT(day, user_key, profile, model, source) DO UPDATE SET "
+            "requests = requests + 1, input_tokens = input_tokens + excluded.input_tokens, "
+            "output_tokens = output_tokens + excluded.output_tokens",
+            (day, str(user_key), profile, model, int(input_tokens), int(output_tokens)))
+        con.commit()
+    finally:
+        con.close()
+
+
+def api_request(ctx: "StubContext", request_id: str, session_id: str = "s", **extra: Any) -> None:
+    """Meniru agent/turn_api_request.py: hook pengamat sebelum request ke provider."""
+    ctx.fire("pre_api_request", **{**dict(
+        task_id="t", turn_id="turn", api_request_id=request_id, session_id=session_id, platform="discord",
+        model="td-simple", provider="custom:td", api_call_count=1, retry_count=0, message_count=3,
+        request={"method": "POST", "body": {}}), **extra})
+
+
+def api_response(ctx: "StubContext", request_id: str, session_id: str = "s", **extra: Any) -> None:
+    ctx.fire("post_api_request", **{**dict(
+        task_id="t", turn_id="turn", api_request_id=request_id, session_id=session_id, platform="discord",
+        model="td-simple", provider="custom:td", api_duration=1.0,
+        usage={"prompt_tokens": 10, "completion_tokens": 5}), **extra})
+
+
+def api_error(ctx: "StubContext", request_id: str, session_id: str = "s", status_code: Any = 429,
+              reason: Any = "rate_limit", error: Any = None, **extra: Any) -> None:
+    """Meniru agent/api_request_hooks.py::_invoke_api_request_error_hook."""
+    ctx.fire("api_request_error", **{**dict(
+        task_id="t", turn_id="turn", api_request_id=request_id, session_id=session_id, platform="discord",
+        model="td-simple", provider="custom:td", status_code=status_code, retry_count=0, max_retries=3,
+        retryable=True, reason=reason,
+        error=error if error is not None else {"type": "RateLimitError", "message": "Too Many Requests"},
+        request={"method": "POST", "body": {}}), **extra})
 
 
 # ----------------------------------------------------------------------------- lingkungan uji siap pakai

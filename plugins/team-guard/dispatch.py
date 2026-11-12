@@ -1,5 +1,5 @@
 """Hook `pre_gateway_dispatch`: gerbang akses (ditahan/nonaktif), penyamaran token di chat,
-rate limit per orang, dan antrean masuk.
+anggaran token, rate limit per orang, batas sesi per orang, dan antrean masuk yang adil.
 
 Hook ini didokumentasikan boleh `async` dan TIDAK dibatasi plugins.hook_callback_timeout
 (website/docs/user-guide/features/hooks.md → pre_gateway_dispatch), jadi menunda pesan di sini aman.
@@ -12,6 +12,7 @@ from typing import Any, Callable, Optional
 
 from .ratelimit import LoadProbe, wait_for_slot
 from .redact import scrub_tokens
+from .scale import as_int, effective_max_active
 from .shared import log, log_once
 
 REFUSE_WAIT = 45.0          # tunggu rate limit lebih lama dari ini → ditolak sopan
@@ -25,6 +26,25 @@ MSG_RATE = ("⏳ <@{uid}> kamu mengirim pesan terlalu cepat. Coba lagi dalam ±{
 MSG_QUEUE = "⏳ <@{uid}> semua slot Hermes sedang terpakai. Kamu di antrean nomor {pos}; pesanmu diproses otomatis."
 MSG_QUEUE_FULL = ("😔 <@{uid}> Hermes masih penuh setelah {wait} detik menunggu, jadi pesanmu tidak diproses. "
                   "Coba kirim lagi sebentar lagi.")
+MSG_QUEUE_BEHIND = ("⏳ <@{uid}> pesanmu yang sebelumnya masih di antrean; pesan ini menyusul setelahnya dan "
+                    "diproses otomatis.")
+MSG_QUEUE_CANCELLED = ("♻️ <@{uid}> Hermes sedang dimuat ulang, jadi pesanmu yang menunggu di antrean tidak "
+                       "diproses. Kirim ulang sebentar lagi.")
+MSG_USER_LIMIT = ("⏳ <@{uid}> kamu sudah punya {limit} sesi Hermes yang berjalan (batas per orang). Pesan ini "
+                  "diproses otomatis setelah salah satunya selesai.")
+MSG_USER_LIMIT_FULL = ("😔 <@{uid}> sesimu yang lain masih berjalan setelah {wait} detik menunggu, jadi pesan ini "
+                       "tidak diproses. Tunggu sampai selesai (atau `/stop` di thread-nya), lalu kirim lagi.")
+MSG_BUDGET_WARN = ("📊 <@{uid}> pemakaian token-mu hari ini sudah {pct}% dari jatah harian "
+                   "({used} dari {limit} token). Setelah 100% pesan baru ditolak sampai tengah malam.")
+MSG_BUDGET_OVER = ("🚫 <@{uid}> jatah token harianmu sudah habis ({used} dari {limit} token), jadi pesan ini "
+                   "tidak diproses. Jatah kembali penuh setelah tengah malam; admin tim bisa menambah kuota.")
+MSG_BUDGET_TEAM_OVER = ("🚫 <@{uid}> jatah token harian TIM sudah habis ({used} dari {limit} token), jadi pesan ini "
+                        "tidak diproses. Jatah kembali penuh setelah tengah malam.")
+ADMIN_BUDGET_OVER = ("📊 Jatah token harian <@{uid}> habis ({used} dari {limit} token). Pesan barunya ditolak "
+                     "sampai tengah malam. Tambah kuota lewat teamctl bila perlu.")
+ADMIN_BUDGET_TEAM_WARN = "📊 Pemakaian token tim hari ini sudah {pct}% dari anggaran ({used} dari {limit} token)."
+ADMIN_BUDGET_TEAM_OVER = ("📊 Anggaran token harian tim habis ({used} dari {limit} token). Pesan anggota ditolak "
+                          "sampai tengah malam.")
 MSG_SCRUB = ("🔒 <@{uid}> pesanmu memuat kredensial ({kinds}). Nilainya disamarkan sebelum sampai ke AI{deleted}. "
              "Simpan secret lewat `/env-set`, lalu sebut namanya saja (mis. `$GH_PAT`). "
              "Anggap token itu sudah bocor: ganti (rotate) sekarang.")
@@ -146,45 +166,177 @@ class Dispatcher:
         is_command = isinstance(text, str) and text.lstrip().startswith("/")
         if admin or is_command:
             return result
+        if not await self._within_budget(uid, source, gateway, roster):
+            self.rt.metrics.refuse("budget")
+            return {"action": "skip", "reason": "team-guard: anggaran token habis"}
         wait, ok = self.rt.limiter.reserve(uid, settings.get("rate_per_minute", 0), settings.get("burst", 1),
                                            self.clock(), REFUSE_WAIT)
         if not ok:
+            self.rt.metrics.refuse("rate")
             await self._say(gateway, source, "rate", MSG_RATE.format(
                 uid=uid, wait=int(wait + 0.999), rate=settings.get("rate_per_minute")))
             return {"action": "skip", "reason": "team-guard: rate limit"}
         if wait > 0:
             await self.sleep(wait)
-        if not await self._admit(uid, source, gateway, settings):
-            return {"action": "skip", "reason": "team-guard: antrean penuh"}
+        refused = await self._admit(uid, source, gateway, settings)
+        if refused:
+            return {"action": "skip", "reason": f"team-guard: {refused}"}
         return result
 
-    async def _admit(self, uid: str, source: Any, gateway: Any, settings: dict) -> bool:
+    # ------------------------------------------------------------------ anggaran token
+    async def _notify_admin(self, gateway: Any, text: str) -> None:
+        """Kabar ke #hermes-admin: lewat jembatan host bila ada, kalau tidak lewat adapter gateway."""
+        try:
+            host = self.rt.host
+            if host is not None:
+                await host.notify_admin(text)
+                return
+            roster = self.rt.roster()
+            if not roster.admin_channel or not roster.onboarding.get("admin_notices", True):
+                return
+            adapters = getattr(gateway, "adapters", None) or {}
+            adapter = next((a for p, a in adapters.items()
+                            if str(getattr(p, "value", p)).lower() == "discord"), None)
+            if adapter is not None:
+                await adapter.send(str(roster.admin_channel), text)
+        except Exception as exc:
+            log_once("dispatch-admin", "kabar ke channel admin gagal (%s: %s)", type(exc).__name__, exc)
+
+    async def _within_budget(self, uid: str, source: Any, gateway: Any, roster: Any) -> bool:
+        """False → pesan ditolak (jatah orang ini atau jatah tim habis). Buku besar tidak terbaca → True."""
+        verdict = self.rt.budget.check(roster, uid)
+        if verdict.team_warn:
+            await self._notify_admin(gateway, ADMIN_BUDGET_TEAM_WARN.format(
+                pct=int(100 * verdict.team_used / max(1, verdict.team_limit)), used=_n(verdict.team_used),
+                limit=_n(verdict.team_limit)))
+        if verdict.state == "warn":
+            await self._say(gateway, source, "budget-warn", MSG_BUDGET_WARN.format(
+                uid=uid, pct=int(100 * verdict.used / max(1, verdict.limit)), used=_n(verdict.used),
+                limit=_n(verdict.limit)))
+        elif verdict.state == "over":
+            await self._say(gateway, source, "budget", MSG_BUDGET_OVER.format(
+                uid=uid, used=_n(verdict.used), limit=_n(verdict.limit)))
+            if verdict.first:
+                await self._notify_admin(gateway, ADMIN_BUDGET_OVER.format(
+                    uid=uid, used=_n(verdict.used), limit=_n(verdict.limit)))
+        elif verdict.state == "team_over":
+            await self._say(gateway, source, "budget", MSG_BUDGET_TEAM_OVER.format(
+                uid=uid, used=_n(verdict.team_used), limit=_n(verdict.team_limit)))
+            if verdict.first:
+                await self._notify_admin(gateway, ADMIN_BUDGET_TEAM_OVER.format(
+                    used=_n(verdict.team_used), limit=_n(verdict.team_limit)))
+        return not verdict.refused
+
+    # ------------------------------------------------------------------ antrean
+    def _runner_count(self, gateway: Any) -> Optional[int]:
+        fn = getattr(gateway, "_running_agent_count", None)
+        if callable(fn):
+            try:
+                return int(fn())
+            except Exception:
+                return None
+        return None
+
+    def user_load(self, uid: str, gateway: Any, now: float) -> int:
+        """Sesi orang ini yang berjalan + yang baru diloloskan. Hitungan berjalan berasal dari hook
+        (`pre_llm_call` membawa `sender_id`), jadi hanya dipakai setelah hook terbukti hidup, dan tidak
+        pernah melebihi jumlah sesi gateway (mengoreksi hook yang bocor)."""
+        turns = self.rt.turns
+        running = 0
+        if turns.trusted():
+            running = turns.user_active(uid, now)
+            total = self._runner_count(gateway)
+            if total is not None:
+                running = min(running, total)
+        elif turns.starts > 0:
+            log_once("user-limit-unproven", "batas sesi per orang baru aktif penuh setelah hook on_session_end "
+                     "terlihat sekali; sampai itu hanya pesan yang baru diloloskan yang dihitung",
+                     level=20)
+        return running + turns.user_reserved(uid, now)
+
+    async def _admit(self, uid: str, source: Any, gateway: Any, settings: dict) -> str:
+        """"" = lolos; selain itu alasan penolakan (untuk `reason` hook)."""
         try:
             max_active = int(settings.get("max_active") or 0)
             max_wait = float(settings.get("queue_max_wait") or 0)
         except (TypeError, ValueError):
-            return True
-        if max_active <= 0 or self.probe(gateway, self.clock()) is None or self._session_running(gateway, source):
-            return True
-        turns, queue = self.rt.turns, self.rt.queue
-        chat = str(getattr(source, "chat_id", "") or "")
+            return ""
+        user_max, llm_max = as_int(settings.get("user_max_concurrent")), as_int(settings.get("max_llm_parallel"))
+        sessions_gated = max_active > 0 and self.probe(gateway, self.clock()) is not None
+        if not sessions_gated and user_max <= 0 and llm_max <= 0:
+            return ""
+        if self._session_running(gateway, source):
+            return ""
+        turns, queue, metrics = self.rt.turns, self.rt.queue, self.rt.metrics
+        # Thread = sesi sendiri (auto-thread Discord memberi tiap pesan baru thread_id baru), jadi kunci
+        # "pesan susulan" memakai thread bila ada. (Urutan pembuatan thread vs hook ini tidak terkonfirmasi
+        # dari sumber; tanpa thread_id perilakunya sama seperti sebelumnya: per channel.)
+        chat = str(getattr(source, "thread_id", None) or getattr(source, "chat_id", "") or "")
         if turns.holds(uid, chat, self.clock()):
-            return True                       # pesan beruntun ke sesi yang baru saja diloloskan
+            return ""                         # pesan beruntun ke sesi yang baru saja diloloskan
 
         def free() -> Optional[bool]:
             now = self.clock()
+            reserved = turns.reserved(now)
+            if llm_max > 0 and self.rt.llm.inflight(now) + reserved >= llm_max:
+                return False                  # panggilan LLM paralel (termasuk cron, /goal, subagent) penuh
+            if max_active <= 0:
+                return True
             load = self.probe(gateway, now)
-            return None if load is None else load + turns.reserved(now) < max_active
+            if load is None:
+                return True                   # beban sesi tidak terukur → hanya gerbang lain yang berlaku
+            return load + reserved < effective_max_active(self.rt, settings)
+
+        def blocked(who: str) -> bool:
+            return user_max > 0 and self.user_load(who, gateway, self.clock()) >= user_max
+
+        def on_wait(pos: int) -> Any:
+            if blocked(uid):
+                return self._say(gateway, source, "user-limit", MSG_USER_LIMIT.format(uid=uid, limit=user_max))
+            if queue.behind_own(ticket) > 0:
+                return self._say(gateway, source, "queue-behind", MSG_QUEUE_BEHIND.format(uid=uid))
+            return self._say(gateway, source, "queue", MSG_QUEUE.format(uid=uid, pos=pos))
 
         ticket = queue.enter(uid, self.clock())
         try:
-            admitted = await wait_for_slot(
-                queue, ticket, free=free, max_wait=max_wait, clock=self.clock, sleep=self.sleep,
-                on_wait=lambda pos: self._say(gateway, source, "queue", MSG_QUEUE.format(uid=uid, pos=pos)))
+            admitted = await wait_for_slot(queue, ticket, free=free, max_wait=max_wait, clock=self.clock,
+                                           sleep=self.sleep, on_wait=on_wait, blocked=blocked)
             if admitted:
-                turns.reserve(uid, self.clock(), chat)
-            else:
-                await self._say(gateway, source, "queue-full", MSG_QUEUE_FULL.format(uid=uid, wait=int(max_wait)))
-            return admitted
+                now = self.clock()
+                turns.reserve(uid, now, chat)
+                metrics.observe_wait(now, now - ticket.t0)
+                return ""
+            if ticket.cancelled:
+                await self._say(gateway, source, "queue-cancelled", MSG_QUEUE_CANCELLED.format(uid=uid))
+                return "antrean dibatalkan"
+            if blocked(uid):
+                metrics.refuse("user_concurrent")
+                await self._say(gateway, source, "user-limit-full",
+                                MSG_USER_LIMIT_FULL.format(uid=uid, wait=int(max_wait)))
+                return "batas sesi per orang"
+            metrics.refuse("queue_full")
+            await self._say(gateway, source, "queue-full", MSG_QUEUE_FULL.format(uid=uid, wait=int(max_wait)))
+            return "antrean penuh"
+        except asyncio.CancelledError:
+            # Gateway berhenti saat pesan ini masih menunggu: kabari pemiliknya sebisanya, lalu teruskan
+            # pembatalan apa adanya.
+            try:
+                await asyncio.wait_for(self._say(gateway, source, "queue-cancelled",
+                                                 MSG_QUEUE_CANCELLED.format(uid=uid)), 2.0)
+            except BaseException:
+                pass
+            raise
         finally:
             queue.leave(ticket)
+
+    def cancel_waiters(self) -> int:
+        """Plugin di-unload: semua penunggu berhenti dan mengabari pemiliknya (lihat `_admit`)."""
+        return len(self.rt.queue.cancel_all())
+
+
+def _n(value: Any) -> str:
+    """Angka token yang enak dibaca: 1.234.567."""
+    try:
+        return f"{int(value):,}".replace(",", ".")
+    except (TypeError, ValueError):
+        return str(value)

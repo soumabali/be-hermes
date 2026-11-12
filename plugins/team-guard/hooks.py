@@ -1,15 +1,17 @@
-"""Hook per profile: penyamaran output, saringan request model, guard perintah, petunjuk nama secret.
+"""Hook per profile: penyamaran output, saringan request model, guard perintah, petunjuk nama secret,
+pencatat giliran dan panggilan LLM (untuk antrean, pembatas adaptif, dan metrik), penjaga jadwal cron.
 
 Hook-hook ini berjalan di scope profile yang dirutekan (tiap profile memuat salinan plugin sendiri),
 jadi secret yang dipakai selalu milik profile itu saja.
 """
 from __future__ import annotations
 
-import time
 from typing import Any, Mapping, Optional
 
+from .cronguard import check_cron_call
 from .guard import check_tool_call
 from .redact import scrub_user_messages
+from .scale import is_rate_limit_error
 from .secrets import SecretStore
 from .shared import log_once
 
@@ -111,11 +113,22 @@ class ProfileHooks:
     # ------------------------------------------------------------------ guard
     def on_pre_tool_call(self, tool_name: Any = None, args: Any = None, **_kw: Any) -> Optional[dict]:
         roster = self.rt.roster()
-        if not roster.settings.get("block_env_dump", True):
-            return None
-        names = set(self.store.names()) | set(roster.reserved_env)
-        found = check_tool_call(tool_name, args, names)
-        return {"action": "block", "message": found} if found else None
+        if roster.settings.get("block_env_dump", True):
+            names = set(self.store.names()) | set(roster.reserved_env)
+            found = check_tool_call(tool_name, args, names)
+            if found:
+                return {"action": "block", "message": found}
+        # Jadwal cron terlalu rapat (tiap job = percakapan LLM di luar antrean). Profile admin dikecualikan.
+        if self.kind != "admin":
+            try:
+                found = check_cron_call(tool_name, args, roster.settings.get("cron_min_interval_minutes"))
+            except Exception as exc:
+                log_once("cron-guard", "penjaga jadwal cron gagal (%s: %s); panggilan diloloskan",
+                         type(exc).__name__, exc)
+                found = None
+            if found:
+                return {"action": "block", "message": found}
+        return None
 
     # ------------------------------------------------------------------ petunjuk
     def prompt_section(self, _session_info: Any = None) -> str:
@@ -142,8 +155,37 @@ class ProfileHooks:
             return None
         uid = str(sender_id or "")
         counted = not (uid and self.rt.roster().is_admin(uid))
-        self.rt.turns.start(str(session_id or ""), uid, time.monotonic(), counted=counted)
+        self.rt.turns.start(str(session_id or ""), uid, self.rt.clock(), counted=counted)
         return None
 
     def on_session_end(self, session_id: Any = None, **_kw: Any) -> None:
         self.rt.turns.end(str(session_id or ""))
+        self.rt.llm.end_session(session_id)       # panggilan yang tidak sempat "selesai" (giliran diinterupsi)
+
+    # ------------------------------------------------------------------ panggilan LLM (pengamat)
+    # Kwargs yang dipakai (website/docs/user-guide/features/hooks.md, agent/turn_api_request.py,
+    # agent/api_request_hooks.py): `api_request_id`, `session_id` di ketiga hook; `status_code`, `reason`
+    # (nilai FailoverReason, mis. "rate_limit"), dan `error` = {"type", "message"} di api_request_error.
+    # Nilai balik diabaikan Hermes. Panggilan bantu (judul, kompresi) memakai pre/post_auxiliary_call dan
+    # TIDAK dihitung di sini.
+    def on_pre_api_request(self, api_request_id: Any = None, session_id: Any = None, **_kw: Any) -> None:
+        try:
+            self.rt.llm.start(api_request_id, session_id, self.rt.clock())
+        except Exception as exc:
+            log_once("llm-track", "pelacak panggilan LLM gagal (%s: %s)", type(exc).__name__, exc)
+
+    def on_post_api_request(self, api_request_id: Any = None, session_id: Any = None, **_kw: Any) -> None:
+        try:
+            self.rt.llm.finish(api_request_id, session_id)
+        except Exception as exc:
+            log_once("llm-track", "pelacak panggilan LLM gagal (%s: %s)", type(exc).__name__, exc)
+
+    def on_api_request_error(self, api_request_id: Any = None, session_id: Any = None, status_code: Any = None,
+                             reason: Any = None, error: Any = None, **_kw: Any) -> None:
+        try:
+            self.rt.llm.finish(api_request_id, session_id)
+            if is_rate_limit_error(status_code, reason, error):
+                self.rt.metrics.hit_429(self.rt.clock())
+                self.rt.throttle.record_429()
+        except Exception as exc:
+            log_once("llm-track", "pelacak panggilan LLM gagal (%s: %s)", type(exc).__name__, exc)

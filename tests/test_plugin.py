@@ -36,6 +36,9 @@ statemod = S.sub(P, "state")
 shared = S.sub(P, "shared")
 commands = S.sub(P, "commands")
 runtime = S.sub(P, "runtime")
+scale = S.sub(P, "scale")
+budget = S.sub(P, "budget")
+cronguard = S.sub(P, "cronguard")
 
 SECRET = "s3cr3t-Value_42xyz"
 
@@ -1538,7 +1541,8 @@ class TestRosterAndState:
 
 # ============================================================================= register() per jenis profile
 EVERYWHERE = {"pre_gateway_dispatch", "pre_tool_call", "transform_terminal_output", "transform_tool_result",
-              "transform_llm_output", "pre_llm_call", "on_session_start", "on_session_end"}
+              "transform_llm_output", "pre_llm_call", "on_session_start", "on_session_end",
+              "pre_api_request", "post_api_request", "api_request_error"}
 
 
 class TestRegisterWiring:
@@ -1672,6 +1676,983 @@ class TestRegisterWiring:
 
         run(main())
         assert sum("Server Members Intent" in r.getMessage() for r in caplog.records) == 1
+
+
+# ============================================================================= skala lanjutan (RENCANA-SKALA)
+NOON = 1_800_000_000.0                                   # 2027-01-15 08:00 UTC; jauh dari tengah malam UTC
+TODAY = "2027-01-15"
+
+
+def thread_event(uid, parent, thread, text="halo", **kw):
+    """Pesan di thread (auto-thread Discord): chat = thread, induknya channel terdaftar."""
+    return event(uid, thread, text, parent_chat_id=parent, thread_id=thread, **kw)
+
+
+class ScaleBase:
+    """Dispatcher dengan jam tiruan yang juga dipakai hook (rt.clock) dan anggaran (jam dinding)."""
+
+    @pytest.fixture
+    def d(self, env):
+        self.env = env
+        self.clock = S.Clock()
+        self.rt = env.rt()
+        self.rt.clock = self.clock
+        self.rt.budget.wall = lambda: NOON + (self.clock.now - 1000.0)
+        self.collects = []
+        self.rt.budget.spawn = lambda argv, environ: self.collects.append(argv)
+        self.rt.dispatcher = dispatch.Dispatcher(self.rt, clock=self.clock, sleep=self.clock.sleep)
+        self.started = []
+        return self.rt.dispatcher
+
+    def prime(self):
+        """Hook giliran terbukti hidup (satu giliran sudah mulai dan selesai)."""
+        self.rt.turns.start("s-prime", "0", self.clock())
+        self.rt.turns.end("s-prime")
+
+    def go(self, d, ev):
+        return run(d.handle(event=ev, gateway=self.env.runner, session_store=None))
+
+    def said(self, chat=None):
+        return [m["content"] for m in self.env.adapter.sent if chat is None or m["chat_id"] == chat]
+
+    def admin_said(self):
+        return self.said(S.CH_ADMIN)
+
+    async def turn(self, d, ev, sid):
+        """Satu pesan: lewat gerbang, lalu (bila lolos) gilirannya mulai seperti di gateway."""
+        got = await d.handle(event=ev, gateway=self.env.runner, session_store=None)
+        if got is None:
+            self.env.runner._running_agents[self.env.runner._session_key_for_source(ev.source)] = sid
+            self.rt.turns.start(sid, ev.source.user_id, self.clock())
+            self.started.append(sid)
+        return got
+
+    def finish(self, sid):
+        runner = self.env.runner
+        for key in [k for k, v in runner._running_agents.items() if v == sid]:
+            del runner._running_agents[key]
+        self.rt.turns.end(sid)
+
+    @staticmethod
+    async def spin(rounds=30):
+        for _ in range(rounds):
+            await asyncio.sleep(0)
+
+
+class TestPerUserTurns:
+    def test_counts_per_user(self):
+        t = ratelimit.TurnTracker(reserve_ttl=30, turn_ttl=100)
+        t.start("s1", "a", 0.0)
+        t.start("s2", "a", 1.0)
+        t.start("s3", "b", 2.0)
+        t.reserve("a", 3.0, "t9")
+        assert t.user_active("a", 5.0) == 2 and t.user_active("b", 5.0) == 1 and t.user_active("c", 5.0) == 0
+        assert t.user_reserved("a", 5.0) == 1 and t.user_reserved("b", 5.0) == 0
+        assert t.by_user(5.0) == {"a": 2, "b": 1}
+        t.end("s1")
+        assert t.user_active("a", 5.0) == 1 and t.user_reserved("a", 40.0) == 0
+        assert t.user_active("a", 200.0) == 0 and t.by_user(200.0) == {}        # giliran basi kedaluwarsa
+
+    def test_user_id_prefix_is_not_confused(self):
+        t = ratelimit.TurnTracker()
+        t.reserve("12", 0.0, "c")
+        assert t.user_reserved("1", 1.0) == 0 and t.user_reserved("12", 1.0) == 1
+
+
+class TestFairQueue:
+    def test_one_global_position_per_user(self):
+        q = ratelimit.AdmissionQueue()
+        a1, a2, a3 = q.enter("a", 0), q.enter("a", 1), q.enter("a", 2)
+        b1 = q.enter("b", 3)
+        assert [q.position(t) for t in (a1, a2, a3, b1)] == [1, 1, 1, 2]
+        assert q.is_head(a1) and not q.is_head(a2) and not q.is_head(b1)
+        assert [q.behind_own(t) for t in (a1, a2, a3, b1)] == [0, 1, 2, 0]
+        assert len(q) == 4 and q.users() == 2
+
+    def test_user_goes_to_the_back_after_its_head_ticket_leaves(self):
+        q = ratelimit.AdmissionQueue()
+        a1, a2 = q.enter("a", 0), q.enter("a", 1)
+        b1 = q.enter("b", 2)
+        q.leave(a1)
+        assert q.is_head(b1) and not q.is_head(a2) and q.position(a2) == 2
+        q.leave(b1)
+        assert q.is_head(a2)
+        q.leave(a2)
+        assert len(q) == 0 and q.users() == 0 and q.position(a2) == 0
+        q.leave(a2)                                                          # keluar dua kali tidak apa-apa
+
+    def test_leaving_from_the_middle_keeps_the_turn(self):
+        q = ratelimit.AdmissionQueue()
+        a1, a2 = q.enter("a", 0), q.enter("a", 1)
+        b1 = q.enter("b", 2)
+        q.leave(a2)
+        assert q.is_head(a1) and q.position(b1) == 2
+
+    def test_blocked_user_is_skipped_but_keeps_place(self):
+        q = ratelimit.AdmissionQueue()
+        a1, b1, c1 = q.enter("a", 0), q.enter("b", 1), q.enter("c", 2)
+        blocked = {"a"}
+        fn = lambda uid: uid in blocked                                      # noqa: E731
+        assert not q.is_head(a1, fn) and q.is_head(b1, fn) and not q.is_head(c1, fn)
+        assert q.position(b1, fn) == 1 and q.position(c1, fn) == 2
+        blocked.clear()
+        assert q.is_head(a1, fn) and not q.is_head(b1, fn)
+
+    def test_cancel_all_marks_every_ticket(self):
+        q = ratelimit.AdmissionQueue()
+        tickets = [q.enter("a", 0), q.enter("a", 1), q.enter("b", 2)]
+        assert q.cancel_all() == tickets and all(t.cancelled for t in tickets)
+
+    def test_cancelled_ticket_stops_waiting(self):
+        clock = S.Clock()
+        q = ratelimit.AdmissionQueue()
+
+        async def main():
+            ticket = q.enter("u", clock())
+            task = asyncio.ensure_future(ratelimit.wait_for_slot(q, ticket, free=lambda: False, max_wait=500,
+                                                                 clock=clock, sleep=clock.sleep))
+            await asyncio.sleep(0)
+            q.cancel_all()
+            return await task
+
+        assert run(main()) is False and clock.now - 1000 < 5
+
+
+class TestPerUserConcurrency(ScaleBase):
+    def test_four_threads_two_run_two_wait_and_others_are_served(self, d):
+        self.env.set("settings", user_max_concurrent=2, max_active=8, rate_per_minute=0)
+        self.prime()
+
+        async def main():
+            tasks = [asyncio.ensure_future(self.turn(d, thread_event(S.U_BUDI, S.CH_BUDI, f"70{i}"), f"s{i}"))
+                     for i in range(4)]
+            await self.spin()
+            assert self.started == ["s0", "s1"] and len(self.rt.queue) == 2
+            assert self.rt.queue.users() == 1                               # satu posisi global, bukan dua
+            assert await self.turn(d, thread_event(S.U_BE1, S.CH_BE1, "801"), "o1") is None   # orang lain langsung
+            assert self.rt.turns.user_active(S.U_BUDI, self.clock()) == 2
+            self.finish("s0")
+            await self.spin()
+            assert self.started == ["s0", "s1", "o1", "s2"] and len(self.rt.queue) == 1
+            self.finish("s1")
+            assert await asyncio.gather(*tasks) == [None] * 4
+            assert self.started[-1] == "s3"
+
+        run(main())
+        notices = [s for s in self.said() if "batas per orang" in s]
+        assert len(notices) == 1 and f"<@{S.U_BUDI}>" in notices[0] and "2 sesi" in notices[0]
+
+    def test_wait_past_max_wait_is_politely_refused(self, d):
+        self.env.set("settings", user_max_concurrent=1, max_active=8, queue_max_wait=180, rate_per_minute=0)
+        self.prime()
+
+        async def main():
+            assert await self.turn(d, thread_event(S.U_BUDI, S.CH_BUDI, "701"), "s1") is None
+            return await self.turn(d, thread_event(S.U_BUDI, S.CH_BUDI, "702"), "s2")
+
+        got = run(main())
+        assert got == {"action": "skip", "reason": "team-guard: batas sesi per orang"}
+        assert 180 <= self.clock.now - 1000 <= 182 and any("sesimu yang lain masih berjalan" in s for s in self.said())
+        assert self.rt.metrics.refused == {"rate": 0, "queue_full": 0, "budget": 0, "user_concurrent": 1}
+        assert len(self.rt.queue) == 0
+
+    def test_freshly_admitted_messages_count_before_their_turn_starts(self, d):
+        """Dua pesan diloloskan tetapi gilirannya belum mulai (reservasi) → pesan ketiga sudah menunggu."""
+        self.env.set("settings", user_max_concurrent=2, max_active=8, queue_max_wait=5, rate_per_minute=0)
+        results = [self.go(d, thread_event(S.U_BUDI, S.CH_BUDI, f"70{i}")) for i in range(3)]
+        assert results[:2] == [None, None] and results[2]["reason"].endswith("batas sesi per orang")
+
+    def test_followup_to_running_session_and_commands_and_admin_bypass(self, d):
+        self.env.set("settings", user_max_concurrent=1, max_active=8, queue_max_wait=180, rate_per_minute=0)
+        self.prime()
+
+        async def main():
+            first = thread_event(S.U_BUDI, S.CH_BUDI, "701")
+            assert await self.turn(d, first, "s1") is None
+            assert await d.handle(event=thread_event(S.U_BUDI, S.CH_BUDI, "701", "lanjut"),
+                                  gateway=self.env.runner) is None            # sesi yang sama
+            assert await d.handle(event=thread_event(S.U_BUDI, S.CH_BUDI, "702", "/stop"),
+                                  gateway=self.env.runner) is None
+            for i in range(5):
+                assert await d.handle(event=thread_event(S.ADMIN, S.CH_ADMIN, f"90{i}"),
+                                      gateway=self.env.runner) is None
+
+        run(main())
+        assert self.clock.slept == [] and self.said() == []
+
+    def test_works_without_global_session_cap(self, d):
+        self.env.set("settings", user_max_concurrent=1, max_active=0, queue_max_wait=3, rate_per_minute=0)
+        self.prime()
+
+        async def main():
+            assert await self.turn(d, thread_event(S.U_BUDI, S.CH_BUDI, "701"), "s1") is None
+            return await self.turn(d, thread_event(S.U_BUDI, S.CH_BUDI, "702"), "s2")
+
+        assert run(main())["action"] == "skip"
+
+    def test_old_roster_without_the_setting_has_no_per_user_cap(self, d):
+        self.env.set("settings", rate_per_minute=0)
+        assert "user_max_concurrent" not in self.env.roster["settings"]
+        self.prime()
+
+        async def main():
+            return [await self.turn(d, thread_event(S.U_BUDI, S.CH_BUDI, f"70{i}"), f"s{i}") for i in range(6)]
+
+        assert run(main()) == [None] * 6 and self.clock.slept == []
+
+    def test_leaked_hook_counts_are_corrected_by_gateway(self, d):
+        """on_session_end tidak terpanggil untuk sebagian sesi → hitungan hook bocor; gateway mengoreksi."""
+        self.env.set("settings", user_max_concurrent=1, max_active=8, queue_max_wait=3, rate_per_minute=0)
+        self.prime()
+        self.rt.turns.start("bocor", S.U_BUDI, self.clock())
+        assert self.env.runner._running_agent_count() == 0
+        assert self.go(d, thread_event(S.U_BUDI, S.CH_BUDI, "701")) is None
+
+    def test_per_user_cap_waits_for_proof_that_hooks_fire(self, d, caplog):
+        """Sebelum on_session_end pernah terlihat, hitungan hook tidak dipercaya (gagal-terbuka)."""
+        self.env.set("settings", user_max_concurrent=1, max_active=8, queue_max_wait=3, rate_per_minute=0)
+        self.rt.turns.start("s-lama", S.U_BUDI, self.clock() - 100)
+        self.env.runner._running_agents["x"] = "s-lama"
+        with caplog.at_level(logging.INFO, logger="team-guard"):
+            assert self.go(d, thread_event(S.U_BUDI, S.CH_BUDI, "701")) is None
+        assert sum("batas sesi per orang baru aktif penuh" in r.getMessage() for r in caplog.records) == 1
+
+
+class TestFairDispatch(ScaleBase):
+    def test_flooder_gets_one_slot_per_round(self, d):
+        self.env.set("settings", max_active=1, queue_max_wait=600, rate_per_minute=0)
+        self.prime()
+        self.env.runner._running_agents["lain"] = "x"
+        self.rt.turns.start("x", "9", self.clock())
+
+        async def main():
+            tasks = [asyncio.ensure_future(self.turn(d, thread_event(S.U_BUDI, S.CH_BUDI, f"70{i}"), f"b{i}"))
+                     for i in range(3)]
+            await self.spin(5)
+            tasks.append(asyncio.ensure_future(self.turn(d, thread_event(S.U_BE1, S.CH_BE1, "801"), "o1")))
+            await self.spin()
+            assert self.started == [] and len(self.rt.queue) == 4 and self.rt.queue.users() == 2
+            self.finish("x")
+            for _ in range(4):
+                await self.spin()
+                if self.started:
+                    self.finish(self.started[-1])
+            await asyncio.gather(*tasks)
+
+        run(main())
+        assert self.started == ["b0", "o1", "b1", "b2"]                     # bukan b0, b1, b2, o1
+        assert sum("antrean nomor 1" in s for s in self.said()) == 1
+        assert sum("antrean nomor 2" in s for s in self.said()) == 1
+        assert sum("menyusul setelahnya" in s for s in self.said()) == 1
+
+    def test_unload_cancels_waiters_and_tells_them_to_resend(self, env):
+        async def main():
+            ctx = env.register("default")
+            rt = env.rt()
+            env.set("settings", max_active=1, queue_max_wait=600, rate_per_minute=0)
+            env.runner._running_agents["lain"] = "x"
+            hook = ctx.hooks["pre_gateway_dispatch"][0]
+            rt.dispatcher.sleep = S.fast_sleep
+            tasks = [asyncio.ensure_future(hook(event=thread_event(uid, ch, t), gateway=env.runner))
+                     for uid, ch, t in ((S.U_BUDI, S.CH_BUDI, "701"), (S.U_BUDI, S.CH_BUDI, "702"),
+                                        (S.U_BE1, S.CH_BE1, "801"))]
+            await asyncio.sleep(0.02)
+            assert len(rt.queue) == 3
+            ctx.unload_callbacks[0]()                                        # reload-plugins / gateway berhenti
+            return await asyncio.wait_for(asyncio.gather(*tasks), 2)
+
+        results = run(main())
+        assert all(r == {"action": "skip", "reason": "team-guard: antrean dibatalkan"} for r in results)
+        resend = [m for m in env.adapter.sent if "Kirim ulang" in m["content"]]
+        assert {m["metadata"]["thread_id"] for m in resend} == {"701", "801"}  # satu kabar per orang (dibatasi)
+        assert env.rt().metrics.refused["queue_full"] == 0
+
+    def test_task_cancellation_at_shutdown_still_tells_the_user(self, d):
+        self.env.set("settings", max_active=1, queue_max_wait=600, rate_per_minute=0)
+        self.env.runner._running_agents["lain"] = "x"
+
+        async def main():
+            task = asyncio.ensure_future(d.handle(event=thread_event(S.U_BUDI, S.CH_BUDI, "701"),
+                                                  gateway=self.env.runner))
+            await self.spin(5)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        run(main())
+        assert any("Kirim ulang" in s for s in self.said()) and len(self.rt.queue) == 0
+
+
+class TestLlmTracker:
+    def test_inflight_and_peak(self):
+        t = scale.LlmTracker(ttl=600, peak_window=300)
+        t.start("r1", "s1", 0.0)
+        t.start("r2", "s1", 1.0)
+        t.start("r3", "s2", 2.0)
+        assert t.inflight(3.0) == 3 and t.peak(3.0) == 3
+        t.finish("r1", "s1")
+        t.finish("r2", "s1")
+        assert t.inflight(4.0) == 1 and t.peak(4.0) == 3
+        assert t.peak(400.0) == 1                                            # puncak lama keluar dari jendela
+        t.finish("r3", "s2")
+        assert t.inflight(401.0) == 0 and (t.started, t.finished) == (3, 3)
+
+    def test_same_request_id_is_counted_once(self):
+        t = scale.LlmTracker()
+        t.start("r1", "s", 0.0)
+        t.start("r1", "s", 1.0)
+        assert t.inflight(2.0) == 1
+
+    def test_lost_finish_expires_or_is_cleared_at_session_end(self):
+        t = scale.LlmTracker(ttl=600)
+        t.start("r1", "s1", 0.0)
+        t.start("r2", "s2", 0.0)
+        t.end_session("s1")
+        assert t.inflight(1.0) == 1 and t.inflight(601.0) == 0
+        t.end_session("")
+        t.end_session(None)
+
+    def test_missing_or_unknown_ids_do_not_leak(self):
+        t = scale.LlmTracker()
+        t.start(None, "s1", 0.0)
+        t.start("", "s1", 1.0)
+        assert t.inflight(2.0) == 2
+        t.finish(None, "s1")
+        t.finish("tak-dikenal", "s1")                                       # lepaskan panggilan anonim tertua
+        assert t.inflight(3.0) == 0
+        t.finish("tak-dikenal", "s1")                                       # tidak ada apa-apa → tidak galat
+        t.start("r9", "s2", 4.0)
+        t.finish("tak-dikenal", "s2")                                       # ID dikenal lain tidak ikut dilepas
+        assert t.inflight(5.0) == 1
+
+    @pytest.mark.parametrize("kw,expected", [
+        ({"status_code": 429}, True), ({"status_code": "429"}, True), ({"status_code": 500}, False),
+        ({"reason": "rate_limit"}, True), ({"reason": "upstream_rate_limit"}, True),
+        ({"reason": types.SimpleNamespace(value="rate_limit")}, True), ({"reason": "overloaded"}, False),
+        ({"error": {"type": "RateLimitError", "message": "x"}}, True),
+        ({"error": {"type": "rate_limit_error"}}, True), ({"error": {"type": "APITimeoutError"}}, False),
+        ({"error": "RateLimitError"}, False), ({}, False), ({"status_code": None, "reason": None, "error": None}, False),
+    ])
+    def test_rate_limit_detection(self, kw, expected):
+        assert scale.is_rate_limit_error(**kw) is expected
+
+
+class TestLlmGate(ScaleBase):
+    def test_hooks_track_calls_from_every_profile_including_cron(self, d):
+        host, member = self.env.register("default"), self.env.register("be-budi")
+        S.api_request(member, "r1", "s1")
+        S.api_request(host, "r2", "cron_42", platform="cron")                # cron tidak lewat pre_gateway_dispatch
+        S.api_request(member, "r3", "s1")
+        assert self.rt.llm.inflight(self.clock()) == 3
+        S.api_response(member, "r1", "s1")
+        S.api_error(host, "r2", "cron_42", status_code=500, reason="server_error",
+                    error={"type": "InternalServerError", "message": "x"})
+        assert self.rt.llm.inflight(self.clock()) == 1 and self.rt.metrics.hits_last_minute(self.clock()) == 0
+        member.fire("on_session_end", session_id="s1", completed=False, interrupted=True, model="m",
+                    platform="discord")
+        assert self.rt.llm.inflight(self.clock()) == 0                       # r3 tidak pernah "selesai"
+
+    def test_llm_parallel_limit_closes_the_gate_until_a_call_finishes(self, d):
+        self.env.set("settings", max_llm_parallel=2, max_active=8, queue_max_wait=600, rate_per_minute=0)
+        ctx = self.env.register("team-shared")
+        S.api_request(ctx, "r1", "cron_1", platform="cron")
+        S.api_request(ctx, "r2", "cron_2", platform="cron")
+
+        async def main():
+            task = asyncio.ensure_future(d.handle(event=thread_event(S.U_BUDI, S.CH_BUDI, "701"),
+                                                  gateway=self.env.runner))
+            await self.spin()
+            assert not task.done() and len(self.rt.queue) == 1
+            S.api_response(ctx, "r1", "cron_1")
+            return await task
+
+        assert run(main()) is None and "semua slot Hermes sedang terpakai" in self.said()[0]
+
+    def test_llm_gate_works_when_sessions_cannot_be_measured(self, d):
+        self.env.set("settings", max_llm_parallel=1, max_active=8, queue_max_wait=4, rate_per_minute=0)
+        ctx = self.env.register("team-shared")
+        S.api_request(ctx, "r1", "cron_1")
+        bare = types.SimpleNamespace(adapters=self.env.runner.adapters)       # tanpa _running_agent_count
+        got = run(d.handle(event=thread_event(S.U_BUDI, S.CH_BUDI, "701"), gateway=bare))
+        assert got["reason"].endswith("antrean penuh") and self.rt.metrics.refused["queue_full"] == 1
+        S.api_response(ctx, "r1", "cron_1")
+        assert run(d.handle(event=thread_event(S.U_BUDI, S.CH_BUDI, "702"), gateway=bare)) is None
+
+    def test_admitted_but_not_started_turns_count_against_the_limit(self, d):
+        self.env.set("settings", max_llm_parallel=1, max_active=8, queue_max_wait=3, rate_per_minute=0)
+        assert self.go(d, thread_event(S.U_BUDI, S.CH_BUDI, "701")) is None
+        assert self.go(d, thread_event(S.U_BE1, S.CH_BE1, "801"))["action"] == "skip"
+
+    def test_broken_tracker_never_breaks_the_agent(self, d, caplog):
+        ctx = self.env.register("be-budi")
+        self.rt.llm = None
+        with caplog.at_level(logging.WARNING, logger="team-guard"):
+            S.api_request(ctx, "r1")
+            S.api_response(ctx, "r1")
+            S.api_error(ctx, "r1")
+        assert sum("pelacak panggilan LLM gagal" in r.getMessage() for r in caplog.records) == 1
+
+
+class TestAdaptiveThrottle:
+    def make(self, **kw):
+        clock = S.Clock(0.0)
+        return clock, scale.AdaptiveThrottle(clock, **kw)
+
+    def hits(self, clock, th, n, gap=1.0):
+        for _ in range(n):
+            th.record_429()
+            clock.advance(gap)
+
+    def test_two_errors_do_nothing_and_three_halve_the_cap(self):
+        clock, th = self.make()
+        self.hits(clock, th, 2)
+        assert th.effective(8) == 8 and not th.throttled and th.drain() == []
+        self.hits(clock, th, 1)
+        assert th.effective(8) == 4 and th.throttled
+        assert th.drain() == [{"kind": "throttled", "configured": 8, "hits": 3, "cap": 4}]
+
+    def test_errors_spread_over_more_than_a_minute_do_not_count(self):
+        clock, th = self.make()
+        self.hits(clock, th, 5, gap=31.0)
+        assert th.effective(8) == 8 and th.drain() == []
+
+    def test_keeps_halving_to_a_floor_of_one_with_one_notice_per_episode(self):
+        clock, th = self.make()
+        seen = []
+        for _ in range(5):
+            self.hits(clock, th, 3)
+            seen.append(th.effective(8))
+        assert seen == [4, 2, 1, 1, 1]
+        assert [e["kind"] for e in th.drain()] == ["throttled"]
+
+    def test_same_errors_are_not_counted_twice(self):
+        clock, th = self.make()
+        self.hits(clock, th, 3)
+        assert [th.effective(8) for _ in range(10)] == [4] * 10
+
+    def test_recovers_by_one_per_minute_after_two_quiet_minutes(self):
+        clock, th = self.make()
+        self.hits(clock, th, 3, gap=0.0)
+        assert th.effective(8) == 4
+        clock.advance(119)
+        assert th.effective(8) == 4
+        clock.advance(1)                                                     # 120 dtk tanpa 429
+        assert th.effective(8) == 5
+        clock.advance(59)
+        assert th.effective(8) == 5
+        clock.advance(1)
+        assert th.effective(8) == 6
+        clock.advance(60)
+        assert th.effective(8) == 7 and th.throttled
+        clock.advance(60)
+        assert th.effective(8) == 8 and not th.throttled
+        assert [e["kind"] for e in th.drain()] == ["throttled", "recovered"]
+        clock.advance(600)
+        assert th.effective(8) == 8 and th.drain() == []
+
+    def test_a_single_error_during_recovery_pauses_the_climb(self):
+        clock, th = self.make()
+        self.hits(clock, th, 3, gap=0.0)
+        th.effective(8)
+        clock.advance(120)
+        assert th.effective(8) == 5
+        th.record_429()
+        clock.advance(100)
+        assert th.effective(8) == 5
+        clock.advance(20)
+        assert th.effective(8) == 6
+
+    def test_new_episode_after_recovery_notifies_again(self):
+        clock, th = self.make()
+        self.hits(clock, th, 3, gap=0.0)
+        assert th.effective(2) == 1
+        clock.advance(120)
+        assert th.effective(2) == 2
+        self.hits(clock, th, 3, gap=0.0)
+        assert th.effective(2) == 1
+        assert [e["kind"] for e in th.drain()] == ["throttled", "recovered", "throttled"]
+
+    def test_disabled_or_unlimited_or_minimal_cap_is_left_alone(self):
+        clock, th = self.make()
+        self.hits(clock, th, 9, gap=0.0)
+        assert th.effective(8, enabled=False) == 8 and th.effective(0) == 0
+        assert th.effective(8) == 8                                          # 429 lama dibuang saat nonaktif
+        self.hits(clock, th, 3, gap=0.0)
+        assert th.effective(1) == 1 and not th.throttled and th.drain() == []
+
+    def test_lowered_configuration_ends_the_episode(self):
+        clock, th = self.make()
+        self.hits(clock, th, 3, gap=0.0)
+        assert th.effective(8) == 4
+        assert th.effective(3) == 3 and not th.throttled
+
+
+class TestAdaptiveThrottleWiring(ScaleBase):
+    def test_429s_from_hooks_lower_the_admission_cap(self, d):
+        self.env.set("settings", adaptive_throttle=True, max_active=4, queue_max_wait=5, rate_per_minute=0)
+        ctx = self.env.register("be-budi")
+        self.prime()
+        self.env.runner._running_agents.update(a="x", b="y")
+        for sid in "xy":
+            self.rt.turns.start(sid, "9", self.clock())
+        assert self.go(d, thread_event(S.U_BUDI, S.CH_BUDI, "701")) is None   # 2 dari 4 terpakai → lolos
+        self.clock.advance(31)                                               # reservasinya kedaluwarsa
+        for i in range(3):
+            S.api_request(ctx, f"r{i}")
+            S.api_error(ctx, f"r{i}")
+        assert self.rt.metrics.hits_last_minute(self.clock()) == 3 and self.rt.llm.inflight(self.clock()) == 0
+        got = self.go(d, thread_event(S.U_BUDI, S.CH_BUDI, "702"))            # batas efektif kini 2
+        assert got["action"] == "skip" and scale.effective_max_active(self.rt, self.rt.roster().settings) == 2
+
+    def test_off_by_default(self, d):
+        self.env.set("settings", max_active=4, rate_per_minute=0)
+        ctx = self.env.register("be-budi")
+        for i in range(10):
+            S.api_error(ctx, f"r{i}")
+        assert scale.effective_max_active(self.rt, self.rt.roster().settings) == 4
+        assert self.rt.metrics.hits_last_minute(self.clock()) == 10          # tetap terlihat di metrik
+
+    def test_non_rate_limit_errors_are_ignored(self, d):
+        self.env.set("settings", adaptive_throttle=True, max_active=4)
+        ctx = self.env.register("be-budi")
+        for i in range(10):
+            S.api_error(ctx, f"r{i}", status_code=503, reason="overloaded", error={"type": "APIError"})
+        assert scale.effective_max_active(self.rt, self.rt.roster().settings) == 4
+
+
+class TestCronGuard:
+    @pytest.mark.parametrize("schedule,minutes", [
+        ("5m", 5), ("30m", 30), ("every 2h", 120), ("every hour", 60), ("every 10 minutes", 10), ("EVERY 1 min", 1),
+        ("1d", 1440), ("every day", 1440), ("every 90 mins", 90), ("2 hrs", 120),
+        ("* * * * *", 1), ("*/5 * * * *", 5), ("*/15 * * * *", 15), ("0 * * * *", 60), ("0 9 * * *", 1440),
+        ("0,30 * * * *", 30), ("0 */2 * * *", 120), ("0-10 9 * * 1-5", 1), ("5,10 9,10 * * *", 5),
+        ("58 * * * *", 60), ("*/45 * * * *", 15), ("0 9,21 * * *", 720), ("0 9 * JAN-MAR MON-FRI", 1440),
+        ("10/20 * * * *", 20), ("0 0 1 * *", 1440),
+        ("every monday 9am", 1440), ("weekdays at 9am", 1440), ("every day at 9am", 1440),
+        ("every monday, wednesday at 9am", 1440),
+        ("*/5 * * * * */10", pytest.approx(10 / 60)), ("0 9 * * * 0", 1440),
+    ])
+    def test_recurring_intervals(self, schedule, minutes):
+        assert cronguard.schedule_interval_minutes(schedule) == minutes
+
+    @pytest.mark.parametrize("schedule", ["in 30m", "in 2h", "2026-06-01T09:00:00", "2026-06-01 09:00"])
+    def test_one_shots_are_never_too_frequent(self, schedule):
+        assert cronguard.schedule_interval_minutes(schedule) == float("inf")
+
+    @pytest.mark.parametrize("schedule", ["", "   ", None, 15, "sesekali saja", "every now and then", "in a while",
+                                          "*/0 * * * *", "61 * * * *", "MON * * * *", "5-1 * * * *",
+                                          "* * * * * * *", "every monday"])
+    def test_unparseable_schedules_return_none(self, schedule):
+        assert cronguard.schedule_interval_minutes(schedule) is None
+
+    def test_check_blocks_only_too_frequent_create_or_update(self):
+        check = cronguard.check_cron_call
+        msg = check("cronjob_manage", {"action": "create", "schedule": "*/5 * * * *", "prompt": "cek"}, 15)
+        assert "tiap ±5 menit" in msg and "15 menit" in msg
+        assert check("cronjob_manage", {"action": "update", "job_id": "j1", "schedule": "every 1m"}, 15)
+        assert "detik" in check("cronjob_manage", {"action": "create", "schedule": "* * * * * */10"}, 15)
+        assert check("cronjob_manage", {"action": "create", "schedule": "every 15m"}, 15) is None
+        assert check("cronjob_manage", {"action": "create", "schedule": "0 9 * * *"}, 15) is None
+        assert check("cronjob_manage", {"action": "create", "schedule": "in 1m"}, 15) is None
+        for args in ({"action": "list"}, {"action": "pause", "job_id": "j"}, {"action": "update", "job_id": "j"},
+                     {"action": "update", "schedule": None}, None, "x"):
+            assert check("cronjob_manage", args, 15) is None
+        assert check("terminal", {"schedule": "* * * * *"}, 15) is None       # tool lain
+        assert check("cronjob_manage", {"schedule": "* * * * *"}, 0) is None   # mati
+        assert check("cronjob_manage", {"schedule": "* * * * *"}, "x") is None
+
+    def test_unparseable_schedule_is_allowed_and_logged_once(self, caplog):
+        with caplog.at_level(logging.WARNING, logger="team-guard"):
+            for _ in range(3):
+                assert cronguard.check_cron_call("cronjob_manage", {"action": "create", "schedule": "kapan-kapan"},
+                                                 15) is None
+        assert sum("tidak bisa diurai" in r.getMessage() for r in caplog.records) == 1
+
+    def test_hook_blocks_member_and_shared_but_not_admin_profile(self, env):
+        env.set("settings", cron_min_interval_minutes=15)
+        args = {"action": "create", "schedule": "every 5m", "prompt": "cek server"}
+        for profile in ("be-budi", "team-shared"):
+            got = env.register(profile).fire("pre_tool_call", tool_name="cronjob_manage", args=args, task_id="t")
+            assert got and got[0]["action"] == "block" and "15 menit" in got[0]["message"]
+        assert env.register("team-admin").fire("pre_tool_call", tool_name="cronjob_manage", args=args) == []
+        ok = dict(args, schedule="every 30m")
+        assert env.register("be-be1").fire("pre_tool_call", tool_name="cronjob_manage", args=ok) == []
+
+    def test_hook_is_off_without_the_setting_and_independent_of_env_guard(self, env):
+        args = {"action": "create", "schedule": "* * * * *", "prompt": "x"}
+        ctx = env.register("be-budi")
+        assert ctx.fire("pre_tool_call", tool_name="cronjob_manage", args=args) == []
+        env.set("settings", cron_min_interval_minutes=15, block_env_dump=False)
+        assert ctx.fire("pre_tool_call", tool_name="cronjob_manage", args=args)[0]["action"] == "block"
+        assert ctx.fire("pre_tool_call", tool_name="terminal", args={"command": "printenv"}) == []
+
+
+class TestBudget(ScaleBase):
+    @pytest.fixture
+    def ledger(self, d):
+        path = self.env.state_dir / "usage.db"
+        self.env.roster["usage"] = {"timezone": "UTC", "ledger": str(path)}
+        self.env.set("settings", daily_token_budget=1000, rate_per_minute=0)
+        S.ledger_add(path, TODAY, S.U_BE1, 10, 10)
+        return path
+
+    def use(self, ledger, uid, tokens, day=TODAY):
+        S.ledger_add(ledger, day, uid, tokens // 2, tokens - tokens // 2)
+        self.clock.advance(61)                                               # lewati cache 60 detik
+
+    def test_disabled_by_default_and_never_touches_the_ledger(self, d):
+        self.env.roster["usage"] = {"timezone": "UTC", "ledger": str(self.env.state_dir / "tidak-ada.db")}
+        self.env.set("settings", rate_per_minute=0)
+        assert self.go(d, event(S.U_BUDI, S.CH_BUDI)) is None
+        assert self.collects == [] and self.rt.budget._cache is None
+
+    def test_warn_once_at_80_percent_then_refuse_at_100(self, d, ledger):
+        assert self.go(d, event(S.U_BUDI, S.CH_BUDI)) is None and self.said() == []
+        self.use(ledger, S.U_BUDI, 800)
+        assert self.go(d, event(S.U_BUDI, S.CH_BUDI)) is None
+        assert len(self.said()) == 1 and "80%" in self.said()[0] and "800 dari 1.000 token" in self.said()[0]
+        self.clock.advance(120)
+        assert self.go(d, event(S.U_BUDI, S.CH_BUDI)) is None and len(self.said()) == 1   # sekali per hari
+        self.use(ledger, S.U_BUDI, 200)
+        got = self.go(d, event(S.U_BUDI, S.CH_BUDI))
+        assert got == {"action": "skip", "reason": "team-guard: anggaran token habis"}
+        assert "jatah token harianmu sudah habis" in self.said(S.CH_BUDI)[-1]
+        assert len(self.admin_said()) == 1 and f"<@{S.U_BUDI}>" in self.admin_said()[0]
+        self.clock.advance(120)
+        assert self.go(d, event(S.U_BUDI, S.CH_BUDI))["action"] == "skip"
+        assert len(self.admin_said()) == 1                                   # admin dikabari sekali per orang per hari
+        assert self.rt.metrics.refused["budget"] == 2
+        assert self.go(d, event(S.U_BE1, S.CH_BE1)) is None                   # orang lain tidak terpengaruh
+
+    def test_refusal_does_not_consume_rate_limit_or_queue(self, d, ledger):
+        self.env.set("settings", rate_per_minute=6, burst=1)
+        self.use(ledger, S.U_BUDI, 5000)
+        for _ in range(5):
+            assert self.go(d, event(S.U_BUDI, S.CH_BUDI))["reason"].endswith("anggaran token habis")
+        assert self.clock.slept == [] and self.rt.metrics.refused["rate"] == 0
+
+    def test_usage_is_cached_for_sixty_seconds(self, d, ledger):
+        assert self.go(d, event(S.U_BUDI, S.CH_BUDI)) is None
+        S.ledger_add(ledger, TODAY, S.U_BUDI, 5000, 0)
+        self.clock.advance(59)
+        assert self.go(d, event(S.U_BUDI, S.CH_BUDI)) is None
+        self.clock.advance(2)
+        assert self.go(d, event(S.U_BUDI, S.CH_BUDI))["action"] == "skip"
+
+    def test_admin_and_slash_commands_bypass(self, d, ledger):
+        self.use(ledger, S.U_BUDI, 5000)
+        self.use(ledger, S.ADMIN, 5000)
+        assert self.go(d, event(S.ADMIN, S.CH_ADMIN)) is None
+        assert self.go(d, event(S.U_BUDI, S.CH_BUDI, "/usage")) is None
+        assert self.said() == []
+
+    def test_override_adds_tokens_only_on_its_own_day(self, d, ledger):
+        overrides = self.env.state_dir / "budget_overrides.json"
+        self.use(ledger, S.U_BUDI, 1500)
+        overrides.write_text(json.dumps({S.U_BUDI: {"day": "2027-01-14", "extra_tokens": 2000}}))
+        assert self.go(d, event(S.U_BUDI, S.CH_BUDI))["action"] == "skip"
+        overrides.write_text(json.dumps({S.U_BUDI: {"day": TODAY, "extra_tokens": 2000},
+                                         S.U_BE1: {"day": TODAY, "extra_tokens": "banyak"}, "x": 5}))
+        assert self.go(d, event(S.U_BUDI, S.CH_BUDI)) is None                 # 1500 dari 3000
+        self.use(ledger, S.U_BUDI, 1500)
+        assert self.go(d, event(S.U_BUDI, S.CH_BUDI))["action"] == "skip"
+        assert "3.000 dari 3.000 token" in self.said(S.CH_BUDI)[-1]
+
+    def test_broken_overrides_file_is_ignored(self, d, ledger, caplog):
+        (self.env.state_dir / "budget_overrides.json").write_text("{rusak")
+        self.use(ledger, S.U_BUDI, 1500)
+        with caplog.at_level(logging.WARNING, logger="team-guard"):
+            assert self.go(d, event(S.U_BUDI, S.CH_BUDI))["action"] == "skip"
+        assert any("budget_overrides.json tidak terbaca" in r.getMessage() for r in caplog.records)
+
+    def test_budget_resets_at_local_midnight_in_team_timezone(self, d, ledger):
+        self.env.roster["usage"]["timezone"] = "Asia/Makassar"               # UTC+8 → 08:00 UTC = 16:00 WITA
+        self.env.save()
+        self.use(ledger, S.U_BUDI, 5000)
+        assert self.rt.budget.today(self.rt.roster()) == TODAY
+        assert self.go(d, event(S.U_BUDI, S.CH_BUDI))["action"] == "skip"
+        self.clock.advance(8 * 3600 - 200)                                   # 23:5x WITA: masih hari yang sama
+        assert self.go(d, event(S.U_BUDI, S.CH_BUDI))["action"] == "skip"
+        self.clock.advance(400)                                              # lewat tengah malam WITA (16:0x UTC)
+        assert self.rt.budget.today(self.rt.roster()) == "2027-01-16"
+        assert self.go(d, event(S.U_BUDI, S.CH_BUDI)) is None
+
+    def test_unknown_timezone_falls_back_to_server_time(self, d, ledger, caplog):
+        self.env.roster["usage"]["timezone"] = "Mars/Olympus"
+        self.env.save()
+        with caplog.at_level(logging.WARNING, logger="team-guard"):
+            day = self.rt.budget.today(self.rt.roster())
+        assert len(day) == 10 and any("tidak dikenal" in r.getMessage() for r in caplog.records)
+
+    def test_team_budget_refuses_every_member_but_not_admin(self, d, ledger):
+        self.env.set("settings", daily_token_budget=0, team_daily_token_budget=10_000)
+        self.use(ledger, "profile:team-shared", 8000)                        # cron di team-shared ikut dihitung
+        assert self.go(d, event(S.U_BUDI, S.CH_BUDI)) is None
+        assert len(self.admin_said()) == 1 and "80%" in self.admin_said()[0]
+        assert self.go(d, event(S.U_BE1, S.CH_BE1)) is None and len(self.admin_said()) == 1
+        self.use(ledger, S.U_BE1, 2000)
+        for uid, chat in ((S.U_BUDI, S.CH_BUDI), (S.U_BE1, S.CH_BE1)):
+            assert self.go(d, event(uid, chat))["action"] == "skip"
+            assert "TIM sudah habis" in self.said(chat)[-1]
+        assert self.go(d, event(S.ADMIN, S.CH_ADMIN)) is None
+        assert len(self.admin_said()) == 2 and "Anggaran token harian tim habis" in self.admin_said()[1]
+
+    def test_personal_limit_takes_precedence_and_both_can_be_set(self, d, ledger):
+        self.env.set("settings", team_daily_token_budget=100_000)
+        self.use(ledger, S.U_BUDI, 1000)
+        assert self.go(d, event(S.U_BUDI, S.CH_BUDI))["action"] == "skip"
+        assert "harianmu" in self.said(S.CH_BUDI)[-1] and self.go(d, event(S.U_BE1, S.CH_BE1)) is None
+
+    def test_missing_ledger_fails_open_with_one_log_line(self, d, caplog):
+        self.env.roster["usage"] = {"timezone": "UTC", "ledger": str(self.env.state_dir / "belum-ada.db")}
+        self.env.set("settings", daily_token_budget=1, rate_per_minute=0)
+        with caplog.at_level(logging.WARNING, logger="team-guard"):
+            assert all(self.go(d, event(S.U_BUDI, S.CH_BUDI)) is None for _ in range(4))
+        assert sum("anggaran token nonaktif" in r.getMessage() for r in caplog.records) == 1
+        assert not (self.env.state_dir / "belum-ada.db").exists()           # baca-saja: tidak pernah membuat berkas
+        assert len(self.collects) == 1                                       # kolektor tetap dicoba (membuat buku besar)
+
+    def test_roster_without_usage_section_fails_open(self, d, caplog):
+        self.env.set("settings", daily_token_budget=1, rate_per_minute=0)
+        with caplog.at_level(logging.WARNING, logger="team-guard"):
+            assert self.go(d, event(S.U_BUDI, S.CH_BUDI)) is None
+        assert sum("tidak memuat usage.ledger" in r.getMessage() for r in caplog.records) == 1
+
+    def test_corrupt_ledger_fails_open(self, d, ledger):
+        ledger.write_bytes(b"bukan sqlite sama sekali" * 50)
+        assert self.go(d, event(S.U_BUDI, S.CH_BUDI)) is None
+
+    def test_unreadable_ledger_keeps_last_numbers_of_the_day(self, d, ledger):
+        self.use(ledger, S.U_BUDI, 5000)
+        assert self.go(d, event(S.U_BUDI, S.CH_BUDI))["action"] == "skip"
+        ledger.write_bytes(b"rusak" * 100)
+        self.clock.advance(61)
+        assert self.go(d, event(S.U_BUDI, S.CH_BUDI))["action"] == "skip"
+
+    def test_ledger_is_opened_read_only(self, d, ledger):
+        before = ledger.read_bytes()
+        assert budget.read_usage(str(ledger), TODAY) == {S.U_BE1: 20}
+        assert budget.read_usage(str(ledger), "2020-01-01") == {}
+        assert ledger.read_bytes() == before
+        with pytest.raises(OSError):
+            budget.read_usage(str(ledger) + ".tidak-ada", TODAY)
+
+    def test_collector_is_spawned_detached_at_most_every_two_minutes(self, d, ledger):
+        self.env.set("settings", rate_per_minute=0)
+        for _ in range(5):
+            self.go(d, event(S.U_BUDI, S.CH_BUDI))
+            self.clock.advance(20)
+        assert len(self.collects) == 1
+        self.clock.advance(30)
+        self.go(d, event(S.U_BUDI, S.CH_BUDI))
+        assert len(self.collects) == 2
+        kit = self.env.roster["kit"]
+        argv = self.collects[0]
+        assert argv[0] == kit["python"] and argv[-1] == "collect"
+        assert argv[1] == str(self.env.state_dir / "usage_ledger.py")        # di samping skrip kit
+        assert argv[argv.index("--ledger") + 1] == str(ledger) and argv[argv.index("--tz") + 1] == "UTC"
+        assert argv[argv.index("--hermes-root") + 1] == str(self.env.hermes_root)
+
+    def test_running_collector_is_not_doubled_and_spawn_failure_is_tolerated(self, d, ledger):
+        class Proc:
+            def poll(self):
+                return None                                                  # masih jalan
+
+        self.rt.budget.spawn = lambda argv, environ: self.collects.append(argv) or Proc()
+        self.go(d, event(S.U_BUDI, S.CH_BUDI))
+        self.clock.advance(500)
+        self.go(d, event(S.U_BUDI, S.CH_BUDI))
+        assert len(self.collects) == 1
+
+        def boom(argv, environ):
+            raise OSError("tidak ada python")
+
+        self.rt.budget._proc, self.rt.budget.spawn = None, boom
+        self.clock.advance(500)
+        assert self.go(d, event(S.U_BUDI, S.CH_BUDI)) is None
+
+    def test_real_detached_spawn_does_not_block(self, tmp_path):
+        marker = tmp_path / "jalan.txt"
+        proc = budget.spawn_detached([sys.executable, "-c",
+                                      f"import pathlib; pathlib.Path({str(marker)!r}).write_text('ok')"],
+                                     dict(os.environ))
+        assert proc.wait(timeout=20) == 0 and marker.read_text() == "ok"
+
+    def test_snapshot_for_metrics(self, d, ledger):
+        self.use(ledger, S.U_BUDI, 300)
+        assert self.rt.budget.snapshot(self.rt.roster()) == {
+            "day": TODAY, "used_by_user": {S.U_BE1: 20, S.U_BUDI: 300}, "team_used": 320}
+        self.env.roster["usage"] = {}
+        self.env.save()
+        assert self.rt.budget.snapshot(self.rt.roster())["used_by_user"] == {}
+
+
+class TestMetricsAndAlerts(ScaleBase):
+    KEYS = {"ts", "active_sessions", "active_by_user", "llm_inflight", "llm_inflight_peak_5m", "queue_len",
+            "queue_wait_p95_s", "refused", "http_429_last_minute", "effective_max_active", "configured_max_active",
+            "throttled", "budget"}
+
+    def test_wait_p95_and_429_window(self):
+        m = scale.Metrics(wait_window=300)
+        assert m.wait_p95(0.0) == 0.0
+        for i in range(1, 101):
+            m.observe_wait(10.0, float(i))
+        assert m.wait_p95(20.0) == 96.0
+        assert m.wait_p95(400.0) == 0.0                                      # sampel lama dibuang
+        for t in (5.0, 30.0, 59.0, 100.0):
+            m.hit_429(t)
+        assert m.hits_last_minute(60.0) == 3 and m.hits_last_minute(120.0) == 1
+        m.refuse("rate")
+        m.refuse("rate")
+        assert m.refused["rate"] == 2
+
+    def test_alert_when_queue_stays_long_for_two_minutes_once_per_episode(self):
+        clock = S.Clock(0.0)
+        rules = scale.AlertRules(clock)
+        out = []
+        for _ in range(40):                                                  # 200 detik antrean 6
+            out += rules.observe(6, 0)
+            clock.advance(5)
+        assert len(out) == 1 and "Antrean Hermes berisi 6 pesan" in out[0]
+        assert rules.observe(5, 0) == []                                     # turun → episode selesai
+        clock.advance(60)
+        assert rules.observe(9, 0) == []                                     # baru mulai lagi
+        clock.advance(119)
+        assert rules.observe(9, 0) == []
+        clock.advance(1)
+        assert len(rules.observe(9, 0)) == 1
+
+    def test_short_spike_does_not_alert(self):
+        clock = S.Clock(0.0)
+        rules = scale.AlertRules(clock)
+        for n in (9, 9, 2, 9, 9):
+            assert rules.observe(n, 0) == []
+            clock.advance(100)
+
+    def test_first_queue_full_refusal_in_ten_minutes_alerts(self):
+        clock = S.Clock(0.0)
+        rules = scale.AlertRules(clock)
+        assert rules.observe(0, 0) == []
+        assert len(rules.observe(0, 1)) == 1
+        clock.advance(300)
+        assert rules.observe(0, 3) == []                                     # masih kejadian yang sama
+        clock.advance(599)
+        assert rules.observe(0, 4) == []
+        clock.advance(600)
+        assert "ditolak karena antrean penuh" in rules.observe(0, 5)[0]
+
+    def test_atomic_write_is_private_and_replaces(self, tmp_path):
+        path = tmp_path / "state" / "metrics.json"
+        assert scale.write_json_atomic(path, {"a": 1}) and scale.write_json_atomic(path, {"a": 2})
+        assert json.loads(path.read_text()) == {"a": 2}
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+        assert [p.name for p in path.parent.iterdir()] == ["metrics.json"]   # tidak ada berkas sementara tersisa
+
+    def test_unwritable_target_is_logged_once_not_raised(self, tmp_path, caplog):
+        blocker = tmp_path / "berkas"
+        blocker.write_text("x")
+        with caplog.at_level(logging.WARNING, logger="team-guard"):
+            assert scale.write_json_atomic(blocker / "metrics.json", {}) is False
+            assert scale.write_json_atomic(blocker / "metrics.json", {}) is False
+        assert sum("tidak bisa ditulis" in r.getMessage() for r in caplog.records) == 1
+
+    def test_metrics_shape_matches_contract(self, d):
+        ledger = self.env.state_dir / "usage.db"
+        self.env.roster["usage"] = {"timezone": "UTC", "ledger": str(ledger)}
+        self.env.set("settings", max_active=6, adaptive_throttle=True, user_max_concurrent=1, queue_max_wait=2,
+                     rate_per_minute=0)
+        S.ledger_add(ledger, TODAY, S.U_BUDI, 100, 50)
+        ctx = self.env.register("be-budi")
+        self.prime()
+
+        async def main():
+            await self.turn(d, thread_event(S.U_BUDI, S.CH_BUDI, "701"), "s1")
+            await self.turn(d, thread_event(S.U_BUDI, S.CH_BUDI, "702"), "s2")     # ditolak: batas per orang
+            await self.turn(d, thread_event(S.U_BE1, S.CH_BE1, "801"), "s3")
+
+        run(main())
+        S.api_request(ctx, "r1", "s1")
+        S.api_request(ctx, "r2", "s3")
+        S.api_response(ctx, "r2", "s3")
+        for i in range(3):
+            S.api_error(ctx, f"e{i}", "s9")
+        data = scale.build_metrics(self.rt, self.env.runner, d.probe, wall=lambda: NOON + 0.7)
+        assert set(data) == self.KEYS
+        assert data == {
+            "ts": int(NOON), "active_sessions": 2, "active_by_user": {S.U_BUDI: 1, S.U_BE1: 1},
+            "llm_inflight": 1, "llm_inflight_peak_5m": 2, "queue_len": 0, "queue_wait_p95_s": 0.0,
+            "refused": {"rate": 0, "queue_full": 0, "budget": 0, "user_concurrent": 1},
+            "http_429_last_minute": 3, "effective_max_active": 3, "configured_max_active": 6, "throttled": True,
+            "budget": {"day": TODAY, "used_by_user": {S.U_BUDI: 150}, "team_used": 150}}
+        json.dumps(data)
+
+    def test_metrics_without_gateway_or_ledger_still_complete(self, d):
+        data = scale.build_metrics(self.rt, None, d.probe)
+        assert set(data) == self.KEYS and data["active_sessions"] == 0 and data["throttled"] is False
+        assert data["budget"]["used_by_user"] == {} and data["configured_max_active"] == 8
+
+    def test_monitor_writes_every_30s_and_notifies_once_per_event(self, d):
+        self.env.set("settings", max_active=8, adaptive_throttle=True)
+        ctx = self.env.register("be-budi")
+        told = []
+
+        async def notify(text):
+            told.append(text)
+
+        mon = scale.Monitor(self.rt, get_gateway=lambda: self.env.runner, notify=notify, probe=d.probe,
+                            wall=lambda: NOON, sleep=self.clock.sleep)
+        path = self.env.state_dir / "metrics.json"
+
+        async def main():
+            assert (await mon.tick())["effective_max_active"] == 8 and path.exists()
+            first = path.read_text()
+            self.clock.advance(10)
+            for i in range(3):
+                S.api_error(ctx, f"e{i}")
+            assert await mon.tick() is None and path.read_text() == first    # belum 30 detik
+            assert len(told) == 1 and "dari 8 ke 4" in told[0] and "3 kali 429" in told[0]
+            self.clock.advance(20)
+            assert (await mon.tick())["throttled"] is True
+            assert json.loads(path.read_text())["effective_max_active"] == 4
+            for _ in range(80):                                              # ±400 detik tenang
+                self.clock.advance(5)
+                await mon.tick()
+            assert len(told) == 2 and "kembali ke 8" in told[1]
+            assert json.loads(path.read_text())["throttled"] is False
+            self.rt.metrics.refuse("queue_full")
+            await mon.tick()
+            assert len(told) == 3 and "antrean penuh" in told[2]
+
+        run(main())
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+    def test_monitor_survives_notify_and_gateway_failures(self, d):
+        async def notify(text):
+            raise RuntimeError("discord putus")
+
+        def gateway():
+            return types.SimpleNamespace(_running_agent_count=lambda: 1 / 0)
+
+        mon = scale.Monitor(self.rt, get_gateway=gateway, notify=notify, probe=d.probe)
+        self.rt.metrics.refuse("queue_full")
+        assert run(mon.tick())["active_sessions"] == 0
+
+    def test_host_bridge_runs_the_monitor_and_other_profiles_do_not_write(self, env):
+        async def main():
+            env.register("be-budi")
+            await asyncio.sleep(0.02)
+            assert not (env.state_dir / "metrics.json").exists()            # hanya host yang menulis
+            ctx = env.register("default")
+            bridge = env.attach()
+            assert [t.get_name() for t in ctx.spawned] == ["team-guard:startup", "team-guard:metrics"]
+            await asyncio.sleep(0.05)
+            data = json.loads((env.state_dir / "metrics.json").read_text())
+            assert set(data) == self.KEYS
+            bridge.close()
+            await asyncio.sleep(0)
+            assert all(t.done() or t.cancelling() for t in ctx.spawned)
+
+        run(main())
 
 
 # ============================================================================= integrasi (butuh Hermes)

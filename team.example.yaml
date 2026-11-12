@@ -78,6 +78,18 @@ llm:
   lobby_model: td-simple      # profile default (lobby)
   aux_model: td-simple        # kompresi konteks, judul, review memory, approval, dll.
   fallback: [td-simple]       # dipakai bila model utama error/throttle (model yang sama dilewati)
+  # PERHATIAN: fallback di provider yang SAMA tidak menolong saat endpoint itu membalas 429 atau mati,
+  # dan anggota yang modelnya td-simple tidak punya cadangan sama sekali. `check` memberi peringatan.
+  # Tambahkan provider kedua (endpoint cadangan, atau endpoint yang sama dengan key/kuota lain), mis.:
+  #   providers:
+  #     td:     {api: "https://llm.example.internal/v1", key_env: TD_API_KEY}
+  #     backup: {api: "https://llm-backup.example.internal/v1", key_env: BACKUP_API_KEY}
+  #   models:
+  #     td-normal:     {provider: "custom:td", model: td-normal}
+  #     td-simple:     {provider: "custom:td", model: td-simple}
+  #     backup-simple: {provider: "custom:backup", model: small-model}
+  #   fallback: [td-simple, backup-simple]   # urutan dicoba; taruh BACKUP_API_KEY di /etc/hermes/.env
+  # Beberapa key untuk SATU endpoint: pakai credential pool Hermes (dokumentasi Hermes: credential-pools).
   per_user_keys: false        # true = tiap profile boleh punya key sendiri (hermes_team.py llm-key)
 
 # --------------------------------------------------------------------------- sandbox
@@ -106,13 +118,24 @@ scale:
   user_burst: 4                     # pesan beruntun yang langsung lolos
   queue_max_wait_seconds: 180       # lama antre saat semua slot penuh sebelum pesan ditolak sopan
   agent_max_turns: 60               # langkah tool per giliran (mencegah loop tak berujung)
-  goals_max_turns: 8                # batas lanjutan otomatis /goal
-  delegation_max_children: 2        # subagent paralel per giliran
+  goals_max_turns: 4                # batas lanjutan otomatis /goal (4 × agent_max_turns langkah dari satu pesan)
+  delegation_max_children: 1        # subagent paralel per giliran (tiap subagent = satu percakapan LLM lagi)
   compression_threshold_tokens: 64000   # kompres konteks paling lambat di angka ini
   proactive_prune_tokens: 48000     # pangkas output tool lama tanpa LLM
   idle_compact_after_seconds: 3600  # sesi yang dibuka lagi setelah 1 jam diringkas dulu
   busy_input_mode: queue            # pesan susulan saat bot sibuk masuk antrean, tidak memotong
   title_llm: false                  # judul sesi tanpa request LLM
+  # --- pembatas tambahan (docs/RENCANA-SKALA.md)
+  user_max_concurrent: 2            # sesi aktif per orang (min 1); pesan berikutnya antre sampai satu selesai
+  max_llm_parallel: 0               # panggilan LLM paralel seluruh tim, termasuk cron & subagent (0 = tidak dibatasi).
+                                    # Isi dari keluaran:  python3 tools/probe_llm.py --team team.yaml --alias td-simple
+  daily_token_budget: 0             # token per orang per hari, mis. 3000000 (0 = tanpa batas); 80% diperingatkan, 100% ditolak
+  team_daily_token_budget: 0        # token seluruh tim per hari (0 = tanpa batas)
+  adaptive_throttle: true           # 429 beruntun → batas sesi efektif diturunkan, lalu pulih perlahan
+  allow_member_cron: false          # false = toolset cronjob mati untuk anggota & #hermes-shared (admin tetap punya)
+  cron_min_interval_minutes: 15     # bila cron dibuka: jadwal lebih rapat dari ini ditolak (0 = tanpa batas)
+  allow_goals: false                # false = /goal dan /subgoal tidak ada di daftar perintah bawaan anggota
+  session_retention_days: 90        # sesi yang sudah berakhir & lebih tua dari ini dipangkas Hermes (0 = tidak diatur kit)
 
 # --------------------------------------------------------------------------- pencatatan pemakaian
 # usage_ledger.py memotret pemakaian token & request tiap orang ke ~/.hermes-team/state/usage.db
@@ -171,7 +194,8 @@ server_admin:
   read_messages: true               # baca pesan channel non-pribadi (channel pribadi anggota selalu ditolak)
 
 # Opsional — perintah slash yang boleh dipakai anggota non-admin (tanpa garis miring).
-# Kosongkan untuk memakai daftar bawaan (tanpa /model, /moa, /reasoning, /tools, /config, ...).
+# Kosongkan untuk memakai daftar bawaan (tanpa /model, /moa, /reasoning, /tools, /config, ...;
+# /goal dan /subgoal hanya ikut bila scale.allow_goals: true). Daftar yang ditulis di sini selalu menang.
 # user_allowed_commands: [new, reset, retry, undo, status, stop, thread, usage]
 
 # Opsional — rute tambahan, mis. satu thread khusus diberi "otak" sendiri.

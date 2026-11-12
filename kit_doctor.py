@@ -5,6 +5,7 @@ Hanya membaca. Mengembalikan kode keluar 0 bila tidak ada masalah ber-level "err
 
   python3 kit_doctor.py                    # cek lokal (tanpa Discord)
   python3 kit_doctor.py --discord          # sekaligus cek channel di Discord (butuh token bot)
+  python3 kit_doctor.py --docker           # sandbox per profile: status & RAM container, ukuran state.db
   python3 kit_doctor.py --format json
 
 Yang diperiksa:
@@ -13,16 +14,21 @@ Yang diperiksa:
   parkir       profile aktif tidak berpenanda gateway.parked; profile nonaktif sebaiknya tidak dirutekan
   berkas       .env profile bermode 0600; plugin team-guard terpasang di tiap profile
   discord      channel ada, di server yang benar, bertipe teks, @everyone tidak bisa melihat (opsional)
+  sandbox      (--docker) container berlabel hermes-profile: status dan RAM per profile, total RAM sandbox
+               terhadap RAM server (peringatan di atas 80%), ukuran state.db tiap profile (peringatan di
+               atas 500 MB). Hanya menjalankan `docker ps` dan `docker stats --no-stream`.
 """
 from __future__ import annotations
 
 import argparse
 import json
 import os
+import re
 import stat
+import subprocess
 import sys
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import yaml
 
@@ -169,6 +175,140 @@ def check_usage(team: dict, rep: Report, now: Optional[float] = None) -> None:
         rep.add(WARN, "pemakaian", f"potret pemakaian terakhir: {last} (seharusnya tiap 15 menit)", fix)
 
 
+# ----------------------------------------------------------------------------- sandbox Docker & state.db
+STATE_DB_WARN_BYTES = 500 * 1024 * 1024     # di atas ini Hermes mulai terasa lambat (FTS, /resume)
+SANDBOX_RAM_WARN_RATIO = 0.80               # total RAM sandbox terhadap RAM server
+PROFILE_LABEL = "hermes-profile"            # label yang dipasang Hermes pada container sandbox
+_UNITS = {"b": 1, "kb": 1000, "mb": 1000 ** 2, "gb": 1000 ** 3, "tb": 1000 ** 4,
+          "kib": 1024, "mib": 1024 ** 2, "gib": 1024 ** 3, "tib": 1024 ** 4}
+
+Runner = Callable[[list], tuple]            # (argv) → (kode keluar, stdout atau stderr)
+
+
+def run_command(cmd: list, timeout: int = 30) -> tuple:
+    """Jalankan perintah baca-saja. OSError (mis. docker tidak terpasang) dan timeout diteruskan ke pemanggil."""
+    proc = subprocess.run(cmd, text=True, capture_output=True, stdin=subprocess.DEVNULL, timeout=timeout)
+    return proc.returncode, (proc.stdout if proc.returncode == 0 else (proc.stderr or proc.stdout))
+
+
+def parse_size(text: str) -> Optional[int]:
+    """'312.5MiB' / '1.2GiB' / '0B' → byte. Tidak dikenali → None."""
+    match = re.fullmatch(r"\s*([0-9]+(?:\.[0-9]+)?)\s*([A-Za-z]+)\s*", str(text or ""))
+    if not match or match.group(2).lower() not in _UNITS:
+        return None
+    return int(float(match.group(1)) * _UNITS[match.group(2).lower()])
+
+
+def _mb(size: float) -> str:
+    return f"{size / (1024 * 1024):.0f} MB"
+
+
+def host_memory_bytes(meminfo: Path = Path("/proc/meminfo")) -> Optional[int]:
+    try:
+        for line in Path(meminfo).read_text(encoding="utf-8", errors="replace").splitlines():
+            if line.startswith("MemTotal:"):
+                return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
+def docker_containers(run: Runner) -> list[dict]:
+    """Container berlabel hermes-profile (semua status) + RAM yang sedang dipakai untuk yang berjalan.
+    Gagal menjalankan docker → RuntimeError dengan alasan singkat."""
+    fmt = "{{.ID}}\t{{.Label \"" + PROFILE_LABEL + "\"}}\t{{.State}}\t{{.Names}}"
+    try:
+        code, out = run(["docker", "ps", "-a", "--filter", f"label={PROFILE_LABEL}", "--format", fmt])
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise RuntimeError(f"{type(exc).__name__}: {exc}")
+    if code != 0:
+        raise RuntimeError((out or "").strip().splitlines()[-1] if (out or "").strip() else f"exit {code}")
+    found = []
+    for line in out.splitlines():
+        parts = line.split("\t")
+        if len(parts) >= 3 and parts[0].strip():
+            found.append({"id": parts[0].strip(), "profile": parts[1].strip(), "state": parts[2].strip().lower(),
+                          "name": parts[3].strip() if len(parts) > 3 else "", "memory": None})
+    running = [c for c in found if c["state"] == "running"]
+    if running:
+        try:
+            code, out = run(["docker", "stats", "--no-stream", "--format", "{{.ID}}\t{{.MemUsage}}",
+                             *[c["id"] for c in running]])
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise RuntimeError(f"docker stats: {type(exc).__name__}: {exc}")
+        if code != 0:
+            raise RuntimeError("docker stats: " + ((out or "").strip().splitlines() or [f"exit {code}"])[-1])
+        for line in out.splitlines():
+            cid, _, usage = line.partition("\t")
+            used = parse_size(usage.split("/")[0])
+            for c in running:
+                if cid.strip() and (c["id"].startswith(cid.strip()) or cid.strip().startswith(c["id"])):
+                    c["memory"] = used
+    return found
+
+
+def state_db_size(home: Path) -> Optional[int]:
+    """Ukuran state.db profile (berikut -wal). Tidak ada → None."""
+    db = home / "state.db"
+    if not db.is_file():
+        return None
+    size = db.stat().st_size
+    wal = home / "state.db-wal"
+    return size + (wal.stat().st_size if wal.is_file() else 0)
+
+
+def check_docker(team: dict, root: Path, rep: Report, run: Runner = run_command,
+                 meminfo: Path = Path("/proc/meminfo")) -> None:
+    """Sandbox per profile (status, RAM) dan ukuran state.db. Hanya membaca; docker hilang → satu peringatan
+    dan pemeriksaan state.db tetap jalan."""
+    profiles = [m["profile"] for m in team["members"]] + [team["shared"]["profile"], team["admin"]["profile"],
+                                                          "default"]
+    by_profile: dict[str, list] = {}
+    docker_ok = True
+    try:
+        for c in docker_containers(run):
+            by_profile.setdefault(c["profile"], []).append(c)
+    except RuntimeError as exc:
+        docker_ok = False
+        rep.add(WARN, "sandbox", f"docker tidak bisa diperiksa ({exc}); status dan RAM container dilewati",
+                "pastikan docker terpasang dan user ini anggota grup docker")
+    total = 0
+    for profile in profiles + sorted(set(by_profile) - set(profiles)):
+        parts = []
+        if docker_ok:
+            containers = by_profile.get(profile, [])
+            if not containers:
+                parts.append("container: belum ada")
+            for c in containers:
+                text = f"container {c['name'] or c['id'][:12]}: {c['state']}"
+                if c["memory"] is not None:
+                    total += c["memory"]
+                    text += f", RAM {_mb(c['memory'])}"
+                parts.append(text)
+        size = state_db_size(_home(root, profile))
+        if size is not None:
+            parts.append(f"state.db {_mb(size)}")
+            if size > STATE_DB_WARN_BYTES:
+                rep.add(WARN, "sandbox", f"state.db profile {profile} sudah {_mb(size)} (ambang "
+                        f"{_mb(STATE_DB_WARN_BYTES)}); riwayat sesi membuat Hermes melambat",
+                        "set scale.session_retention_days di team.yaml lalu pasang ulang managed config, atau "
+                        f"jalankan: hermes -p {profile} sessions prune")
+        if parts:
+            unknown = "" if profile in profiles else " (profile tidak ada di members.yaml)"
+            rep.add(INFO, "sandbox", f"{profile}{unknown}: " + "; ".join(parts))
+    if docker_ok:
+        host = host_memory_bytes(meminfo)
+        note = f"total RAM sandbox yang berjalan: {_mb(total)}"
+        if host:
+            ratio = total / host
+            note += f" dari {_mb(host)} RAM server ({ratio * 100:.0f}%)"
+            if ratio > SANDBOX_RAM_WARN_RATIO:
+                rep.add(WARN, "sandbox", note + f" — di atas {SANDBOX_RAM_WARN_RATIO * 100:.0f}%",
+                        "hentikan sandbox yang menganggur (tools/sandbox_idle.py) atau turunkan sandbox.memory_mb")
+                return
+        rep.add(INFO, "sandbox", note)
+
+
 def check_discord(team: dict, rep: Report, ht: Any, api: Any) -> None:
     guild = team["guild_id"]
     everyone = guild            # id role @everyone = id server
@@ -208,6 +348,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     ap.add_argument("--members")
     ap.add_argument("--hermes-root", default=os.environ.get("HERMES_HOME") or "~/.hermes")
     ap.add_argument("--discord", action="store_true", help="periksa juga channel di Discord")
+    ap.add_argument("--docker", action="store_true",
+                    help="periksa sandbox Docker per profile (status, RAM) dan ukuran state.db")
     ap.add_argument("--format", choices=("text", "json"), default="text")
     args = ap.parse_args(argv)
     try:
@@ -224,6 +366,8 @@ def main(argv: Optional[list[str]] = None) -> int:
             check_discord(team, rep, ht, ht.DiscordAPI(ht.discord_token(root)))
         except ht.TeamError as exc:
             rep.add(ERROR, "discord", f"tidak bisa memeriksa Discord: {exc}")
+    if args.docker:
+        check_docker(team, root, rep)
     print(rep.render(args.format))
     return 1 if rep.errors else 0
 

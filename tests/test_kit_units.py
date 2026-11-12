@@ -1705,3 +1705,286 @@ class TestUsageWiring:
         unit = (ht.KIT_DIR / "systemd" / "hermes-usage-collect.service").read_text(encoding="utf-8")
         timer = (ht.KIT_DIR / "systemd" / "hermes-usage-collect.timer").read_text(encoding="utf-8")
         assert "usage_ledger.py collect" in unit and "OnCalendar=*:0/15" in timer
+
+
+# =========================================================================== skala (docs/RENCANA-SKALA.md)
+class TestScalePlan:
+    def test_new_scale_defaults(self, kit):
+        scale = kit.team()["scale"]
+        assert (scale["user_max_concurrent"], scale["max_llm_parallel"], scale["daily_token_budget"],
+                scale["team_daily_token_budget"], scale["cron_min_interval_minutes"],
+                scale["session_retention_days"]) == (2, 0, 0, 0, 15, 90)
+        assert scale["adaptive_throttle"] is True
+        assert scale["allow_member_cron"] is False and scale["allow_goals"] is False
+        assert (scale["goals_max_turns"], scale["delegation_max_children"]) == (4, 1)
+
+    def test_new_scale_settings_are_validated(self, kit):
+        kit.write_team(scale={"user_max_concurrent": "3", "daily_token_budget": 3000000, "adaptive_throttle": "off",
+                              "allow_goals": "ya"})
+        scale = kit.team()["scale"]
+        assert (scale["user_max_concurrent"], scale["daily_token_budget"]) == (3, 3000000)
+        assert scale["adaptive_throttle"] is False and scale["allow_goals"] is True
+        for bad in ({"user_max_concurrent": 0}, {"max_llm_parallel": -1}, {"daily_token_budget": "banyak"},
+                    {"team_daily_token_budget": 1.5}, {"adaptive_throttle": "mungkin"},
+                    {"cron_min_interval_minutes": -5}, {"session_retention_days": None}):
+            kit.write_team(scale=bad)
+            with pytest.raises(ht.TeamError, match="scale\\."):
+                kit.team()
+        kit.write_team(scale=["x"])
+        with pytest.raises(ht.TeamError, match="scale: harus mapping"):
+            kit.team()
+
+    def test_example_file_documents_every_scale_setting(self):
+        text = (ht.KIT_DIR / "team.example.yaml").read_text(encoding="utf-8")
+        raw = yaml.safe_load(text)
+        assert set(raw["scale"]) == set(ht.SCALE_DEFAULTS)
+        assert {k: raw["scale"][k] for k in ht.SCALE_DEFAULTS} == ht.SCALE_DEFAULTS      # contoh = bawaan
+        assert "custom:backup" in text and "credential-pools" in text
+
+    def test_cron_toolset_off_for_members_and_shared_but_not_admin(self, kit):
+        team = kit.team()
+        for role, member in (("member", team["members"][0]), ("template", None), ("shared", None)):
+            assert "cronjob" in dict(ht.profile_settings(team, role, member))["agent.disabled_toolsets"]
+        admin = dict(ht.profile_settings(team, "admin"))["agent.disabled_toolsets"]
+        assert "cronjob" not in admin and "discord" in admin
+        kit.write_team(scale={"allow_member_cron": True})
+        team = kit.team()
+        for role in ("member", "shared", "admin"):
+            assert "cronjob" not in dict(ht.profile_settings(team, role))["agent.disabled_toolsets"]
+
+    def test_goal_commands_are_opt_in_and_explicit_list_wins(self, kit):
+        team = kit.team()
+        assert "goal" not in team["user_commands"] and "subgoal" not in team["user_commands"]
+        assert "new" in team["user_commands"] and "bg" in team["user_commands"]
+        assert dict(ht.host_settings(team))["platforms.discord.extra.user_allowed_commands"] == team["user_commands"]
+        assert {"goal", "subgoal"} <= set(ht.DEFAULT_USER_COMMANDS)          # konstanta tetap lengkap
+        kit.write_team(scale={"allow_goals": True})
+        assert kit.team()["user_commands"] == ht.DEFAULT_USER_COMMANDS
+        kit.write_team(user_allowed_commands=["/new", "Goal"])                # eksplisit menang walau allow_goals false
+        assert kit.team()["user_commands"] == ["new", "goal"]
+
+    def test_managed_config_pins_cron_and_session_retention(self, kit):
+        policy = ht.managed_config(kit.team())
+        assert policy["cron"] == {"max_parallel_jobs": 1, "model": "td-simple", "model_provider": "custom:td"}
+        assert policy["sessions"] == {"auto_prune": True, "retention_days": 90}
+        assert policy["goals"] == {"max_turns": 4} and policy["delegation"]["max_concurrent_children"] == 1
+        kit.write_team(scale={"session_retention_days": 0}, llm=None)
+        policy = ht.managed_config(kit.team())
+        assert "sessions" not in policy and policy["cron"] == {"max_parallel_jobs": 1}
+        kit.write_team(scale={"session_retention_days": 30})
+        assert ht.managed_config(kit.team())["sessions"]["retention_days"] == 30
+
+    def test_roster_carries_limits_and_usage_for_the_plugin(self, kit):
+        kit.write_team(scale={"user_max_concurrent": 3, "max_llm_parallel": 12, "daily_token_budget": 3000000,
+                              "team_daily_token_budget": 40000000, "adaptive_throttle": False,
+                              "cron_min_interval_minutes": 30}, usage={"timezone": "Asia/Makassar"})
+        data = ht.roster_data(kit.team(), kit.root, str(kit.bin))
+        settings = data["settings"]
+        assert {k: settings[k] for k in ("user_max_concurrent", "max_llm_parallel", "daily_token_budget",
+                                         "team_daily_token_budget", "adaptive_throttle",
+                                         "cron_min_interval_minutes")} == {
+            "user_max_concurrent": 3, "max_llm_parallel": 12, "daily_token_budget": 3000000,
+            "team_daily_token_budget": 40000000, "adaptive_throttle": False, "cron_min_interval_minutes": 30}
+        assert all(type(settings[k]) is int for k in ("user_max_concurrent", "max_llm_parallel",
+                                                      "daily_token_budget", "team_daily_token_budget",
+                                                      "cron_min_interval_minutes"))
+        assert type(settings["adaptive_throttle"]) is bool
+        assert data["usage"] == {"timezone": "Asia/Makassar", "ledger": str(kit.state / "usage.db")}
+        # key lama tidak berubah (plugin versi lama tetap bisa membaca roster ini)
+        assert data["version"] == 3 and {"rate_per_minute", "burst", "max_active", "queue_max_wait"} <= set(settings)
+
+
+class TestFallbackWarnings:
+    def test_same_provider_and_missing_fallback_are_reported_by_alias(self, kit):
+        warnings = ht.fallback_warnings(kit.team())
+        text = "\n".join(warnings)
+        assert "tanpa fallback sama sekali: td-simple" in text
+        assert "td-normal (custom:td)" in text and "provider yang sama" in text
+        assert "team.example.yaml" in warnings[-1]
+
+    def test_second_provider_in_chain_silences_the_warning(self, kit):
+        llm = json.loads(json.dumps(kit.write_team()["llm"]))
+        llm["providers"]["backup"] = {"api": "https://backup.example/v1", "key_env": "BACKUP_API_KEY"}
+        llm["models"]["backup-simple"] = {"provider": "custom:backup", "model": "small"}
+        llm["fallback"] = ["td-simple", "backup-simple"]
+        kit.write_team(llm=llm)
+        team = kit.team()
+        assert ht.fallback_warnings(team) == []
+        assert "backup-simple" not in ht.used_model_aliases(team)             # hanya cadangan → tidak diperiksa
+
+    def test_only_models_in_use_are_checked_and_no_llm_means_no_warning(self, kit):
+        kit.write_members([BUDI])                                             # tidak ada yang memakai td-normal…
+        llm = json.loads(json.dumps(kit.write_team()["llm"]))
+        llm["admin_model"] = "td-simple"                                      # …termasuk admin
+        llm["fallback"] = []
+        kit.write_team(llm=llm)
+        assert ht.used_model_aliases(kit.team()) == ["td-simple"]
+        assert "td-normal" not in "\n".join(ht.fallback_warnings(kit.team()))
+        kit.write_team(llm=None)
+        assert ht.fallback_warnings(kit.team()) == []
+
+    def test_check_and_apply_print_warning_but_still_succeed(self, kit, capsys):
+        ht.main(cli(kit, "check"))
+        out = capsys.readouterr().out
+        assert "Peringatan:" in out and "td-normal (custom:td)" in out and out.rstrip().endswith("Konfigurasi valid.")
+        ht.main(cli(kit, "apply"))                                             # peringatan ≠ kegagalan (tanpa SystemExit)
+        out = capsys.readouterr().out
+        assert "Selesai." in out and "tanpa fallback sama sekali: td-simple" in out
+
+
+# =========================================================================== onboarding massal (#11)
+def _batch_file(tmp_path, entries, name="batch.yaml"):
+    path = tmp_path / name
+    path.write_text(json.dumps(entries) if name.endswith(".json") else yaml.safe_dump(entries), encoding="utf-8")
+    return path
+
+
+class TestOnboardBatch:
+    ENTRIES = [{"user_id": DODI, "username": "dodi.pratama", "display_name": "Dodi Pratama"},
+               {"user_id": EKA, "username": "eka", "model": "td-normal"},
+               {"user_id": CITRA, "name": "citra"}]
+
+    def test_all_channels_then_single_apply(self, kit, discord):
+        events = []
+        result = ht.onboard_batch(kit.team(), kit.hermes(), self.ENTRIES, emit=lambda e, **f: events.append((e, f)))
+        assert [m["status"] for m in result["members"]] == ["created"] * 3
+        assert result["failed"] == [] and result["failures"] == []
+        names = [m["member"]["name"] for m in result["members"]]
+        assert names == ["dodi-pratama", "eka", "citra"]
+        for row in result["members"]:
+            member = row["member"]
+            assert overwrites(discord, member["channel_id"]) == private_set(row["user_id"])
+            assert routes_for(kit, member["profile"])[0]["chat_id"] == member["channel_id"]
+            assert kit.roster()["users"][row["user_id"]]["profile"] == member["profile"]
+        assert [(e, f["user_id"], f["created"]) for e, f in events] == \
+            [("channel", DODI, True), ("channel", EKA, True), ("channel", CITRA, True)]
+        assert [m["name"] for m in kit.members_yaml()] == ["be1", "budi", *names]
+        assert kit.members_yaml()[3]["model"] == "td-normal"
+        # SATU apply: rute gateway ditulis sekali saja, sesudah SEMUA channel dibuat
+        route_sets = [c for c in kit.config_sets() if c[1] == "gateway.profile_routes"]
+        assert len(route_sets) == 1
+        assert all(m["member"]["channel_id"] in route_sets[0][2] for m in result["members"])
+        assert sorted(kit.creates()) == sorted(["be-template", *(m["member"]["profile"] for m in result["members"])])
+
+    def test_validation_error_anywhere_changes_nothing(self, kit, discord):
+        before = kit.members_file.read_text()
+        kit.make_profile("be-sisa")
+        bad = [{"user_id": DODI, "username": "dodi"},
+               {"user_id": DODI, "username": "dodi-lagi"},                   # dobel di berkas
+               {"user_id": "bukan-id"},
+               {"user_id": EKA, "model": "gpt-rahasia"},
+               {"user_id": CITRA, "name": "sisa"},                           # profile sisa anggota lama
+               {"user_id": "500000000000000006", "nickname": "x"},           # key tak dikenal
+               "bukan-mapping"]
+        with pytest.raises(ht.TeamError) as err:
+            ht.onboard_batch(kit.team(), kit.hermes(), bad)
+        text = str(err.value)
+        assert "tidak ada yang diubah" in text
+        for where in ("entri[1]", "entri[2]", "entri[3]", "entri[4]", "entri[5]", "entri[6]"):
+            assert where in text
+        assert "entri[0]" not in text
+        assert discord.calls == [] and kit.calls() == [] and kit.members_file.read_text() == before
+
+    def test_names_derived_inside_one_file_do_not_collide(self, kit, discord):
+        result = ht.onboard_batch(kit.team(), kit.hermes(), [{"user_id": DODI, "username": "sama"},
+                                                             {"user_id": EKA, "username": "sama"}])
+        assert [m["member"]["name"] for m in result["members"]] == ["sama", "sama-2"]
+        with pytest.raises(ht.TeamError, match="entri\\[1\\]"):
+            ht.onboard_batch(kit.team(), kit.hermes(), [{"user_id": CITRA, "name": "kembar"},
+                                                        {"user_id": "500000000000000006", "name": "kembar"}])
+
+    def test_member_missing_from_guild_fails_alone(self, kit, discord):
+        ghost = "599999999999999999"
+        result = ht.onboard_batch(kit.team(), kit.hermes(), [{"user_id": DODI, "username": "dodi"},
+                                                             {"user_id": ghost, "username": "hantu"},
+                                                             {"user_id": EKA, "username": "eka"}])
+        assert [m["status"] for m in result["members"]] == ["created", "failed", "created"]
+        assert [m["user_id"] for m in result["failed"]] == [ghost]
+        assert "tidak ditemukan" in result["failed"][0]["failures"][0] and ghost in result["failures"][0]
+        assert [m["name"] for m in kit.members_yaml()] == ["be1", "budi", "dodi", "eka"]
+        assert channels_named(discord, "hermes-hantu") == [] and not kit.home("be-hantu").exists()
+        assert routes_for(kit, "be-dodi") and routes_for(kit, "be-eka")
+
+    def test_profile_failure_rolls_back_only_that_member(self, kit, discord, monkeypatch):
+        monkeypatch.setenv("FAKE_HERMES_FAIL_CREATE", "be-eka")
+        result = ht.onboard_batch(kit.team(), kit.hermes(), self.ENTRIES)
+        assert [m["status"] for m in result["members"]] == ["created", "failed", "created"]
+        failed = result["failed"][0]
+        assert "disk penuh" in failed["failures"][0] and "dibatalkan" in failed["failures"][0]
+        assert channels_named(discord, "hermes-eka") == [] and not kit.home("be-eka").exists()
+        assert [m["name"] for m in kit.members_yaml()] == ["be1", "budi", "dodi-pratama", "citra"]
+        # rute & roster akhir hanya memuat yang berhasil (tidak ada rute ke profile yang dibatalkan)
+        assert routes_for(kit, "be-eka") == [] and EKA not in kit.roster()["users"]
+        assert routes_for(kit, "be-dodi-pratama") and routes_for(kit, "be-citra")
+        assert {DODI, CITRA} <= set(kit.roster()["users"])
+        # percobaan ulang setelah penyebabnya hilang hanya menambah yang kurang
+        monkeypatch.delenv("FAKE_HERMES_FAIL_CREATE")
+        retry = ht.onboard_batch(kit.team(), kit.hermes(), self.ENTRIES)
+        assert [m["status"] for m in retry["members"]] == ["exists", "created", "exists"] and retry["failed"] == []
+        assert len(channels_named(discord, "hermes-eka")) == 1 and len(channels_named(discord, "hermes-citra")) == 1
+
+    def test_existing_and_inactive_members_are_handled_like_single_onboarding(self, kit, discord):
+        discord.add_channel(BUDI_CH, "hermes-budi", parent=fd.CAT_HERMES,
+                            overwrites=ht.private_overwrites(fd.GUILD, BUDI_UID, fd.BOT))
+        discord.add_channel(BE1_CH, "hermes-be1", parent=fd.CAT_HERMES,
+                            overwrites=ht.private_overwrites(fd.GUILD, BE1_UID, fd.BOT))
+        kit.write_members([BE1, {**BUDI, "active": False}])
+        ht.cmd_apply(kit.team(), kit.hermes())
+        result = ht.onboard_batch(kit.team(), kit.hermes(), [{"user_id": BE1_UID}, {"user_id": BUDI_UID},
+                                                             {"user_id": DODI, "username": "dodi"}])
+        assert [m["status"] for m in result["members"]] == ["exists", "reactivated", "created"]
+        assert result["failed"] == []
+        assert kit.team()["members"][1]["active"] is True and routes_for(kit, "be-budi")
+        assert len(channel_posts(discord)) == 1                                 # hanya channel dodi yang dibuat
+
+    def test_dry_run_touches_nothing(self, kit, discord):
+        before = kit.members_file.read_text()
+        result = ht.onboard_batch(kit.team(), kit.hermes(dry_run=True), self.ENTRIES)
+        assert [m["status"] for m in result["members"]] == ["created"] * 3
+        assert len({m["member"]["channel_id"] for m in result["members"]}) == 3
+        assert discord.calls == [] and kit.calls() == [] and kit.members_file.read_text() == before
+
+    def test_cli_events_protocol_and_exit_codes(self, kit, discord, capsys, tmp_path):
+        path = _batch_file(tmp_path, [{"user_id": DODI, "username": "dodi.pratama"},
+                                      {"user_id": "599999999999999999", "username": "hantu"}], "batch.json")
+        with pytest.raises(SystemExit) as exit_info:
+            ht.main(cli(kit, "onboard-batch", "--file", str(path), "--events"))
+        lines = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+        assert exit_info.value.code == 3
+        assert [e["event"] for e in lines] == ["channel", "result", "result", "summary"]
+        assert lines[0]["user_id"] == DODI and lines[0]["created"] is True
+        ok, failed, summary = lines[1], lines[2], lines[3]
+        # bentuk baris `result` sama dengan `onboard --events`
+        assert {"status", "user_id", "name", "display_name", "profile", "channel_id", "model", "notes",
+                "restart_needed", "live_changed", "failures"} <= set(ok)
+        assert (ok["status"], ok["name"], ok["model"], ok["failures"]) == ("created", "dodi-pratama", "td-simple", [])
+        assert failed["status"] == "failed" and "tidak ditemukan" in failed["failures"][0]
+        assert summary["total"] == 2 and summary["counts"] == {"created": 1, "failed": 1}
+        assert summary["failed"][0]["user_id"] == "599999999999999999"
+
+    def test_cli_success_text_and_bad_file(self, kit, discord, capsys, tmp_path):
+        path = _batch_file(tmp_path, {"members": [{"discord_user_id": DODI, "username": "dodi"}]})
+        ht.main(cli(kit, "onboard-batch", "--file", str(path)))               # sukses: tanpa SystemExit
+        out = capsys.readouterr().out
+        assert "✓ dodi" in out and "1 entri: 1 created" in out
+        for content in ("[]", "satu: dua", "{rusak"):
+            bad = tmp_path / "bad.yaml"
+            bad.write_text(content, encoding="utf-8")
+            with pytest.raises(SystemExit) as exit_info:
+                ht.main(cli(kit, "onboard-batch", "--file", str(bad), "--events"))
+            event = json.loads(capsys.readouterr().out.splitlines()[-1])
+            assert exit_info.value.code == 1 and event["event"] == "error"
+        with pytest.raises(SystemExit):
+            ht.main(cli(kit, "onboard-batch", "--file", str(tmp_path / "tidak-ada.yaml")))
+
+    def test_failure_outside_member_profiles_rolls_back_the_whole_batch(self, kit, discord, monkeypatch):
+        monkeypatch.setenv("FAKE_HERMES_FAIL_CREATE", "be-template")
+        before = kit.members_file.read_text()
+        result = ht.onboard_batch(kit.team(), kit.hermes(), self.ENTRIES)
+        assert [m["status"] for m in result["members"]] == ["failed"] * 3 and len(result["failed"]) == 3
+        assert all("dibatalkan" in m["failures"][0] for m in result["members"])
+        assert yaml.safe_load(kit.members_file.read_text()) == yaml.safe_load(before)
+        assert len(channel_posts(discord)) == 3                               # dibuat, lalu dihapus lagi
+        for name in ("dodi-pratama", "eka", "citra"):
+            assert channels_named(discord, f"hermes-{name}") == []
+            assert not kit.home(f"be-{name}").exists() and routes_for(kit, f"be-{name}") == []

@@ -14,6 +14,9 @@ SETTINGS_DEFAULTS: dict[str, Any] = {
     "rate_per_minute": 6, "burst": 4, "max_active": 8, "queue_max_wait": 180,
     "max_keys": 40, "min_length": 6, "scrub_chat": True, "delete_secret_messages": True,
     "block_env_dump": True, "hint": True, "allow_names": [], "deny_names": [],
+    # Skala lanjutan (docs/RENCANA-SKALA.md). 0 / False = mati, supaya roster lama berperilaku seperti dulu.
+    "user_max_concurrent": 0, "max_llm_parallel": 0, "daily_token_budget": 0, "team_daily_token_budget": 0,
+    "adaptive_throttle": False, "cron_min_interval_minutes": 0,
 }
 ONBOARDING_DEFAULTS: dict[str, Any] = {
     "enabled": True, "give_entry_role": True, "remove_entry_role": True, "verify_actor": True,
@@ -56,6 +59,9 @@ class Roster:
         self.free_response_channels: list[str] = [str(c) for c in gw.get("free_response_channels") or []]
         self.live_reload: bool = bool(d.get("live_reload", True))
         self.restart_fallback: str = str(d.get("restart_fallback") or "idle")
+        usage = d.get("usage") if isinstance(d.get("usage"), dict) else {}
+        self.usage: dict[str, str] = {"timezone": str(usage.get("timezone") or "").strip(),
+                                      "ledger": str(usage.get("ledger") or "").strip()}
         self.kit: dict[str, str] = {str(k): str(v) for k, v in (d.get("kit") or {}).items()}
         self.hermes_root: Path = Path(str(d.get("hermes_root") or "~/.hermes")).expanduser()
         self.hermes_bin: str = str(d.get("hermes_bin") or "hermes")

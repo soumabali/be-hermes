@@ -14,6 +14,7 @@ from typing import Any, Optional
 from . import commands as env_commands
 from .livereload import LiveReloader
 from .onboarding import Onboarder, run_kit
+from .scale import Monitor
 from .shared import log, log_once
 
 
@@ -113,6 +114,8 @@ class HostBridge:
                                  get_adapter=lambda: self.adapter, notify=self.notify_admin, upstream=upstream,
                                  spawn=self.spawn)
         self.onboarder = Onboarder(rt, self.port, self.live, kit=kit)
+        self.monitor = Monitor(rt, get_gateway=lambda: getattr(self.adapter, "gateway_runner", None),
+                               notify=self.notify_admin, probe=getattr(rt.dispatcher, "probe", None))
         self.command_guild: Any = None
         self.ready = False
         self.loop: Any = None
@@ -152,6 +155,7 @@ class HostBridge:
         except Exception as exc:
             log_once("env-install", "/env-set tidak bisa dipasang (%s: %s)", type(exc).__name__, exc)
         self.spawn(self.startup(), "team-guard:startup")
+        self.spawn(self.monitor.run(), "team-guard:metrics")
 
     async def on_member_join(self, member: Any) -> None:
         await self._guarded("member_join", self.onboarder.on_member_join(member))

@@ -1,0 +1,18 @@
+# Laporkan (dan, bila diaktifkan, hentikan) container sandbox Hermes yang menganggur (tools/sandbox_idle.py).
+#
+# BELUM TERBUKTI: apakah Hermes menyalakan lagi container yang sudah dihentikan saat dipakai berikutnya
+# BELUM diverifikasi. Uji dulu di server staging. Karena itu ExecStart di bawah TANPA --apply: unit ini
+# hanya mencatat ke journal container mana yang AKAN dihentikan. Setelah terbukti aman di staging,
+# tambahkan --apply di akhir ExecStart.
+#
+# Unit USER milik user hermes (harus anggota grup docker):
+#   mkdir -p ~/.config/systemd/user && cp /opt/hermes-team/systemd/hermes-sandbox-idle.* ~/.config/systemd/user/
+#   systemctl --user daemon-reload && systemctl --user enable --now hermes-sandbox-idle.timer
+#   journalctl --user -u hermes-sandbox-idle.service        # lihat laporannya
+[Unit]
+Description=Hermes team kit: container sandbox yang menganggur (laporan; --apply untuk menghentikan)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /opt/hermes-team/tools/sandbox_idle.py --idle-hours 6
+Nice=10

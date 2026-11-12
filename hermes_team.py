@@ -451,14 +451,30 @@ SCALE_DEFAULTS = {
     "user_burst": 4,
     "queue_max_wait_seconds": 180,
     "agent_max_turns": 60,            # langkah tool per giliran
-    "goals_max_turns": 8,
-    "delegation_max_children": 2,
+    "goals_max_turns": 4,             # lanjutan otomatis /goal (4 × agent_max_turns langkah dari satu pesan)
+    "delegation_max_children": 1,     # subagent paralel per giliran (tiap subagent = satu percakapan LLM lagi)
     "compression_threshold_tokens": 64000,
     "proactive_prune_tokens": 48000,
     "idle_compact_after_seconds": 3600,
     "busy_input_mode": "queue",
     "title_llm": False,               # judul sesi pakai LLM? false = judul instan, tanpa request
+    # --- docs/RENCANA-SKALA.md. Yang ditegakkan plugin team-guard dikirim lewat roster.json → settings.
+    "user_max_concurrent": 2,         # sesi aktif per orang (minimal 1); pesan berikutnya antre
+    "max_llm_parallel": 0,            # panggilan LLM paralel seluruh tim (0 = tidak dibatasi); isi dari tools/probe_llm.py
+    "daily_token_budget": 0,          # token per orang per hari (0 = tanpa batas)
+    "team_daily_token_budget": 0,     # token seluruh tim per hari (0 = tanpa batas)
+    "adaptive_throttle": True,        # turunkan batas sesi efektif saat 429 beruntun, pulih perlahan
+    "allow_member_cron": False,       # false = toolset cronjob mati untuk anggota & profile bersama (admin tetap)
+    "cron_min_interval_minutes": 15,  # jadwal cron lebih rapat dari ini ditolak plugin (0 = tanpa batas)
+    "allow_goals": False,             # false = /goal dan /subgoal keluar dari daftar perintah bawaan anggota
+    "session_retention_days": 90,     # sesi berakhir yang lebih tua dipangkas Hermes (0 = kit tidak mengatur)
 }
+# Setelan `scale` yang nilainya minimal 1 (0 akan berarti "semua ditolak", bukan "tanpa batas").
+SCALE_MIN_ONE = ("user_max_concurrent",)
+# Perintah yang membuat agent melanjutkan sendiri tanpa pesan baru → di luar pembatas pesan.
+GOAL_COMMANDS = ("goal", "subgoal")
+# Toolset penjadwalan: cron job berjalan tanpa pesan, jadi tidak lewat rate limit maupun antrean.
+CRON_TOOLSET = "cronjob"
 SECRETS_DEFAULTS = {
     "max_keys": 40, "min_length": 6, "scrub_chat": True, "delete_secret_messages": True,
     "block_env_dump": True, "hint": True, "allow_names": [], "deny_names": [],
@@ -483,6 +499,13 @@ SERVER_ADMIN_DEFAULTS = {
     "allow_elevated_permissions": False,  # izin tinggi (Administrator, Manage Roles, ...) lewat Hermes
     "read_messages": True,              # discord_read_messages (channel pribadi selalu ditolak)
 }
+
+
+def default_user_commands(scale: dict) -> list[str]:
+    """Perintah slash bawaan anggota. `/goal` dan `/subgoal` hanya ikut bila `scale.allow_goals: true`."""
+    if scale.get("allow_goals"):
+        return list(DEFAULT_USER_COMMANDS)
+    return [c for c in DEFAULT_USER_COMMANDS if c not in GOAL_COMMANDS]
 
 
 def load_team(team_path: Path, members_path: Optional[Path] = None) -> dict:
@@ -540,12 +563,14 @@ def load_team(team_path: Path, members_path: Optional[Path] = None) -> dict:
     }
     team["llm"] = _load_llm(raw)
     scale = dict(SCALE_DEFAULTS)
+    if raw.get("scale") is not None and not isinstance(raw.get("scale"), dict):
+        raise TeamError("scale: harus mapping")
     scale.update({k: v for k, v in (raw.get("scale") or {}).items() if k in SCALE_DEFAULTS})
     for key, default in SCALE_DEFAULTS.items():
         if isinstance(default, bool):
             scale[key] = _bool(scale[key], f"scale.{key}", default)
         elif isinstance(default, int):
-            scale[key] = _int(scale[key], f"scale.{key}", 0)
+            scale[key] = _int(scale[key], f"scale.{key}", 1 if key in SCALE_MIN_ONE else 0)
     if scale["busy_input_mode"] not in ("queue", "interrupt", "steer"):
         raise TeamError("scale.busy_input_mode harus queue, interrupt, atau steer")
     team["scale"] = scale
@@ -562,7 +587,8 @@ def load_team(team_path: Path, members_path: Optional[Path] = None) -> dict:
             secrets[key] = [str(v) for v in secrets[key]]
     team["secrets"] = secrets
     cmds = raw.get("user_allowed_commands")
-    team["user_commands"] = [str(c).lstrip("/").lower() for c in cmds] if cmds else list(DEFAULT_USER_COMMANDS)
+    # Daftar eksplisit di team.yaml selalu menang (admin sengaja memilihnya), termasuk bila berisi goal/subgoal.
+    team["user_commands"] = [str(c).lstrip("/").lower() for c in cmds] if cmds else default_user_commands(scale)
     team["extra_routes"] = list(raw.get("extra_routes") or [])
     team["onboarding"] = _load_onboarding(raw.get("onboarding"))
     server_admin = dict(SERVER_ADMIN_DEFAULTS)
@@ -778,6 +804,44 @@ def model_settings(team: dict, alias: str) -> list[tuple[str, object]]:
     return settings
 
 
+def used_model_aliases(team: dict) -> list[str]:
+    """Alias yang benar-benar menjadi model UTAMA suatu profile (anggota aktif, bawaan, shared, admin, lobby)."""
+    if not team["llm"]:
+        return []
+    aliases = [model_alias(team, "member", m) for m in active_members(team)]
+    aliases += [team["llm"]["default_model"]] + [model_alias(team, role) for role in ("shared", "admin", "lobby")]
+    return list(dict.fromkeys(aliases))
+
+
+def fallback_warnings(team: dict) -> list[str]:
+    """Peringatan (bukan error) soal rantai fallback. Fallback di provider yang sama tidak menolong saat
+    endpoint itu membalas 429 atau mati; model yang juga satu-satunya isi `llm.fallback` tidak punya
+    cadangan sama sekali (model yang sama dilewati, lihat `model_settings`)."""
+    llm = team["llm"]
+    if not llm:
+        return []
+    none: list[str] = []
+    same: list[str] = []
+    for alias in used_model_aliases(team):
+        provider = llm["models"][alias]["provider"]
+        chain = [llm["models"][a]["provider"] for a in llm["fallback"] if a != alias]
+        if not chain:
+            none.append(alias)
+        elif all(p == provider for p in chain):
+            same.append(f"{alias} ({provider})")
+    warnings = []
+    if none:
+        warnings.append("model tanpa fallback sama sekali: " + ", ".join(none)
+                        + " — bila endpoint-nya error/429, giliran langsung gagal")
+    if same:
+        warnings.append("semua fallback berada di provider yang sama dengan model utamanya: " + ", ".join(same)
+                        + " — 429 atau gangguan di endpoint itu ikut menjatuhkan fallback")
+    if warnings:
+        warnings.append("saran: tambah provider kedua (endpoint cadangan atau key lain) di llm.providers dan "
+                        "masukkan modelnya ke llm.fallback; lihat contoh di team.example.yaml")
+    return warnings
+
+
 def plugin_settings(team: dict) -> list[tuple[str, object]]:
     return [(f"plugins.entries.{PLUGIN_NAME}.settings.state_dir", team["paths"]["state_dir"])]
 
@@ -850,15 +914,21 @@ def host_settings(team: dict) -> list[tuple[str, object]]:
     return settings
 
 
-def worker_disabled_toolsets(team: dict) -> list[str]:
-    return WORKER_DISABLED_TOOLSETS + ([] if team.get("allow_browser") else HOST_SIDE_TOOLSETS)
+def worker_disabled_toolsets(team: dict, role: str = "admin") -> list[str]:
+    """Toolset yang dimatikan untuk profile pekerja. Cron job berjalan tanpa pesan (di luar rate limit dan
+    antrean), jadi toolset `cronjob` mati untuk anggota dan profile bersama kecuali
+    `scale.allow_member_cron: true`; profile admin selalu memilikinya (laporan terjadwal)."""
+    disabled = WORKER_DISABLED_TOOLSETS + ([] if team.get("allow_browser") else HOST_SIDE_TOOLSETS)
+    if role != "admin" and not team["scale"].get("allow_member_cron"):
+        disabled = disabled + [CRON_TOOLSET]
+    return disabled
 
 
 def profile_settings(team: dict, role: str, member: Optional[dict] = None, *,
                      hermes_bin: str = "hermes", hermes_root: Optional[Path] = None) -> list[tuple[str, object]]:
     """Setelan per profile. Selalu eksplisit supaya tidak mewarisi setelan lobby dari clone."""
     skills_dir = [team["team_skills_dir"]] if team["team_skills_dir"] else []
-    disabled = worker_disabled_toolsets(team)
+    disabled = worker_disabled_toolsets(team, role)
     if role in ("member", "template"):
         settings: list[tuple[str, object]] = [
             ("agent.disabled_toolsets", disabled),
@@ -930,9 +1000,17 @@ def managed_config(team: dict) -> dict:
             "idle_compact_after_seconds": int(scale["idle_compact_after_seconds"]),
         },
     }
+    # Cron: satu job pada satu waktu per profile (tiap job = percakapan LLM di luar antrean team-guard).
+    policy["cron"] = {"max_parallel_jobs": 1}
+    if int(scale["session_retention_days"]) > 0:
+        # Thread per percakapan membuat jumlah sesi tumbuh cepat; Hermes hanya memangkas sesi yang SUDAH
+        # berakhir dan tidak aktif selama retention_days. Buku besar pemakaian (usage.db) tidak terpengaruh.
+        policy["sessions"] = {"auto_prune": True, "retention_days": int(scale["session_retention_days"])}
     if llm:
         policy["providers"] = copy.deepcopy(llm["providers"])
         aux = llm["models"][llm["aux_model"]]
+        # Cron job tanpa model sendiri memakai model murah (urutan Hermes: pin per job > cron.model > model.default).
+        policy["cron"].update({"model": aux["model"], "model_provider": aux["provider"]})
         auxiliary = {task: {"provider": aux["provider"], "model": aux["model"]} for task in AUX_TASKS}
         if not scale["title_llm"]:
             auxiliary["title_generation"]["model_upgrade_enabled"] = False
@@ -994,7 +1072,17 @@ def roster_data(team: dict, hermes_root: Path, hermes_bin: str) -> dict:
             "rate_per_minute": scale["user_rate_per_minute"], "burst": scale["user_burst"],
             "max_active": scale["max_concurrent_sessions"], "queue_max_wait": scale["queue_max_wait_seconds"],
             **{k: secrets[k] for k in SECRETS_DEFAULTS},
+            # docs/RENCANA-SKALA.md — ditegakkan plugin team-guard (key baru; yang lama tidak berubah).
+            "user_max_concurrent": int(scale["user_max_concurrent"]),
+            "max_llm_parallel": int(scale["max_llm_parallel"]),
+            "daily_token_budget": int(scale["daily_token_budget"]),
+            "team_daily_token_budget": int(scale["team_daily_token_budget"]),
+            "adaptive_throttle": bool(scale["adaptive_throttle"]),
+            "cron_min_interval_minutes": int(scale["cron_min_interval_minutes"]),
         },
+        # Anggaran token harian dihitung dari buku besar ini, dengan batas hari di zona waktu yang sama.
+        "usage": {"timezone": team["usage"]["timezone"],
+                  "ledger": str(Path(team["paths"]["state_dir"]) / "usage.db")},
     }
 
 
@@ -1385,8 +1473,13 @@ def restart_needed(hermes: Hermes, created: list[str], *, live_reload: bool = Fa
 
 
 def cmd_apply(team: dict, hermes: Hermes, *, only: Optional[list[str]] = None, host_only: bool = False,
-              force_soul: bool = False, sync_shared: Iterable[str] = ()) -> dict:
+              force_soul: bool = False, sync_shared: Iterable[str] = (),
+              on_member_error: Optional[Callable[[dict, Exception], None]] = None) -> dict:
     """Idempoten. Kembalikan ringkasan {created, restart_needed, live_changed, failures}.
+
+    `on_member_error(member, exc)`: bila diisi, profile anggota yang gagal dibuat tidak menghentikan apply;
+    pemanggil (onboarding massal) WAJIB membatalkan anggota itu di dalam callback (mengeluarkannya dari
+    members.yaml — `team` ikut diperbarui), supaya rute dan roster yang ditulis sesudahnya tidak memuatnya.
 
     Dipanggil paling luar (CLI `apply`, teamctl): team.yaml + members.yaml dibaca ULANG setelah kunci
     tim dipegang, supaya tidak bekerja dari salinan sebelum proses lain selesai menulis. Dipanggil dari
@@ -1395,7 +1488,7 @@ def cmd_apply(team: dict, hermes: Hermes, *, only: Optional[list[str]] = None, h
         if _lock_depth() == 1:
             reload_team(team)
         return _cmd_apply(team, hermes, only=only, host_only=host_only, force_soul=force_soul,
-                          sync_shared=set(sync_shared or ()))
+                          sync_shared=set(sync_shared or ()), on_member_error=on_member_error)
 
 
 def _check_only(team: dict, only: Optional[list[str]]) -> None:
@@ -1411,7 +1504,8 @@ def _check_only(team: dict, only: Optional[list[str]]) -> None:
 
 
 def _cmd_apply(team: dict, hermes: Hermes, *, only: Optional[list[str]], host_only: bool,
-               force_soul: bool, sync_shared: Iterable[str] = ()) -> dict:
+               force_soul: bool, sync_shared: Iterable[str] = (),
+               on_member_error: Optional[Callable[[dict, Exception], None]] = None) -> dict:
     created: list[str] = []
     if not host_only:
         _check_only(team, only)
@@ -1423,9 +1517,14 @@ def _cmd_apply(team: dict, hermes: Hermes, *, only: Optional[list[str]], host_on
         for member in active_members(team):
             if only and member["name"] not in names:
                 continue
-            if provision_member(team, hermes, member, force_soul=force_soul,
-                                sync_shared=member["name"] in sync_shared):
-                created.append(member["profile"])
+            try:
+                if provision_member(team, hermes, member, force_soul=force_soul,
+                                    sync_shared=member["name"] in sync_shared):
+                    created.append(member["profile"])
+            except Exception as exc:  # noqa: BLE001 — tanpa callback perilakunya tetap: error diteruskan
+                if on_member_error is None or hermes.dry_run:
+                    raise
+                on_member_error(member, exc)
         if not only:
             hermes.say("\n[3/4] Profile bersama & admin")
             for key in ("shared", "admin"):
@@ -1810,6 +1909,62 @@ def _onboard_existing(team: dict, hermes: Hermes, existing: dict, api: Optional[
             "failures": failures + list(result.get("failures", []))}
 
 
+def _plan_onboard(team: dict, hermes: Hermes, *, user_id: str, username: str = "", display_name: str = "",
+                  name: str = "", model: str = "") -> dict:
+    """Bagian onboarding TANPA efek samping: tentukan jenisnya dan jalankan semua validasi.
+    → {"kind": "exists" | "reactivated" | "created", "member": {...}, "previous": entri lama | None}.
+    `member["channel_id"]` anggota baru masih kosong sampai `_onboard_channel` dijalankan."""
+    if model and team["llm"] and model not in team["llm"]["models"]:
+        raise TeamError(f"model '{model}' tidak ada di katalog: {', '.join(team['llm']['models'])}")
+    existing = next((m for m in team["members"] if m["user_id"] == user_id), None)
+    if existing and existing.get("active", True):
+        return {"kind": "exists", "member": dict(existing), "previous": existing}
+    if existing:
+        member = dict(existing)
+        if model:
+            member["model"] = model
+        return {"kind": "reactivated", "member": member, "previous": existing}
+    if name:
+        name = _check_new_name(team, name)
+    else:
+        # Folder profile yang sudah ada dihitung terpakai: anggota baru tidak pernah menumpang profile lama.
+        name = derive_member_name(username or display_name, user_id, _taken_names(team, hermes))
+    display = clean_display_name(display_name or username or name, name)
+    profile = _validate_new_member(team, hermes, name=name, user_id=user_id, model=model)
+    member = {"name": name, "display_name": display, "user_id": user_id, "channel_id": "",
+              "profile": profile, "model": model, "active": True, "forward_env": []}
+    return {"kind": "created", "member": member, "previous": None}
+
+
+def _onboard_channel(team: dict, hermes: Hermes, plan: dict, api: Optional[DiscordAPI],
+                     emit: Callable[..., None], notes: list[str]) -> bool:
+    """Bagian Discord dari onboarding: pastikan/buat channel pribadi dan isi `plan["member"]["channel_id"]`.
+    → True bila channel BARU dibuat di panggilan ini (dipakai untuk pembatalan)."""
+    member = plan["member"]
+    if plan["kind"] == "reactivated":
+        cid, created = _ensure_member_channel_ex(team, hermes, member, api, emit, notes)
+        member["channel_id"] = cid
+        member["active"] = True
+        return created
+    name, user_id = member["name"], member["user_id"]
+    if hermes.dry_run:
+        member["channel_id"] = "9" * 18
+        hermes.say(f"  (dry-run) buat channel #{team['channel_prefix']}{name}")
+        emit("channel", channel_id=member["channel_id"], created=True)
+        return False
+    api = _discord(hermes, api)
+    try:
+        api.guild_member(team["guild_id"], user_id)
+    except TeamError as exc:
+        raise TeamError(f"user {user_id} tidak ditemukan di server Discord ({exc})")
+    channel_id, channel_created = _new_private_channel(
+        team, api, name=name, user_id=user_id, display=member["display_name"], notes=notes, emit=emit)
+    if channel_created:
+        notes.append(f"channel <#{channel_id}> dibuat")
+    member["channel_id"] = channel_id
+    return channel_created
+
+
 def onboard_member(team: dict, hermes: Hermes, *, user_id: str, username: str = "", display_name: str = "",
                    name: str = "", model: str = "", api: Optional[DiscordAPI] = None,
                    emit: Optional[Callable[..., None]] = None) -> dict:
@@ -1824,48 +1979,181 @@ def onboard_member(team: dict, hermes: Hermes, *, user_id: str, username: str = 
     user_id = _id(user_id, "discord_user_id")
     with team_lock(team):
         reload_team(team)
-        if model and team["llm"] and model not in team["llm"]["models"]:
-            raise TeamError(f"model '{model}' tidak ada di katalog: {', '.join(team['llm']['models'])}")
         notes: list[str] = []
-        existing = next((m for m in team["members"] if m["user_id"] == user_id), None)
-        if existing and existing.get("active", True):
-            return _onboard_existing(team, hermes, existing, api, emit, notes)
-        if existing:
-            member = dict(existing)
-            cid, created = _ensure_member_channel_ex(team, hermes, member, api, emit, notes)
-            member["channel_id"] = cid
-            member["active"] = True
-            if model:
-                member["model"] = model
-            result = _commit_member(team, hermes, api, member, previous=existing, channel_created=created,
-                                    sync_shared=True)
-            return {"status": "reactivated", "member": member, "notes": notes, **result}
-        if name:
-            name = _check_new_name(team, name)
-        else:
-            # Folder profile yang sudah ada dihitung terpakai: anggota baru tidak pernah menumpang profile lama.
-            name = derive_member_name(username or display_name, user_id, _taken_names(team, hermes))
-        display = clean_display_name(display_name or username or name, name)
-        profile = _validate_new_member(team, hermes, name=name, user_id=user_id, model=model)
-        channel_created = False
-        if hermes.dry_run:
-            channel_id = "9" * 18
-            hermes.say(f"  (dry-run) buat channel #{team['channel_prefix']}{name}")
-            emit("channel", channel_id=channel_id, created=True)
-        else:
+        plan = _plan_onboard(team, hermes, user_id=user_id, username=username, display_name=display_name,
+                             name=name, model=model)
+        if plan["kind"] == "exists":
+            return _onboard_existing(team, hermes, plan["previous"], api, emit, notes)
+        if not hermes.dry_run:
             api = _discord(hermes, api)
+        channel_created = _onboard_channel(team, hermes, plan, api, emit, notes)
+        result = _commit_member(team, hermes, api, plan["member"], previous=plan["previous"],
+                                channel_created=channel_created, sync_shared=plan["kind"] == "reactivated")
+        return {"status": plan["kind"], "member": plan["member"], "notes": notes, **result}
+
+
+BATCH_ENTRY_KEYS = ("user_id", "discord_user_id", "username", "display_name", "name", "model")
+
+
+def load_batch_file(path: Path) -> list:
+    """Berkas onboarding massal: daftar YAML/JSON berisi {user_id, username?, display_name?, name?, model?}
+    (boleh juga mapping dengan key `members`). Isinya divalidasi di `onboard_batch`."""
+    try:
+        raw = yaml.safe_load(Path(path).expanduser().read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        raise TeamError(f"{path} tidak ditemukan")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise TeamError(f"{path} tidak bisa dibaca: {exc}")
+    except yaml.YAMLError as exc:
+        raise TeamError(f"{path}: YAML/JSON tidak valid: {exc}")
+    if isinstance(raw, dict) and isinstance(raw.get("members"), list):
+        raw = raw["members"]
+    if not isinstance(raw, list) or not raw:
+        raise TeamError(f"{path}: isinya harus daftar anggota yang tidak kosong")
+    return raw
+
+
+def onboard_batch(team: dict, hermes: Hermes, entries: Iterable[Any], *, api: Optional[DiscordAPI] = None,
+                  emit: Optional[Callable[..., None]] = None) -> dict:
+    """Onboarding banyak orang sekaligus (hari pertama): validasi SEMUA entri → semua channel → semua
+    entri members.yaml → SATU `apply` (satu kali tulis roster = satu live reload).
+
+    Validasi gagal di entri mana pun → TeamError berisi semua kesalahan, tidak ada yang diubah. Setelah
+    itu kegagalan per orang (Discord, profile) tidak menghentikan yang lain: yang dibuat untuk orang itu
+    dibatalkan dengan pembatal yang sama dengan onboarding tunggal, lalu dilaporkan di `failed`.
+    → {"members": [hasil per orang], "failed": [...], "restart_needed", "live_changed", "failures"}."""
+    emit = emit or (lambda *_a, **_k: None)
+    entries = list(entries)
+    with team_lock(team):
+        reload_team(team)
+        # --- 1. validasi semua, tanpa efek samping. `probe` ikut memuat anggota baru yang sudah direncanakan
+        #        supaya nama turunan dan keunikan dicek terhadap sesama isi berkas.
+        probe = dict(team)
+        probe["members"] = list(team["members"])
+        items: list[dict] = []
+        errors: list[str] = []
+        seen: set[str] = set()
+        for i, entry in enumerate(entries):
+            where = f"entri[{i}]"
             try:
-                api.guild_member(team["guild_id"], user_id)
+                if not isinstance(entry, dict):
+                    raise TeamError("harus mapping {user_id, username?, display_name?, name?, model?}")
+                unknown = sorted(str(k) for k in entry if k not in BATCH_ENTRY_KEYS)
+                if unknown:
+                    raise TeamError(f"key tidak dikenal: {', '.join(unknown)}")
+                user_id = _id(entry.get("user_id") or entry.get("discord_user_id"), "user_id")
+                if user_id in seen:
+                    raise TeamError(f"user {user_id} muncul dua kali di berkas")
+                plan = _plan_onboard(probe, hermes, user_id=user_id,
+                                     username=str(entry.get("username") or ""),
+                                     display_name=str(entry.get("display_name") or ""),
+                                     name=str(entry.get("name") or ""), model=str(entry.get("model") or ""))
             except TeamError as exc:
-                raise TeamError(f"user {user_id} tidak ditemukan di server Discord ({exc})")
-            channel_id, channel_created = _new_private_channel(
-                team, api, name=name, user_id=user_id, display=display, notes=notes, emit=emit)
-            if channel_created:
-                notes.append(f"channel <#{channel_id}> dibuat")
-        member = {"name": name, "display_name": display, "user_id": user_id, "channel_id": channel_id,
-                  "profile": profile, "model": model, "active": True, "forward_env": []}
-        result = _commit_member(team, hermes, api, member, channel_created=channel_created)
-        return {"status": "created", "member": member, "notes": notes, **result}
+                errors.append(f"{where}: {exc}")
+                continue
+            seen.add(user_id)
+            if plan["kind"] == "created":
+                probe["members"].append(dict(plan["member"], channel_id=f"batch-{i}"))
+            items.append({"index": i, "user_id": user_id, "plan": plan, "notes": [], "status": plan["kind"],
+                          "channel_created": False, "error": "", "result": {}})
+        if errors:
+            raise TeamError("berkas onboarding massal tidak valid, tidak ada yang diubah:\n  - "
+                            + "\n  - ".join(errors))
+        if not hermes.dry_run and any(it["plan"]["kind"] != "exists" for it in items):
+            api = _discord(hermes, api)
+
+        def member_emit(item: dict) -> Callable[..., None]:
+            return lambda event, **fields: emit(event, user_id=item["user_id"], **fields)
+
+        def fail(item: dict, exc: BaseException, undone: Iterable[str] = ()) -> None:
+            item["status"] = "failed"
+            item["error"] = str(exc) + (f" — dibatalkan: {'; '.join(undone)}" if undone else "")
+
+        # --- 2. channel untuk semua (anggota yang sudah aktif hanya dipastikan/disembuhkan seperti biasa)
+        for item in items:
+            plan = item["plan"]
+            try:
+                if plan["kind"] == "exists":
+                    item["result"] = _onboard_existing(team, hermes, plan["previous"], api, member_emit(item),
+                                                       item["notes"])
+                    plan["member"] = item["result"]["member"]
+                    continue
+                item["channel_created"] = _onboard_channel(team, hermes, plan, api, member_emit(item),
+                                                           item["notes"])
+                if hermes.dry_run and plan["kind"] == "created":
+                    plan["member"]["channel_id"] = str(10 ** 18 - 1 - item["index"])  # unik per entri
+            except TeamError as exc:
+                fail(item, exc)
+        # --- 3. members.yaml untuk semua yang channel-nya siap
+        pending: dict[str, dict] = {}
+        for item in items:
+            plan = item["plan"]
+            if item["status"] == "failed" or plan["kind"] == "exists":
+                continue
+            member = plan["member"]
+            item["had_dir"] = hermes.dir_exists(member["profile"])
+            try:
+                if hermes.dry_run:   # `_store_member` tidak menulis saat dry-run → kumpulkan di memori saja
+                    team["members"] = [m for m in team["members"] if m["user_id"] != member["user_id"]] + [member]
+                    _validate_unique(team)
+                else:
+                    _store_member(team, hermes, member, replace=plan["previous"] is not None)
+            except TeamError as exc:
+                fail(item, exc, _rollback_member(team, hermes, api, member, previous=plan["previous"],
+                                                 stored=False, remove_dir=False,
+                                                 channel_created=item["channel_created"]))
+                continue
+            pending[member["name"]] = item
+        # --- 4. SATU apply untuk semuanya. Profile yang gagal dibuat dibatalkan saat itu juga (pembatal yang
+        #        sama dengan onboarding tunggal: entri members.yaml, folder setengah jadi, channel baru),
+        #        sehingga rute dan roster yang ditulis di akhir apply hanya memuat anggota yang berhasil.
+        summary: dict = {"created": [], "restart_needed": False, "live_changed": []}
+
+        def merge(result: dict) -> None:
+            summary["created"] = list(dict.fromkeys(summary["created"] + list(result.get("created", []))))
+            summary["restart_needed"] = summary["restart_needed"] or bool(result.get("restart_needed"))
+            summary["live_changed"] = sorted(set(summary["live_changed"]) | set(result.get("live_changed", [])))
+
+        def undo(item: dict, exc: BaseException) -> None:
+            plan = item["plan"]
+            fail(item, exc, _rollback_member(
+                team, hermes, api, plan["member"], previous=plan["previous"], stored=True,
+                remove_dir=not item["had_dir"], channel_created=item["channel_created"]))
+
+        for item in items:
+            if item["plan"]["kind"] == "exists" and item["status"] != "failed":
+                merge(item["result"])
+        if pending:
+            try:
+                merge(cmd_apply(team, hermes, only=list(pending),
+                                sync_shared=[n for n, it in pending.items() if it["plan"]["kind"] == "reactivated"],
+                                on_member_error=lambda member, exc: undo(pending[member["name"]], exc)))
+            except Exception as exc:  # noqa: BLE001 — gagal di luar profile anggota (template, host gateway)
+                if hermes.dry_run:
+                    raise
+                for item in pending.values():
+                    if item["status"] != "failed":
+                        undo(item, exc)
+                # Samakan lagi host gateway + roster dengan members.yaml yang sekarang (tanpa anggota batal).
+                try:
+                    merge(cmd_apply(team, hermes, only=[], host_only=True))
+                except Exception as sync_exc:  # noqa: BLE001
+                    hermes.failures.append(f"sinkronisasi host setelah pembatalan gagal: {sync_exc}")
+        members = []
+        for item in items:
+            member = item["plan"]["member"]
+            marker = f" {shlex.join(Hermes.profile_args(member['profile']))} "
+            own = [f for f in hermes.failures if marker in f]
+            if item["status"] == "failed":
+                own = [item["error"]] + own
+            elif item["plan"]["kind"] == "exists":
+                own = list(dict.fromkeys(list(item["result"].get("failures", [])) + own))
+            members.append({"status": item["status"], "user_id": item["user_id"], "member": member,
+                            "notes": item["notes"], "failures": own})
+        failed = [m for m in members if m["status"] == "failed"]
+        return {"members": members, "failed": failed, **summary,
+                "failures": [f"{m['member']['name']} ({m['user_id']}): {m['failures'][0]}" for m in failed]
+                + list(hermes.failures)}
 
 
 def offboard_member(team: dict, hermes: Hermes, *, user_id: str, hide_channel: bool = True,
@@ -2432,7 +2720,13 @@ def describe(team: dict, hermes: Optional[Hermes] = None) -> str:
                   f"Fallback: {', '.join(llm['fallback']) or '-'}; auxiliary: {llm['aux_model']}"]
     s = team["scale"]
     lines += ["", f"Skala: {s['max_concurrent_sessions']} sesi aktif, {s['user_rate_per_minute']} pesan/menit/orang "
-              f"(burst {s['user_burst']}), antre maks {s['queue_max_wait_seconds']} dtk, busy={s['busy_input_mode']}"]
+              f"(burst {s['user_burst']}), antre maks {s['queue_max_wait_seconds']} dtk, busy={s['busy_input_mode']}",
+              f"       {s['user_max_concurrent']} sesi/orang, LLM paralel {s['max_llm_parallel'] or 'tak dibatasi'}, "
+              f"anggaran token/hari: orang {s['daily_token_budget'] or 'tanpa batas'}, "
+              f"tim {s['team_daily_token_budget'] or 'tanpa batas'}; "
+              f"cron anggota {'boleh' if s['allow_member_cron'] else 'mati'}, "
+              f"/goal {'boleh' if s['allow_goals'] else 'mati'}, "
+              f"retensi sesi {str(s['session_retention_days']) + ' hari' if s['session_retention_days'] else 'tidak diatur'}"]
     ob = team["onboarding"]
     if ob["enabled"]:
         entry = f"role entry {team['entry_role']}" if team["entry_role"] else "tanpa role entry"
@@ -2523,6 +2817,11 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     p.add_argument("--name", default="", help="paksa nama anggota (default: dari username)")
     p.add_argument("--model", default="")
     p.add_argument("--events", action="store_true", help="keluaran JSON per baris (untuk plugin)")
+    p = sub.add_parser("onboard-batch", parents=[common],
+                       help="onboarding massal: semua channel dulu, lalu SATU apply")
+    p.add_argument("--file", required=True,
+                   help="berkas YAML/JSON: daftar {user_id, username?, display_name?, name?, model?}")
+    p.add_argument("--events", action="store_true", help="keluaran JSON per baris (untuk plugin)")
     p = sub.add_parser("offboard", parents=[common], help="nonaktifkan anggota dari user Discord (data tetap)")
     p.add_argument("--user-id", required=True)
     p.add_argument("--keep-channel-access", action="store_true", help="jangan cabut izin melihat channel")
@@ -2563,6 +2862,7 @@ def _run(args: argparse.Namespace, events: bool) -> None:
 
     if args.command == "check":
         print(describe(team))
+        _print_warnings(team)
         print("\nKonfigurasi valid.")
         return
     if args.command == "managed":
@@ -2588,6 +2888,9 @@ def _run(args: argparse.Namespace, events: bool) -> None:
         sys.exit(f"CLI hermes tidak ditemukan ({hermes_bin}). Pasang Hermes dulu atau pakai --hermes-bin.")
     if args.command in ("onboard", "offboard"):
         _cmd_membership(team, hermes, args, events)
+        return
+    if args.command == "onboard-batch":
+        _cmd_onboard_batch(team, hermes, args, events)
         return
     try:
         if args.command == "apply":
@@ -2642,21 +2945,71 @@ def _cmd_membership(team: dict, hermes: Hermes, args: argparse.Namespace, events
             emit("error", message=str(exc), log=hermes.log[-15:])
             sys.exit(1)
         sys.exit(f"gagal: {exc}")
-    member = result.get("member") or {}
-    summary = {
-        "status": result["status"], "user_id": args.user_id, "name": member.get("name"),
-        "display_name": member.get("display_name"), "profile": member.get("profile"),
-        "channel_id": member.get("channel_id"),
-        "model": model_alias(team, "member", member) if (team["llm"] and member) else "",
-        "notes": result.get("notes", []), "restart_needed": bool(result.get("restart_needed")),
-        "live_changed": result.get("live_changed", []), "failures": result.get("failures", []),
-    }
+    summary = _membership_summary(team, result, args.user_id)
     if events:
         emit("result", **summary)
         sys.exit(3 if summary["failures"] else 0)
     print(json.dumps(summary, indent=2, ensure_ascii=False))
     if summary["failures"]:
         sys.exit(1)
+
+
+def _membership_summary(team: dict, result: dict, user_id: str) -> dict:
+    """Isi event `result` (dan keluaran JSON tanpa --events) untuk satu anggota."""
+    member = result.get("member") or {}
+    return {
+        "status": result["status"], "user_id": user_id, "name": member.get("name"),
+        "display_name": member.get("display_name"), "profile": member.get("profile"),
+        "channel_id": member.get("channel_id"),
+        "model": model_alias(team, "member", member) if (team["llm"] and member) else "",
+        "notes": result.get("notes", []), "restart_needed": bool(result.get("restart_needed")),
+        "live_changed": result.get("live_changed", []), "failures": result.get("failures", []),
+    }
+
+
+def _cmd_onboard_batch(team: dict, hermes: Hermes, args: argparse.Namespace, events: bool) -> None:
+    """onboard-batch. Dengan --events: baris `channel` dan `result` per anggota (bentuknya sama dengan
+    `onboard`, ditambah `user_id` di baris `channel`), lalu satu baris `summary`. Exit 3 bila ada yang gagal."""
+    def emit(event: str, **fields: Any) -> None:
+        if events:
+            print(json.dumps({"event": event, **fields}, ensure_ascii=False), flush=True)
+        elif event == "channel":
+            print(f"  • {fields.get('user_id')}: channel {fields.get('channel_id')}"
+                  + (" (baru)" if fields.get("created") else ""))
+
+    try:
+        result = onboard_batch(team, hermes, load_batch_file(Path(args.file)), emit=emit)
+    except TeamError as exc:
+        if events:
+            emit("error", message=str(exc), log=hermes.log[-15:])
+            sys.exit(1)
+        sys.exit(f"gagal: {exc}")
+    rows = [_membership_summary(team, {**m, "restart_needed": result["restart_needed"],
+                                       "live_changed": result["live_changed"]}, m["user_id"])
+            for m in result["members"]]
+    counts: dict = {}
+    for row in rows:
+        counts[row["status"]] = counts.get(row["status"], 0) + 1
+    summary = {"total": len(rows), "counts": counts,
+               "failed": [{"user_id": r["user_id"], "name": r["name"], "error": (r["failures"] or [""])[0]}
+                          for r in rows if r["status"] == "failed"],
+               "restart_needed": result["restart_needed"], "live_changed": result["live_changed"],
+               "failures": result["failures"]}
+    if events:
+        for row in rows:
+            emit("result", **row)
+        emit("summary", **summary)
+    else:
+        for row in rows:
+            mark = "✗" if row["status"] == "failed" else "✓"
+            print(f"  {mark} {row['name']} ({row['user_id']}): {row['status']}"
+                  + (f" — {row['failures'][0]}" if row["failures"] else ""))
+            for note in row["notes"]:
+                print(f"      • {note}")
+        print(f"\n{len(rows)} entri: " + ", ".join(f"{n} {k}" for k, n in sorted(counts.items())))
+        _print_apply_tail(team, hermes, result)
+    if summary["failures"]:
+        sys.exit(3)
 
 
 def _llm_key_target(team: dict, who: str) -> tuple[str, str]:
@@ -2705,10 +3058,20 @@ def _cmd_llm_key(team: dict, hermes: Hermes, who: str, *, use_stdin: bool = Fals
     print(f"✓ {key_env} disimpan di {path}. Ingat: nilai di /etc/hermes/.env (kalau ada) selalu menang.")
 
 
+def _print_warnings(team: dict) -> None:
+    """Peringatan konfigurasi (tidak menggagalkan `check`/`apply`)."""
+    warnings = fallback_warnings(team)
+    if warnings:
+        print("\n⚠️  Peringatan:")
+        for line in warnings:
+            print(f"  • {line}")
+
+
 def _print_apply_tail(team: dict, hermes: Hermes, result: dict) -> None:
     print("\nSelesai." if not hermes.failures else f"\nSelesai dengan {len(hermes.failures)} kegagalan:")
     for failure in hermes.failures:
         print(f"  ✗ {failure}")
+    _print_warnings(team)
     known = {m["profile"] for m in team["members"]} | {team["template"]}
     profiles_dir = hermes.root / "profiles"
     stale = sorted(d.name for d in profiles_dir.iterdir()

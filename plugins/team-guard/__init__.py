@@ -4,8 +4,10 @@ Dipasang ke SEMUA profile (host/default, be-<nama>, team-shared, team-admin). He
 modul per profile; state yang harus tunggal per proses ada di `shared.py`.
 
   semua profile : penyamaran secret (terminal / hasil tool / jawaban AI / request model), guard dump
-                  environment, petunjuk nama secret, pencatat giliran untuk antrean, pre_gateway_dispatch
-  host saja     : listener Discord (onboarding), /env-set, live reload rute, pengawas roster.json
+                  environment, penjaga jadwal cron, petunjuk nama secret, pencatat giliran dan panggilan LLM
+                  (antrean adil, batas sesi per orang, pembatas adaptif, anggaran token), pre_gateway_dispatch
+  host saja     : listener Discord (onboarding), /env-set, live reload rute, pengawas roster.json,
+                  metrics.json + peringatan beban ke #hermes-admin
 
 Konfigurasi: hanya `<state_dir>/roster.json` (ditulis hermes_team.py) dan
 `plugins.entries.team-guard.settings.state_dir`.
@@ -108,6 +110,10 @@ def register(ctx: Any) -> None:
     _try("hook pre_llm_call", lambda: ctx.register_hook("pre_llm_call", hooks.on_pre_llm_call))
     _try("hook on_session_start", lambda: ctx.register_hook("on_session_start", hooks.on_session_start))
     _try("hook on_session_end", lambda: ctx.register_hook("on_session_end", hooks.on_session_end))
+    # Pengamat panggilan LLM: beban nyata (termasuk cron, /goal, subagent) + 429 untuk pembatas adaptif.
+    _try("hook pre_api_request", lambda: ctx.register_hook("pre_api_request", hooks.on_pre_api_request))
+    _try("hook post_api_request", lambda: ctx.register_hook("post_api_request", hooks.on_post_api_request))
+    _try("hook api_request_error", lambda: ctx.register_hook("api_request_error", hooks.on_api_request_error))
     _try("system prompt section", lambda: ctx.register_system_prompt_section(
         PROMPT_SECTION_ID, hooks.prompt_section, position="after_memory", max_chars=2000))
     # Pola vendor statis ke redaktor bawaan Hermes (log + output). Nilai tersimpan TIDAK lewat sini —
@@ -121,6 +127,12 @@ def register(ctx: Any) -> None:
         def _unload() -> None:
             # Bisa dipanggil dari thread lain (reload-plugins): tutup jembatan di loop gateway, dan simpan
             # client-nya supaya salinan plugin berikutnya memasang ulang listener tanpa menunggu reconnect.
+            # Pesan yang masih menunggu di antrean tidak akan diproses: penunggunya berhenti dan mengabari
+            # pemiliknya supaya mengirim ulang (sebisanya; lihat Dispatcher._admit).
+            try:
+                rt.queue.cancel_all()
+            except Exception:
+                pass
             bridge = rt.host
             if bridge is None:
                 return

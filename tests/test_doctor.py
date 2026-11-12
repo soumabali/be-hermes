@@ -202,3 +202,112 @@ def test_usage_ledger_fresh_is_clean_stale_warns_and_loose_mode_errors(env):
     rep = kd.Report()
     kd.check_usage(team, rep, now=1_800_000_000.0 + 600)
     assert rep.errors == 1 and "0600" in rep.items[0]["message"]
+
+
+# ----------------------------------------------------------------------------- --docker (sandbox & state.db)
+PS = ("aaa111aaa111\tbe-andi\trunning\thermes-be-andi\n"
+      "bbb222bbb222\tteam-shared\texited\thermes-team-shared\n"
+      "ccc333ccc333\tbe-lama\trunning\thermes-be-lama\n")
+STATS = "aaa111aaa111\t512MiB / 2GiB\nccc333ccc333\t1.5GiB / 2GiB\n"
+
+
+def fake_docker(ps=PS, stats=STATS, calls=None):
+    def run(cmd):
+        if calls is not None:
+            calls.append(cmd)
+        if cmd[:2] == ["docker", "ps"]:
+            return 0, ps
+        if cmd[:2] == ["docker", "stats"]:
+            return 0, stats
+        return 1, "perintah tak terduga"
+    return run
+
+
+def meminfo(tmp, gib):
+    path = tmp / "meminfo"
+    path.write_text(f"MemTotal:       {gib * 1024 * 1024} kB\nMemFree:  1 kB\n")
+    return path
+
+
+def docker_report(team, root, tmp, run, gib=16):
+    rep = kd.Report()
+    kd.check_docker(team, root, rep, run=run, meminfo=meminfo(tmp, gib))
+    return rep
+
+
+def test_parse_size_units():
+    assert kd.parse_size("512MiB") == 512 * 1024 ** 2 and kd.parse_size("1.5GiB") == int(1.5 * 1024 ** 3)
+    assert kd.parse_size("0B") == 0 and kd.parse_size(" 2 kB ") == 2000
+    assert kd.parse_size("banyak") is None and kd.parse_size("") is None and kd.parse_size("5XB") is None
+
+
+def test_docker_reports_state_and_ram_per_profile(env):
+    team, root, tmp = env
+    calls = []
+    rep = docker_report(team, root, tmp, fake_docker(calls=calls))
+    info = [i["message"] for i in rep.items if i["level"] == kd.INFO]
+    assert any(m.startswith("be-andi: container hermes-be-andi: running, RAM 512 MB") for m in info)
+    assert any(m.startswith("team-shared: container hermes-team-shared: exited") and "RAM" not in m for m in info)
+    assert any(m.startswith("team-admin: container: belum ada") for m in info)
+    assert any(m.startswith("be-lama (profile tidak ada di members.yaml)") and "RAM 1536 MB" in m for m in info)
+    assert any("total RAM sandbox yang berjalan: 2048 MB dari 16384 MB RAM server (12%)" in m for m in info)
+    assert rep.errors == 0 and not [i for i in rep.items if i["level"] == kd.WARN]
+    # hanya perintah baca: `docker ps` berlabel hermes-profile, lalu `docker stats --no-stream` untuk yang berjalan
+    assert [c[:2] for c in calls] == [["docker", "ps"], ["docker", "stats"]]
+    assert "label=hermes-profile" in calls[0] and "--no-stream" in calls[1]
+    assert calls[1][-2:] == ["aaa111aaa111", "ccc333ccc333"]
+
+
+def test_docker_missing_is_a_single_warning_and_state_db_still_checked(env):
+    team, root, tmp = env
+    (root / "profiles" / "be-andi" / "state.db").write_bytes(b"x" * 2048)
+
+    def missing(cmd):
+        raise FileNotFoundError(2, "No such file or directory: 'docker'")
+
+    rep = docker_report(team, root, tmp, missing)
+    warns = [i for i in rep.items if i["level"] == kd.WARN]
+    assert len(warns) == 1 and "docker tidak bisa diperiksa" in warns[0]["message"] and rep.errors == 0
+    assert any(i["message"] == "be-andi: state.db 0 MB" for i in rep.items)
+    assert not any("total RAM" in i["message"] for i in rep.items)
+
+    rep = docker_report(team, root, tmp, lambda cmd: (1, "Cannot connect to the Docker daemon"))
+    warns = [i for i in rep.items if i["level"] == kd.WARN]
+    assert len(warns) == 1 and "Cannot connect" in warns[0]["message"]
+
+
+def test_docker_warns_on_big_state_db_and_high_ram(env, monkeypatch):
+    team, root, tmp = env
+    db = root / "profiles" / "be-andi" / "state.db"
+    db.write_bytes(b"x" * 4096)
+    (root / "profiles" / "be-andi" / "state.db-wal").write_bytes(b"x" * 4096)
+    monkeypatch.setattr(kd, "STATE_DB_WARN_BYTES", 6000)                   # 4096 + 4096 (wal ikut dihitung) > 6000
+    rep = docker_report(team, root, tmp, fake_docker(), gib=2)               # 2048 MB dari 2048 MB = 100%
+    warns = [i["message"] for i in rep.items if i["level"] == kd.WARN]
+    assert len(warns) == 2
+    assert any("state.db profile be-andi" in w for w in warns)
+    assert any("total RAM sandbox" in w and "di atas 80%" in w for w in warns)
+    monkeypatch.setattr(kd, "STATE_DB_WARN_BYTES", 500 * 1024 * 1024)
+    rep = docker_report(team, root, tmp, fake_docker(), gib=3)               # 68% → tidak diperingatkan
+    assert not [i for i in rep.items if i["level"] == kd.WARN]
+
+
+def test_docker_without_running_containers_skips_stats(env):
+    team, root, tmp = env
+    calls = []
+    rep = docker_report(team, root, tmp, fake_docker(ps="bbb222bbb222\tteam-shared\texited\tx\n", calls=calls))
+    assert [c[:2] for c in calls] == [["docker", "ps"]]
+    assert any("total RAM sandbox yang berjalan: 0 MB" in i["message"] for i in rep.items)
+
+
+def test_main_docker_flag_is_wired(env, monkeypatch, capsys):
+    team, root, _ = env
+    sync(team, root)
+    seen = []
+    monkeypatch.setattr(kd, "check_docker", lambda team, root, rep: seen.append(root) or rep.add(kd.INFO, "sandbox", "ok"))
+    argv = ["--config", team["paths"]["team_file"], "--members", team["paths"]["members_file"],
+            "--hermes-root", str(root)]
+    kd.main(argv)
+    assert seen == []
+    kd.main(argv + ["--docker", "--format", "json"])
+    assert seen == [root] and '"sandbox"' in capsys.readouterr().out

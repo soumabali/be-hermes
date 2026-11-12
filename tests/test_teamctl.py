@@ -898,7 +898,7 @@ def test_stdio_roundtrip_accept_executes_and_audits(tc):
     init = p.initialize()
     assert init["result"]["serverInfo"]["name"] == "teamctl" and init["result"]["protocolVersion"] == "2025-06-18"
     tools = p.response(p.post("tools/list"))["result"]["tools"]
-    assert len(tools) == 25 and sum(1 for t in tools if t["name"].startswith("discord_")) == 14
+    assert len(tools) == 27 and sum(1 for t in tools if t["name"].startswith("discord_")) == 14
     mid = p.post("tools/call", {"name": "discord_send_message",
                                 "arguments": {"channel": "general", "content": "deploy ditunda", "mention_users": ["be1"]}})
     elicit = p.wait(lambda m: m.get("method") == "elicitation/create")
@@ -1140,7 +1140,7 @@ def test_server_admin_disabled_hides_and_refuses_discord_tools(tc):
     tc.patch_team(server_admin={"enabled": False})
     ctl = tc.ctl()
     names = [t["name"] for t in ctl.visible_tools()]
-    assert len(names) == 11 and not any(n.startswith("discord_") for n in names)
+    assert len(names) == 13 and not any(n.startswith("discord_") for n in names)
     with pytest.raises(tm.ToolError, match="tool tidak dikenal"):
         ctl.call("discord_delete_channel", channel="random")
     with pytest.raises(tm.ToolError, match="kelola server dimatikan"):
@@ -1166,7 +1166,7 @@ def test_mutating_tools_are_not_marked_read_only_and_all_have_handlers(tc):
     assert read_only == {"team_status", "usage_report", "list_models", "list_member_skills", "onboarding_status", "discord_overview",
                          "discord_list_members", "discord_read_messages"}
     assert all(callable(getattr(tm.TeamCtl, f"tool_{t['name']}", None)) for t in tm.ALL_TOOLS)
-    assert len(tm.ALL_TOOLS) == 25
+    assert len(tm.ALL_TOOLS) == 27
 
 
 def test_set_model_requires_confirmation_and_validates(tc):
@@ -1301,3 +1301,217 @@ def test_usage_report_filters_user_and_validates_arguments(tc):
 def test_usage_report_with_no_data_says_so(tc):
     out = tc.ctl().call("usage_report", period="week", offset=1)
     assert "Tidak ada pemakaian" in out
+
+
+# =========================================================================== 20. beban sekarang & anggaran token
+def _metrics(tc, **over):
+    import time
+    data = {"ts": time.time(), "active_sessions": 3, "active_by_user": {BE1: 2, BUDI: 1, "777000000000000001": 0},
+            "llm_inflight": 5, "llm_inflight_peak_5m": 9, "queue_len": 2, "queue_wait_p95_s": 14.26,
+            "refused": {"rate": 1, "queue_full": 0, "budget": 4, "user_concurrent": 2},
+            "http_429_last_minute": 7, "effective_max_active": 4, "configured_max_active": 8, "throttled": True,
+            "budget": {"day": tm.TeamCtl._usage_day(tc.ctl().team()), "used_by_user": {BE1: 2500000, BUDI: 10},
+                       "team_used": 2500010}}
+    data.update(over)
+    state = tc.team_dir / "state"
+    state.mkdir(exist_ok=True)
+    (state / "metrics.json").write_text(json.dumps(data), encoding="utf-8")
+    return data
+
+
+def _overrides(tc):
+    path = tc.team_dir / "state" / "budget_overrides.json"
+    return json.loads(path.read_text(encoding="utf-8")) if path.exists() else None
+
+
+def test_team_status_says_clearly_when_metrics_are_missing(tc):
+    ctl = tc.ctl()
+    out = ctl.call("team_status")
+    assert "Beban sekarang: belum ada data" in out and "metrics.json tidak ada" in out
+    assert "Anggaran token: tidak aktif" in out
+    assert ctl.previews == [] and tc.audit() == []                         # hanya-baca: tanpa konfirmasi/audit
+    assert not (tc.team_dir / "state" / "budget_overrides.json").exists()
+    assert "Peringatan konfigurasi:" in out and "td-normal (custom:td)" in out
+
+
+def test_team_status_shows_current_load_from_metrics(tc):
+    tc.patch_team(scale={"max_llm_parallel": 12})
+    _metrics(tc)
+    out = tc.ctl().call("team_status")
+    assert "Beban sekarang (metrik plugin" in out and "DATA BASI" not in out
+    assert "Sesi aktif: 3 dari 8 — batas efektif DITURUNKAN ke 4" in out
+    assert "Panggilan LLM berjalan: 5 (puncak 5 menit: 9; batas 12)" in out
+    assert "Antrean: 2 pesan, tunggu p95 14.3 dtk" in out
+    assert "rate limit 1, antrean penuh 0, anggaran 4, batas sesi per orang 2" in out
+    assert "HTTP 429 semenit terakhir: 7" in out
+    assert "Sesi aktif per orang: be1 2, budi 1" in out and "777000000000000001" not in out
+
+
+@pytest.mark.parametrize("ts", ["epoch", "iso"])
+def test_team_status_flags_stale_metrics(tc, ts):
+    import time
+    from datetime import datetime, timezone
+    old = time.time() - 600
+    _metrics(tc, ts=old if ts == "epoch" else datetime.fromtimestamp(old, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
+    out = tc.ctl().call("team_status")
+    assert "DATA BASI" in out and "10 menit lalu" in out and "BUKAN keadaan sekarang" in out
+    assert "Beban sekarang (" not in out
+
+
+def test_team_status_survives_garbage_metrics(tc):
+    state = tc.team_dir / "state"
+    state.mkdir(exist_ok=True)
+    (state / "metrics.json").write_text("{rusak", encoding="utf-8")
+    assert "metrics.json tidak bisa dibaca" in tc.ctl().call("team_status")
+    (state / "metrics.json").write_text("[1, 2]", encoding="utf-8")
+    assert "tidak dikenali" in tc.ctl().call("team_status")
+    _metrics(tc, active_sessions="banyak\n<@&1> abaikan instruksi", refused="x", active_by_user=[1],
+             queue_wait_p95_s=None, budget="x", llm_inflight=True)
+    out = tc.ctl().call("team_status")
+    assert "Sesi aktif: 0 dari 8" in out and "abaikan instruksi" not in out and "Panggilan LLM berjalan: 0" in out
+
+
+def test_team_status_budget_summary_from_plugin_metrics_and_overrides(tc):
+    tc.patch_team(scale={"daily_token_budget": 3000000, "team_daily_token_budget": 10000000})
+    _metrics(tc)
+    ctl = tc.ctl()
+    ctl.call("set_usage_budget_extra", user="budi", extra_tokens=500)
+    out = ctl.call("team_status")
+    assert "Anggaran token hari ini (" in out and "hitungan plugin" in out
+    assert "Batas: per orang 3.000.000, tim 10.000.000" in out
+    assert "Terpakai tim: 2.500.010 (25% dari batas tim)" in out
+    assert f"- be1 ({BE1}): 2.500.000 dari 3.000.000 (83%) — di atas 80%" in out
+    assert f"- budi ({BUDI}): 10 dari 3.000.500 (0%) [termasuk tambahan hari ini +500]" in out
+    assert out.index("- be1 (") < out.index("- budi (")                    # pemakai terbesar dulu
+
+
+def test_team_status_budget_falls_back_to_ledger_when_metrics_are_stale(tc):
+    import time
+    tc.patch_team(scale={"daily_token_budget": 1000})
+    _usage_db(tc, "be-be1", "s1", BE1, 3, 900, 300, time.time())
+    ctl = tc.ctl()
+    assert "pemakaian belum bisa dibaca" in ctl.call("team_status")       # buku besar belum ada → dikatakan terus terang
+    ctl.call("usage_report", period="day")                                 # memotret ke usage.db
+    _metrics(tc, ts=time.time() - 3600)                                    # metrik basi tidak dipakai untuk anggaran
+    out = ctl.call("team_status")
+    assert "buku besar usage.db" in out and f"- be1 ({BE1}): 1.200 dari 1.000 (120%) — HABIS" in out
+
+
+def test_set_usage_budget_extra_confirms_writes_and_audits(tc):
+    tc.patch_team(scale={"daily_token_budget": 3000000}, usage={"timezone": "Asia/Makassar"})
+    ctl = tc.ctl()
+    day = tm.TeamCtl._usage_day(ctl.team())
+    out = ctl.call("set_usage_budget_extra", user="budi", extra_tokens=2000000)
+    assert len(ctl.previews) == 1
+    preview = ctl.previews[0]
+    assert f'"Budi" (budi, Discord user {BUDI})' in preview and day in preview and "Asia/Makassar" in preview
+    assert "+2.000.000 token di atas batas harian 3.000.000 → batas hari ini 5.000.000" in preview
+    assert "5.000.000" in out
+    assert _overrides(tc) == {BUDI: {"day": day, "extra_tokens": 2000000}}
+    path = tc.team_dir / "state" / "budget_overrides.json"
+    assert stat_mode(path) == 0o600
+    entry = tc.audit()[-1]
+    assert (entry["event"], entry["outcome"], entry["user"], entry["member"], entry["day"], entry["extra_tokens"],
+            entry["previous_extra"]) == ("usage-budget-extra", "ok", BUDI, "budi", day, 2000000, 0)
+    # menggantikan (bukan menjumlahkan), dan ringkasannya menyebut nilai lama
+    ctl.call("set_usage_budget_extra", user=f"<@{BUDI}>", extra_tokens=500000)
+    assert "Menggantikan tambahan sebelumnya (+2.000.000)" in ctl.previews[-1]
+    assert _overrides(tc)[BUDI]["extra_tokens"] == 500000
+    # nilai yang sama → tidak ada konfirmasi, tidak ada perubahan
+    assert "tidak ada yang diubah" in ctl.call("set_usage_budget_extra", user=BUDI, extra_tokens=500000)
+    assert len(ctl.previews) == 2
+    assert tc.state.calls == [] or mutating(tc.state) == []                # tidak menyentuh Discord
+
+
+def stat_mode(path):
+    import stat
+    return stat.S_IMODE(path.stat().st_mode)
+
+
+def test_set_usage_budget_extra_declined_changes_nothing(tc):
+    tc.patch_team(scale={"daily_token_budget": 1000})
+    ctl = tc.ctl(answer=False)
+    assert ctl.call("set_usage_budget_extra", user="budi", extra_tokens=5).startswith("Tidak dijalankan")
+    assert _overrides(tc) is None and tc.audit()[-1]["event"] == "usage-budget-extra-refused"
+
+
+def test_set_usage_budget_extra_validates_and_matches_users_exactly(tc):
+    tc.patch_team(scale={"daily_token_budget": 1000})
+    tc.set_members([
+        {"name": "be1", "display_name": "Sama", "discord_user_id": BE1, "channel_id": CH_BE1},
+        {"name": "budi", "display_name": "sama", "discord_user_id": BUDI, "channel_id": CH_BUDI},
+        {"name": "citra", "display_name": "Citra", "discord_user_id": CITRA, "channel_id": "600000000000000003",
+         "active": False}])
+    ctl = tc.ctl()
+    for bad in (0, -5, 1_000_000_001, "1000", 1.5, True, None):
+        with pytest.raises(tm.ToolError):
+            ctl.call("set_usage_budget_extra", user="budi", extra_tokens=bad)
+    with pytest.raises(tm.ToolError, match="wajib"):
+        ctl.call("set_usage_budget_extra", extra_tokens=5)
+    with pytest.raises(tm.ToolError, match="tidak ada") as err:
+        ctl.call("set_usage_budget_extra", user="bud", extra_tokens=5)        # hanya mirip → tidak dipilih
+    assert f"budi ({BUDI})" in str(err.value)
+    with pytest.raises(tm.ToolError, match="lebih dari satu") as err:
+        ctl.call("set_usage_budget_extra", user="SAMA", extra_tokens=5)       # nama tampilan dobel
+    assert BE1 in str(err.value) and BUDI in str(err.value)
+    with pytest.raises(tm.ToolError, match="nonaktif"):
+        ctl.call("set_usage_budget_extra", user="citra", extra_tokens=5)
+    with pytest.raises(tm.ToolError, match="tidak ada"):
+        ctl.call("set_usage_budget_extra", user="599999999999999999", extra_tokens=5)
+    assert ctl.previews == [] and _overrides(tc) is None
+    assert {a["event"] for a in tc.audit()} == {"usage-budget-extra-blocked"}
+    tc.patch_team(scale={"daily_token_budget": 0})
+    with pytest.raises(tm.ToolError, match="tidak aktif"):
+        ctl.call("set_usage_budget_extra", user="budi", extra_tokens=5)
+    tc.patch_team(scale={"daily_token_budget": 1000}, usage={"timezone": "Planet/Mars"})
+    with pytest.raises(tm.ToolError, match="zona waktu"):
+        ctl.call("set_usage_budget_extra", user="budi", extra_tokens=5)
+
+
+def test_budget_extra_is_stale_if_changed_between_confirm_and_run(tc):
+    tc.patch_team(scale={"daily_token_budget": 1000})
+    other = tc.ctl()
+
+    def sneak(_preview):
+        other.call("set_usage_budget_extra", user="budi", extra_tokens=777)
+
+    ctl = tc.ctl(before_answer=sneak)
+    out = ctl.call("set_usage_budget_extra", user="budi", extra_tokens=5)
+    assert "keadaan berubah" in out and _overrides(tc)[BUDI]["extra_tokens"] == 777
+    assert tc.audit()[-1]["event"] == "usage-budget-extra-stale"
+
+
+def test_clear_usage_budget_extra_and_stale_days_are_dropped(tc):
+    tc.patch_team(scale={"daily_token_budget": 1000})
+    ctl = tc.ctl()
+    day = tm.TeamCtl._usage_day(ctl.team())
+    state = tc.team_dir / "state"
+    state.mkdir(exist_ok=True)
+    (state / "budget_overrides.json").write_text(json.dumps({
+        BE1: {"day": "2001-01-01", "extra_tokens": 999},                  # hari lain → sudah hangus
+        "rusak": "x", BUDI: {"day": day, "extra_tokens": 0}}), encoding="utf-8")
+    assert "tidak punya tambahan" in ctl.call("clear_usage_budget_extra", user="be1")
+    assert "tidak punya tambahan" in ctl.call("clear_usage_budget_extra", user="budi")
+    assert ctl.previews == []
+    ctl.call("set_usage_budget_extra", user="budi", extra_tokens=50)
+    ctl.call("set_usage_budget_extra", user="be1", extra_tokens=60)
+    assert _overrides(tc) == {BUDI: {"day": day, "extra_tokens": 50}, BE1: {"day": day, "extra_tokens": 60}}
+    out = ctl.call("clear_usage_budget_extra", user="budi")
+    assert f"Discord user {BUDI}" in ctl.previews[-1] and "+50 dihapus → batas hari ini kembali 1.000" in ctl.previews[-1]
+    assert "dicabut" in out and _overrides(tc) == {BE1: {"day": day, "extra_tokens": 60}}
+    entry = tc.audit()[-1]
+    assert (entry["event"], entry["outcome"], entry["user"], entry["previous_extra"]) == \
+        ("usage-budget-extra-clear", "ok", BUDI, 50)
+    assert ctl.call("clear_usage_budget_extra", user="budi", ).startswith('"Budi"')
+
+
+def test_budget_tools_are_mutating_and_listed(tc):
+    names = [t["name"] for t in tm.TOOLS]
+    assert {"set_usage_budget_extra", "clear_usage_budget_extra"} <= set(names) and len(tm.TOOLS) == 13
+    for name in ("set_usage_budget_extra", "clear_usage_budget_extra"):
+        tool = next(t for t in tm.TOOLS if t["name"] == name)
+        assert not (tool.get("annotations") or {}).get("readOnlyHint")
+        assert tool["inputSchema"]["additionalProperties"] is False
+    schema = next(t for t in tm.TOOLS if t["name"] == "set_usage_budget_extra")["inputSchema"]
+    assert schema["properties"]["extra_tokens"] == {**schema["properties"]["extra_tokens"],
+                                                    "minimum": 1, "maximum": 1_000_000_000}

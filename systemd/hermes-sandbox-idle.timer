@@ -1,0 +1,12 @@
+# Pengamatan berkala pemakaian CPU sandbox. "Menganggur" dihitung antar-jalan, jadi selang ini adalah
+# ketelitian pengukurannya (lihat tools/sandbox_idle.py dan catatan BELUM TERBUKTI di berkas .service).
+[Unit]
+Description=Hermes team kit: periksa sandbox menganggur tiap 30 menit
+
+[Timer]
+OnCalendar=*:5/30
+Persistent=true
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target
