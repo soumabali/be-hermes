@@ -53,20 +53,27 @@ class TurnTracker:
         self._active: dict[str, tuple[str, float]] = {}        # session_id → (uid, mulai)
         self.starts = self.ends = 0
 
-    def reserve(self, user_id: str, now: float) -> None:
+    def reserve(self, user_id: str, now: float, chat_id: str = "") -> None:
         with self._lock:
-            self._reserved.append((str(user_id), now))
+            self._reserved.append((f"{user_id}:{chat_id}", now))
+
+    def holds(self, user_id: str, chat_id: str, now: float) -> bool:
+        """Orang ini sudah memegang reservasi untuk chat yang sama (pesan susulan → sesi yang sama)."""
+        key = f"{user_id}:{chat_id}"
+        with self._lock:
+            return any(k == key and now - t < self.reserve_ttl for k, t in self._reserved)
 
     def reserved(self, now: float) -> int:
         with self._lock:
-            self._reserved = [(u, t) for u, t in self._reserved if now - t < self.reserve_ttl]
+            self._reserved = [(k, t) for k, t in self._reserved if now - t < self.reserve_ttl]
             return len(self._reserved)
 
     def start(self, session_id: str, user_id: str, now: float, counted: bool = True) -> None:
         with self._lock:
             self.starts += 1
-            for i, (uid, _t) in enumerate(self._reserved):
-                if uid == str(user_id):
+            prefix = f"{user_id}:"
+            for i, (key, _t) in enumerate(self._reserved):
+                if key.startswith(prefix):
                     del self._reserved[i]
                     break
             if counted and session_id:

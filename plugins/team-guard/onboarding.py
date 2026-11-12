@@ -325,8 +325,8 @@ class Onboarder:
 
     # ------------------------------------------------------------------ onboard
     async def _verify_actor(self, uid: str, roster: Any, window: timedelta) -> tuple[bool, Optional[str], str]:
-        if not roster.onboarding.get("verify_actor", True):
-            return True, None, ""
+        if not roster.onboarding.get("verify_actor", True) or uid in roster.admins:
+            return True, None, ""             # admin tim yang memberi dirinya @backend = sudah disetujui admin
         guild = self.port.guild()
         if guild is None:
             return False, None, "server Discord belum termuat"

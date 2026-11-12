@@ -23,15 +23,17 @@ Perintah:
   set-model      ganti model AI anggota / shared / admin / lobby
   set-active     aktif/nonaktifkan anggota berdasarkan nama
   list-skills    daftar skill milik seorang anggota
-  share-skill    bagikan skill seorang anggota ke anggota lain atau semua anggota
+  share-skill    bagikan skill seorang anggota ke anggota lain atau semua anggota (ditolak bila pemindai
+                 keamanan Hermes tidak memberi verdict "safe"; --allow-unscanned bila pemindai tidak ada)
   unshare-skill  tarik kembali skill yang pernah dibagikan
-  llm-key        simpan API key LLM khusus satu profile (input tersembunyi)
+  llm-key        simpan API key LLM khusus satu profile (input tersembunyi; --stdin untuk pipe)
   status         ringkasan kondisi instalasi
 
 Semua perintah yang mengubah sesuatu memegang kunci tim (<team_dir>/.team.lock), jadi onboarding
 otomatis, tool admin, dan CLI tidak pernah saling menimpa.
 
-Jalankan sebagai user Linux yang menjalankan Hermes (bukan root).
+Jalankan sebagai user Linux yang menjalankan Hermes (bukan root). Kesalahan tak terduga dicetak satu
+baris; set HERMES_TEAM_DEBUG=1 untuk traceback lengkap.
 """
 from __future__ import annotations
 

@@ -612,7 +612,6 @@ def base_roster(state_dir: Path, hermes_root: Path, kit_script: Optional[Path] =
         "settings": {"rate_per_minute": 6, "burst": 4, "max_active": 8, "queue_max_wait": 180, "max_keys": 40,
                      "min_length": 6, "scrub_chat": True, "delete_secret_messages": True, "block_env_dump": True,
                      "hint": True, "allow_names": [], "deny_names": []},
-        "_members": [],
     }
     for name, uid, cid, model in members:
         roster_add(data, uid, name, cid, model=model)
@@ -839,7 +838,7 @@ class Env:
         self.bot = FakeBot()
         g = self.bot.guild
         g.add(FakeMember(OWNER, "owner"))
-        g.add(FakeMember(ADMIN, "adminbe", (ROLE_ADMIN, ROLE_MEMBER)))
+        g.add(FakeMember(ADMIN, "adminbe", (ROLE_ADMIN,)))
         g.add(FakeMember(U_BE1, "be1", (ROLE_MEMBER,)))
         g.add(FakeMember(U_BUDI, "budi", (ROLE_MEMBER,)))
         g.add(FakeMember(BOT, "hermes", (), bot=True))

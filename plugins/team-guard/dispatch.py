@@ -167,6 +167,9 @@ class Dispatcher:
         if max_active <= 0 or self.probe(gateway, self.clock()) is None or self._session_running(gateway, source):
             return True
         turns, queue = self.rt.turns, self.rt.queue
+        chat = str(getattr(source, "chat_id", "") or "")
+        if turns.holds(uid, chat, self.clock()):
+            return True                       # pesan beruntun ke sesi yang baru saja diloloskan
 
         def free() -> Optional[bool]:
             now = self.clock()
@@ -179,7 +182,7 @@ class Dispatcher:
                 queue, ticket, free=free, max_wait=max_wait, clock=self.clock, sleep=self.sleep,
                 on_wait=lambda pos: self._say(gateway, source, "queue", MSG_QUEUE.format(uid=uid, pos=pos)))
             if admitted:
-                turns.reserve(uid, self.clock())
+                turns.reserve(uid, self.clock(), chat)
             else:
                 await self._say(gateway, source, "queue-full", MSG_QUEUE_FULL.format(uid=uid, wait=int(max_wait)))
             return admitted
