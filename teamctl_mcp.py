@@ -208,7 +208,7 @@ TOOLS: list[dict] = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "user": {"type": "string", "description": "user ID, <@mention>, atau username"},
+                "user": {"type": "string", "description": "user ID, <@mention>, atau username PERSIS"},
                 "name": {"type": "string", "description": "opsional; default dari username (huruf kecil/angka/-/_)"},
                 "model": {"type": "string", "description": "opsional; alias dari list_models"},
             },
@@ -275,7 +275,7 @@ DISCORD_TOOLS: list[dict] = [
     {
         "name": "discord_edit_channel",
         "description": ("Ubah channel: nama, topik, kategori (\"none\" = keluarkan dari kategori), slowmode, posisi. "
-                        "Butuh konfirmasi."),
+                        "Channel pribadi anggota ditolak; channel/kategori tim hanya topik & slowmode. Butuh konfirmasi."),
         "inputSchema": {
             "type": "object",
             "properties": {"channel": _STR, "name": _STR, "topic": _STR, "category": _STR,
@@ -346,15 +346,17 @@ DISCORD_TOOLS: list[dict] = [
     },
     {
         "name": "discord_remove_role",
-        "description": ("Cabut role dari user. Mencabut @backend menonaktifkan anggota Hermes-nya (data tetap). Role admin "
-                        "hanya bisa dicabut manual. Butuh konfirmasi."),
+        "description": ("Cabut role dari user. Mencabut @backend menonaktifkan anggota Hermes-nya (data tetap). Role admin, "
+                        "role berizin tinggi, dan role milik admin/pemilik server hanya bisa dicabut manual. Butuh "
+                        "konfirmasi."),
         "inputSchema": {"type": "object", "properties": {"user": _STR, "role": _STR},
                         "required": ["user", "role"], "additionalProperties": False},
     },
     {
         "name": "discord_moderate_member",
         "description": ("Moderasi user: timeout (menit, maks 40320 = 28 hari), untimeout, atau kick. Admin tim, pemilik "
-                        "server, dan bot tidak bisa dimoderasi; ban selalu manual. Butuh konfirmasi."),
+                        "server, bot, dan pemegang izin tinggi tidak bisa dimoderasi; ban selalu manual. User harus "
+                        "ID, mention, atau username persis. Butuh konfirmasi."),
         "inputSchema": {
             "type": "object",
             "properties": {"user": _STR, "action": {"type": "string", "enum": ["timeout", "untimeout", "kick"]},
@@ -366,8 +368,9 @@ DISCORD_TOOLS: list[dict] = [
     },
     {
         "name": "discord_send_message",
-        "description": ("Kirim pesan/pengumuman sebagai bot ke sebuah channel. Tidak ada @everyone/@here/role ping; "
-                        "hanya user di mention_users yang di-ping. Butuh konfirmasi."),
+        "description": ("Kirim pesan/pengumuman sebagai bot ke sebuah channel (channel pribadi anggota ditolak). Tidak ada "
+                        "@everyone/@here/role ping; hanya user di mention_users yang di-ping. Seluruh isi pesan "
+                        "ditampilkan di konfirmasi."),
         "inputSchema": {
             "type": "object",
             "properties": {"channel": _STR, "content": {**_STR, "description": "maks 2000 karakter"},

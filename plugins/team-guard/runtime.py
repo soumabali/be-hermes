@@ -21,6 +21,7 @@ class Runtime:
         self.queue = AdmissionQueue()
         self.started = time.monotonic()          # dipakai aturan "jangan restart berulang"
         self.host: Any = None                    # HostBridge, diisi saat adapter Discord tersambung
+        self.detached: Any = None                # (native, adapter, loop) setelah plugin host di-unload
         self.dispatcher: Any = None
         self.profiles: dict[str, str] = {}       # profile → jenis (host/member/…) yang sudah memuat plugin
 
