@@ -4,9 +4,16 @@ Satu instalasi Hermes, satu bot Discord, satu gateway (mode multiplex), dan **sa
 orang**. Tiap channel dirutekan ke profile-nya, jadi memory, skill, SOUL.md, config, model,
 secret (`.env`), sesi, dan sandbox Docker tiap orang terpisah.
 
-> **Status:** 944 uji lulus memakai Discord tiruan dan stub API plugin. Kit **belum pernah
+> **Status:** hampir 1.000 uji lulus memakai Discord tiruan dan stub API plugin. Kit **belum pernah
 > dijalankan** terhadap Hermes, Discord, atau Docker sungguhan. Ikuti panduan ini di server uji
 > dulu, dan jalankan `tests/selftest.sh` (Langkah 9) sebelum dipakai tim.
+
+**Isi:** [Gambaran sistem](#gambaran-sistem) · [Instalasi dari nol](#panduan-instalasi-dari-nol) ·
+[Bila ada yang tidak jalan](#bila-ada-yang-tidak-jalan) · [Upgrade](#upgrade-dari-v30) · [Fitur](#fitur) ·
+[Isi kit](#isi-kit) · [Onboarding](#5-onboarding-otomatis) · [Tool admin](#6-tool-admin-di-hermes-admin) ·
+[Secret](#8-secret-pribadi-anggota) · [Thread & memory](#9-konteks--memory-tidak-campur-aduk) ·
+[Skala](#10-skala-20-orang) · [Pemakaian token](#10b-pencatatan-pemakaian-token-dan-request) ·
+[Operasional](#12-operasional) · [Batasan](#13-batasan)
 
 ## Gambaran sistem
 
@@ -268,8 +275,15 @@ llm:
   default_model: td-simple
 ```
 
-Setelan lain (sandbox, skala, secret, onboarding, thread) sudah punya nilai bawaan yang wajar dan
-dijelaskan di komentar berkas itu.
+Setelan lain sudah punya nilai bawaan yang wajar dan dijelaskan di komentar berkas itu. Dua yang
+layak ditinjau sekarang:
+
+```yaml
+threads:
+  personal: true              # tiap pesan baru di channel pribadi = thread/sesi baru
+usage:
+  timezone: "Asia/Makassar"   # batas hari laporan pemakaian; kosong = zona waktu server
+```
 
 `members.yaml`:
 - **Mulai kosong** (`members: []`) bila semua orang akan masuk lewat onboarding otomatis (beri role
@@ -363,7 +377,7 @@ Perhatikan baris awalnya. "Hermes terdeteksi" berarti uji integrasi (resolver ru
 daftar toolset) ikut jalan. Bila tertulis uji integrasi **dilewati**, kecocokan kit dengan versi
 Hermes-mu belum terbukti.
 
-Terakhir, periksa konsistensi:
+Terakhir, periksa konsistensi (rute, profile, channel, izin berkas, buku besar pemakaian):
 
 ```bash
 python3 /opt/hermes-team/kit_doctor.py --discord
@@ -455,43 +469,69 @@ Setelah perbaikan apa pun: `python3 /opt/hermes-team/kit_doctor.py --discord`.
 
 ## Upgrade dari v3.0
 
-Salin kit baru ke `/opt/hermes-team`, tambahkan blok `threads` dari `team.example.yaml` ke
-`team.yaml`-mu, jalankan `apply`, pasang ulang `/etc/hermes/config.yaml` (`managed`), lalu `/restart`
-**sekali**. Baca §12b untuk perubahan perilaku. SOUL.md yang sudah ada tidak ditimpa kecuali
-`--force-soul`.
+1. Perbarui kit: `sudo git -C /opt/hermes-team pull` (atau salin versi baru), pemilik tetap root.
+2. Tambahkan blok `threads` dan `usage` dari `team.example.yaml` ke `team.yaml`-mu.
+3. `python3 /opt/hermes-team/hermes_team.py apply`, lalu pasang ulang `/etc/hermes/config.yaml` (`managed`).
+4. Pasang timer pemakaian (§10b).
+5. `/restart` **sekali**, lalu `python3 /opt/hermes-team/kit_doctor.py --discord`.
+
+Baca §12b untuk perubahan perilaku. SOUL.md yang sudah ada tidak ditimpa kecuali `--force-soul`.
 
 ---
 
 # Referensi
 
-## Yang baru di v3
+## Fitur
+
+### Baru di v3.1
+
+| Fitur | Ringkasnya | Rinci |
+|---|---|---|
+| **Thread per percakapan** | Tiap pesan baru di channel pribadi membuka thread = sesi baru; konteks satu diskusi tidak tercampur diskusi lain. Memory, skill, secret, sandbox tetap sama. | §9, `team.yaml` → `threads` |
+| **Pencatatan pemakaian** | Token dan request per orang, per hari / minggu / bulan, di buku besar sendiri; diambil lewat CLI, tool `usage_report`, atau skill `team-usage-report`. | §10b |
+| **`doctor`** | Membandingkan members.yaml ↔ profile ↔ rute ↔ channel Discord ↔ buku besar pemakaian; hanya membaca. | §12 |
+| **Onboarding transaksional** | Validasi dulu, channel dipakai ulang, batal bersih bila gagal; profile sisa tidak diwarisi orang baru. | §12b |
+| **Parkir resmi** | Anggota nonaktif diparkir: adapter dan cron job-nya berhenti, data utuh. | §5, §12b |
+| **Pagar kelola server diperketat** | Konfirmasi divalidasi ulang setelah Approve, channel pribadi tak bisa diedit/dikirimi, pencabutan role dan penghapusan izin dijaga, tak ada cara mematikan konfirmasi. | §6 |
+| **Berbagi skill gagal-tertutup** | Hanya skill yang dinyatakan aman oleh pemindai Hermes yang dibagikan. | §12b |
+| **Lobby hanya-teks** | Semua toolset Hermes ditutup untuk profile default; CI gagal bila Hermes menambah toolset baru. | §12b |
+| **Image sandbox tim** | Dockerfile berisi toolchain backend. | Langkah 8 |
+| **Egress bawaan Hermes** | Sandbox hanya memegang token proxy, bukan key asli. | Langkah 8, §8 |
+| **Uji dan CI** | Uji unit + uji integrasi terhadap Hermes yang dipin dan `main` (mingguan); `selftest.sh` di server. | Langkah 9 |
+
+### Dari v3
 
 | Kebutuhan | Cara kit memenuhinya |
 |---|---|
 | User baru di server langsung dapat role entry | Plugin `team-guard` mendengar event *member join* dan memberi `roles.entry` (setelah lolos membership screening bila server memakainya). |
-| Setelah admin memberi @backend: channel, env, profile, sandbox sendiri | Event *role berubah* → plugin memeriksa siapa pemberinya (audit log), lalu menjalankan `hermes_team.py onboard`: channel privat `#hermes-<username>` (hanya dia + bot), profile `be-<username>` dari template (SOUL, memory kosong, `.env` sendiri, sandbox Docker sendiri, plugin, model default), rute gateway. |
+| Setelah admin memberi @backend: channel, env, profile, sandbox sendiri | Event *role berubah* → plugin memeriksa siapa pemberinya (audit log), lalu menjalankan `hermes_team.py onboard`: channel privat `#hermes-<username>` (hanya dia + bot), profile `be-<username>` dari template (SOUL, memory kosong, `.env` kosong, sandbox Docker sendiri, plugin, model default), rute gateway. |
 | Masukkan dia & bot ke channel, langsung sapa dengan mention | Izin channel hanya untuk orang itu + bot. Bot mengirim pesan sambutan yang me-mention dia (bisa diubah di `team.yaml`); role entry dicabut; admin dikabari di #hermes-admin. |
 | Tanpa restart | **Live reload**: plugin menerapkan rute & daftar channel baru ke gateway yang sedang jalan dan memverifikasinya. Gagal (mis. Hermes berubah) → restart halus otomatis saat tidak ada sesi aktif. |
 | Hermes bisa mengelola server Discord | 14 tool `discord_*` di #hermes-admin: lihat server/anggota, baca pesan channel non-pribadi, buat/ubah/hapus channel & role, atur izin, beri/cabut role, timeout/kick, kirim pengumuman. Semua dengan tombol konfirmasi dan pagar keamanan. |
 
-Tetap ada dari v2: tool admin (tambah anggota, bagikan skill, model per orang), `/env-set` aman,
-model terkunci untuk anggota, penyamaran secret berlapis, dan mekanisme skala 20 orang.
+Dari v2: tool admin (tambah anggota, bagikan skill, model per orang), `/env-set` aman, model terkunci
+untuk anggota, penyamaran secret berlapis, dan mekanisme skala 20 orang.
 
 ## Isi kit
+
+Semua berkas di bawah ada di repo ini; memasang kit berarti menyalin repo ke `/opt/hermes-team` (Langkah 5).
+Satu-satunya bagian yang dipasang terpisah adalah timer pemakaian (§10b); `kit_doctor.py` mengingatkan bila belum.
+
 
 | File | Fungsi |
 |---|---|
 | `kit_base.py`, `kit_discord.py` | Dasar (versi, `TeamError`, tokenizer `.env`) dan klien Discord REST ringan; diimpor `hermes_team.py` dan tetap terlihat sebagai `hermes_team.DiscordAPI` dst. |
 | `hermes_team.py` | CLI provisioning & operasi (check, apply, managed, add-member, onboard, offboard, set-model, share-skill, …). Juga dipakai plugin dan tool admin. |
-| `teamctl_mcp.py` | Server MCP tool admin + kelola server; dipasang otomatis hanya di profile `team-admin`. |
+| `teamctl_mcp.py` | Server MCP 25 tool: admin tim, kelola server Discord, dan `usage_report`; dipasang otomatis hanya di profile `team-admin`. |
 | `plugins/team-guard/` (v3.1.0, modul kecil: `onboarding`, `livereload`, `secrets`, `guard`, `redact`, `ratelimit`, …) | Plugin Hermes: `/env-set`, penyamaran secret, guard perintah, rate limit & antrean, **onboarding otomatis, live reload rute**. Dipasang ke semua profile. |
-| `team.example.yaml` | Setelan tim (guild, role, admin, channel, model, sandbox, skala, secret, onboarding, kelola server). |
+| `team.example.yaml` | Setelan tim (guild, role, admin, channel, model, sandbox, thread, skala, pemakaian, secret, onboarding, kelola server). |
 | `members.example.yaml` | Anggota + model per orang (juga ditulis otomatis oleh onboarding). |
-| `kit_doctor.py` | `doctor`: membandingkan members.yaml ↔ profile di disk ↔ rute gateway ↔ channel Discord (`--discord`), hanya membaca. |
+| `kit_doctor.py` | `doctor`: membandingkan members.yaml ↔ profile di disk ↔ rute gateway ↔ channel Discord (`--discord`) ↔ buku besar pemakaian; hanya membaca. |
 | `usage_ledger.py` | Buku besar pemakaian: token & request per orang per hari/minggu/bulan, tahan terhadap pembersihan sesi (§10b). |
-| `skills/team-usage-report/` | Skill admin untuk laporan pemakaian (dipanggil manual atau oleh cron). |
+| `skills/team-usage-report/` | Skill admin untuk laporan pemakaian (dipanggil manual atau oleh cron). Terbaca otomatis oleh profile `team-admin` setelah `apply`. |
 | `systemd/` | Timer user untuk memotret pemakaian tiap 15 menit. |
 | `usage_report.py` | Laporan sekali-jalan langsung dari `state.db` (tanpa buku besar). |
+| `docs/RENCANA-SKALA.md` | Celah skala yang sudah diketahui dan urutan perbaikannya. |
 | `docker/sandbox/` | Dockerfile image sandbox tim (PHP, Go, Java, Node, Python, klien DB, `gh`). |
 | `.github/workflows/ci.yml` | CI: uji unit + uji integrasi terhadap Hermes yang dipin dan `main` (mingguan). |
 | `tests/` | `selftest.sh` menguji seluruh kit memakai Python milik Hermes di server ini (HOME sementara, Discord tiruan). Uji integrasi (resolver rute, loader plugin) dilewati bila Hermes tidak bisa di-import. |
@@ -529,7 +569,8 @@ diberikan bersamaan diproses berurutan.
 ### Keluar tim
 
 - `@backend` dicabut, atau user keluar/di-kick dari server → anggota **dinonaktifkan**: rute dicabut
-  (live), izin melihat channel pribadinya dilepas, ia kembali mendapat `@entry` bila masih di server.
+  (live), izin melihat channel pribadinya dilepas, profile-nya diparkir (`gateway.parked`, sehingga cron
+  job-nya berhenti), dan ia kembali mendapat `@entry` bila masih di server.
   Profile, memory, secret, dan isi channel **tidak dihapus**.
 - `@backend` diberikan lagi → aktif kembali dengan channel dan memory lamanya, disambut
   "Halo lagi …". Kalau channelnya sudah dihapus, dibuatkan yang baru.
@@ -583,7 +624,8 @@ Tulis biasa, Hermes memanggil tool `teamctl`, menjelaskan rencananya, lalu menam
 | "Lanjutkan onboarding @dodi" / "jadikan @citra anggota, model td-normal" | `onboard_member`: channel + profile + rute (+ `@backend` bila belum), lalu sambutan otomatis. |
 | "Tambahkan anggota: nama be3, user ID 5000…, pakai channel 6000…" | `add_member` dengan nama/channel/model tertentu. |
 | "Ganti model be1 ke td-normal" / "semua anggota pakai td-simple" | `members.yaml` + config profile. Berlaku di sesi baru (`/new`). |
-| "Nonaktifkan citra" | Rute dicabut (live), akses channel dilepas, data tetap. |
+| "Nonaktifkan citra" | Rute dicabut (live), akses channel dilepas, profile diparkir, data tetap. |
+| "Pemakaian token minggu lalu" / "pemakaian budi bulan ini" | `usage_report`: request, token, sesi, biaya per orang. Hanya-baca, tanpa tombol konfirmasi (§10b). |
 | "Bagikan skill deploy-checklist milik be1 ke semua anggota" | Dipindai dulu (secret pemilik, pola kredensial, pemindai Hermes, symlink), lalu disalin ke `skills/shared/`. |
 
 ### Mengelola server Discord
@@ -893,16 +935,27 @@ Yang perlu diketahui admin saat naik dari v3.0:
 - Discord API: `Retry-After` dihormati, 5xx dicoba ulang (GET/PUT/DELETE saja), timeout menjadi `TeamError`.
 - `apply --only` dengan nama tak dikenal/nonaktif sekarang error; kode keluar 3 = sebagian gagal, 2 = galat tak terduga
   (`HERMES_TEAM_DEBUG=1` menampilkan traceback). Event `--events` `channel` bisa membawa `reused: true`.
+- **Thread per percakapan** aktif secara bawaan (`threads.personal: true`); `#hermes-admin` tetap satu aliran.
+  Setel `false` untuk perilaku lama (satu sesi per channel).
+- **Pencatatan pemakaian** baru berjalan setelah timer dipasang; tool `usage_report` juga memotret saat dipanggil.
+- Profile `team-admin` kini membaca skill bawaan kit dari `/opt/hermes-team/skills` (hanya-baca, milik root).
 - Plugin 3.1.0 butuh `plugins.isolation: in_process` (bawaan Hermes). Satu salinan modul dimuat per profile,
   jadi status lintas-profile disimpan di entri `sys.modules` sintetis (`shared.py`).
 - `hold_stream` (opsional, default mati): menahan jawaban AI sampai disamarkan; tanpa itu balasan yang
   mengandung secret bisa terlihat sesaat saat streaming.
 
-> **Belum pernah dijalankan terhadap Hermes/Discord sungguhan.** 938 uji lulus memakai Discord tiruan dan stub
+> **Belum pernah dijalankan terhadap Hermes/Discord sungguhan.** Seluruh uji lulus memakai Discord tiruan dan stub
 > API plugin; 14 uji integrasi (resolver rute, loader plugin, daftar toolset/config Hermes) hanya jalan di CI
 > atau `selftest.sh` di server yang punya Hermes. Jalankan itu dulu, lalu tes manual §11 di server uji.
 
 ## 13. Batasan
+
+- **Thread per percakapan** mengandalkan `discord.free_response_auto_thread` Hermes. Pesan berupa *balasan*
+  (reply) tidak membuka thread baru, dan thread diarsipkan otomatis oleh Discord (bisa dibuka lagi).
+  Satu orang bisa menjalankan beberapa thread sekaligus dan memakai beberapa slot sesi; pembatas per
+  orang belum ada (lihat [docs/RENCANA-SKALA.md](docs/RENCANA-SKALA.md)).
+- **Pencatatan pemakaian** hanya mencatat; belum ada anggaran atau pemblokiran otomatis. Batas hari bisa
+  bergeser paling lama selang timer. Laporan terjadwal ke channel lewat cron belum dibuat (§10b).
 
 - Live reload memakai struktur internal gateway Hermes (dicek dengan resolver rute Hermes sendiri
   setiap kali). Bila update Hermes mengubahnya, kit jatuh ke restart halus (atau `/restart` manual)

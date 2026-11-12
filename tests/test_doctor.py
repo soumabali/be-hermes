@@ -176,3 +176,29 @@ def test_render_and_exit_code_json(env):
     assert out["ok"] is False and out["items"]
     assert "error" in rep.render("text")
     assert kd.Report().render() .startswith("✓")
+
+
+# ----------------------------------------------------------------------------- buku besar pemakaian
+def test_usage_ledger_missing_warns_with_install_command(env):
+    team, *_ = env
+    rep = kd.Report()
+    kd.check_usage(team, rep)
+    assert rep.errors == 0 and rep.items[0]["area"] == "pemakaian"
+    assert "hermes-usage-collect.timer" in rep.items[0]["fix"]
+
+
+def test_usage_ledger_fresh_is_clean_stale_warns_and_loose_mode_errors(env):
+    import usage_ledger as ul
+    team, root, _ = env
+    ledger = Path(team["paths"]["state_dir"]) / "usage.db"
+    ul.collect(ledger, root, now=1_800_000_000.0)
+    rep = kd.Report()
+    kd.check_usage(team, rep, now=1_800_000_000.0 + 600)
+    assert rep.items == []
+    rep = kd.Report()
+    kd.check_usage(team, rep, now=1_800_000_000.0 + 7200)
+    assert [i["level"] for i in rep.items] == [kd.WARN] and "120 menit lalu" in rep.items[0]["message"]
+    ledger.chmod(0o644)
+    rep = kd.Report()
+    kd.check_usage(team, rep, now=1_800_000_000.0 + 600)
+    assert rep.errors == 1 and "0600" in rep.items[0]["message"]

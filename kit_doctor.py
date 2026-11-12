@@ -138,6 +138,35 @@ def check_local(team: dict, root: Path, rep: Report, ht: Any) -> None:
             alias = m.get("model") or llm["default_model"]
             if alias not in llm["models"]:
                 rep.add(ERROR, "model", f"{m['name']} memakai model '{alias}' yang tidak ada di katalog")
+    check_usage(team, rep)
+
+
+def check_usage(team: dict, rep: Report, now: Optional[float] = None) -> None:
+    """Buku besar pemakaian: ada, privat, dan masih dipotret (timer systemd terpasang)."""
+    import sqlite3
+    import time
+    ledger = Path(team["paths"]["state_dir"]) / "usage.db"
+    fix = ("pasang timer: cp /opt/hermes-team/systemd/hermes-usage-collect.* ~/.config/systemd/user/ && "
+           "systemctl --user daemon-reload && systemctl --user enable --now hermes-usage-collect.timer")
+    if not ledger.exists():
+        rep.add(WARN, "pemakaian", "buku besar pemakaian belum ada (token & request per orang tidak tercatat)", fix)
+        return
+    mode = stat.S_IMODE(ledger.stat().st_mode)
+    if mode & 0o077:
+        rep.add(ERROR, "pemakaian", f"{ledger} bermode {oct(mode)} (harus 0600)", f"chmod 600 {ledger}")
+    try:
+        con = sqlite3.connect(f"file:{ledger}?mode=ro", uri=True, timeout=5)
+        try:
+            row = con.execute("SELECT value FROM meta WHERE key='last_collect'").fetchone()
+        finally:
+            con.close()
+    except sqlite3.Error as exc:
+        rep.add(ERROR, "pemakaian", f"buku besar pemakaian tidak terbaca: {exc}")
+        return
+    age = (time.time() if now is None else now) - float(row[0]) if row else None
+    if age is None or age > 3600:
+        last = "belum pernah" if age is None else f"{int(age // 60)} menit lalu"
+        rep.add(WARN, "pemakaian", f"potret pemakaian terakhir: {last} (seharusnya tiap 15 menit)", fix)
 
 
 def check_discord(team: dict, rep: Report, ht: Any, api: Any) -> None:
