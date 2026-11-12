@@ -33,28 +33,11 @@ v3/
 arsip-versi-lama/v1, v2   # versi lama (referensi)
 ```
 
-## 3. YANG HILANG (penting)
-File berikut ada di container sebelumnya dan **tidak bisa dipulihkan** (container diganti dan
-isinya tidak ikut terlampir). Minta Claude baru membangunnya ulang dari spesifikasi di bawah:
-- `plugins/team-guard/__init__.py` (~2304 baris) + `plugin.yaml` v3.0.0
-- `tests/selftest.sh`, `test_kit_units.py`, `test_hermes_config.py`, `test_plugin.py`,
-  `test_teamctl.py`, `test_onboarding.py` (total terakhir: 375 PASS, 0 FAIL)
-- `fake_discord.py` sudah dibuat ulang (versi baru; isinya sama dengan yang terakhir dibaca).
-
-Spesifikasi plugin `team-guard` (apa yang dulu dilakukannya):
-- Listener Discord: `on_member_join`, `on_member_update`, `on_member_remove`.
-- `onboard_flow` / `offboard_flow`, `_activate_member`, `_sync_once`, `team_watcher`,
-  `reconcile_members` (jalankan `hermes_team.py` sebagai subprocess dengan `--events`).
-- `apply_live_gateway` / `verify_live_gateway`: reload rute tanpa restart (control socket
-  `rescan-profiles`); `_fallback_restart` (jangan loop restart bila gagal tepat setelah start;
-  beri tahu admin untuk `/restart` manual).
-- `find_role_actor` (audit log) dan `actor_trusted` (hanya pemberi role tepercaya yang memicu onboarding).
-- Gating di `_on_pre_gateway_dispatch`: user @backend yang belum terverifikasi ("held") tidak
-  boleh memakai `#hermes-shared`; `_unhold` saat role dicabut/keluar.
-- `render_welcome` (template `DEFAULT_WELCOME`, `DEFAULT_WELCOME_BACK`), `AllowedMentions`
-  agar hanya user target yang di-mention.
-- Hook/middleware: throttling, batas konteks, pencegahan pembocoran secret.
-- Plugin API Hermes: `register_hook`, `register_middleware`, `register_platform_handler`.
+## 3. Status pembangunan ulang (diperbarui)
+Plugin `plugins/team-guard` (v3.1.0) dan seluruh uji **sudah dibangun ulang** terhadap API plugin Hermes
+terbaru (adapter Discord kini plugin platform di `plugins/platforms/discord/`). Lihat README §12b untuk
+perubahan perilaku. Uji: `python -m pytest tests -q` (938 lulus, 14 integrasi dilewati tanpa Hermes).
+Belum diuji: Hermes sungguhan, Discord sungguhan, Docker sungguhan.
 
 ## 4. Fakta teknis kunci
 - Profile = `HERMES_HOME` terpisah (`~/.hermes/profiles/<name>`).
@@ -67,7 +50,7 @@ Spesifikasi plugin `team-guard` (apa yang dulu dilakukannya):
 - Restart: exit code 75 di bawah systemd (`RestartForceExitStatus=75`).
 - Scope terkelola: `/etc/hermes/config.yaml`; **token bot jangan** di `/etc/hermes/.env`,
   taruh di `~/.hermes/.env` (`DISCORD_BOT_TOKEN`).
-- Hermes butuh Python 3.14 (ruamel.yaml dipin untuk >=3.14).
+- Hermes terbaru mendukung Python 3.14 saja untuk instalasi baru (3.11–3.13 hanya agar update lama bisa lewat).
 - Uji: `import discord` harus sebelum `import gateway.run` (yang menggeser `sys.path`).
 - Guardrail server admin: channel pribadi tak tersentuh, role/channel tim terlindungi, izin
   elevated diblokir, tidak boleh moderasi admin/owner/bot, ban manual; hasil baca ditandai
