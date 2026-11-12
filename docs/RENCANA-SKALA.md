@@ -6,6 +6,29 @@ Dokumen ini menilai tabel "Skala 20 orang" di README §10 terhadap kode kit v3.1
 Status tiap temuan: **terbukti** = terlihat langsung di kode; **perlu diukur** = masuk akal dari
 kode/dokumentasi tetapi dampaknya baru jelas setelah diuji di server.
 
+## Status pengerjaan
+
+Rencana ini sudah dijalankan. "Selesai" berarti kodenya ada dan lulus uji unit serta simulasi;
+**tidak ada** yang sudah dijalankan terhadap Hermes, Discord, Docker, atau endpoint LLM sungguhan.
+
+| # | Butir | Status | Sisa |
+|---|---|---|---|
+| 1 | Batas sesi per orang | Selesai | Baru aktif penuh setelah satu sesi selesai sejak gateway start |
+| 2 | Cron, `/goal`, subagent | Selesai | Panggilan auxiliary (judul, kompresi) belum dihitung |
+| 3 | Fallback dan 429 | Selesai | Pembatas adaptif menurunkan batas sesi, bukan `max_llm_parallel` |
+| 4 | Ukur kapasitas endpoint | Selesai (`tools/probe_llm.py`) | Harus dijalankan di server; angka bawaan belum diganti |
+| 5 | Anggaran token | Selesai | Mati secara bawaan; status "sudah diperingatkan" hilang saat restart |
+| 6 | Sandbox menganggur dan RAM | Sebagian | `sandbox_idle.py` hanya melaporkan; `memory_mb` per orang dan bawaan 1024 belum |
+| 7 | Metrik | Selesai | Belum ada ekspor ke Prometheus/DataDog |
+| 8 | Antrean adil | Selesai | Antrean sesi-sibuk milik Hermes tetap di luar pembatas |
+| 9 | Kompresi per model | Belum | Butuh data pemakaian nyata dulu |
+| 10 | Retensi | Sebagian | Retensi sesi selesai; durasi arsip thread belum diatur |
+| 11 | Onboarding massal | Selesai (`onboard-batch`) | — |
+| 12 | Uji beban | Sebagian | Simulasi dan LLM tiruan ada; penggerak 20 user ke gateway sungguhan belum |
+
+Langkah berikutnya yang paling bernilai: jalankan `tools/probe_llm.py` di server, isi
+`max_llm_parallel`, lalu lakukan uji manual di `tests/loadtest/README.md`.
+
 ## Ringkasan
 
 Mekanisme yang ada membatasi **jumlah pesan** dan **jumlah sesi**, tetapi tiga hal yang paling

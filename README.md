@@ -470,7 +470,8 @@ Setelah perbaikan apa pun: `python3 /opt/hermes-team/kit_doctor.py --discord`.
 ## Upgrade dari v3.0
 
 1. Perbarui kit: `sudo git -C /opt/hermes-team pull` (atau salin versi baru), pemilik tetap root.
-2. Tambahkan blok `threads` dan `usage` dari `team.example.yaml` ke `team.yaml`-mu.
+2. Tambahkan blok `threads` dan `usage`, serta setelan `scale` baru, dari `team.example.yaml` ke `team.yaml`-mu.
+   Perhatikan: cron dan `/goal` untuk anggota mati secara bawaan (§10).
 3. `python3 /opt/hermes-team/hermes_team.py apply`, lalu pasang ulang `/etc/hermes/config.yaml` (`managed`).
 4. Pasang timer pemakaian (§10b).
 5. `/restart` **sekali**, lalu `python3 /opt/hermes-team/kit_doctor.py --discord`.
@@ -495,6 +496,8 @@ Baca §12b untuk perubahan perilaku. SOUL.md yang sudah ada tidak ditimpa kecual
 | **Pagar kelola server diperketat** | Konfirmasi divalidasi ulang setelah Approve, channel pribadi tak bisa diedit/dikirimi, pencabutan role dan penghapusan izin dijaga, tak ada cara mematikan konfirmasi. | §6 |
 | **Berbagi skill gagal-tertutup** | Hanya skill yang dinyatakan aman oleh pemindai Hermes yang dibagikan. | §12b |
 | **Lobby hanya-teks** | Semua toolset Hermes ditutup untuk profile default; CI gagal bila Hermes menambah toolset baru. | §12b |
+| **Pembatas skala berlapis** | Batas sesi per orang, antrean adil, penghitung panggilan LLM, pembatas adaptif saat 429, anggaran token harian, metrik beban. | §10 |
+| **Alat ukur** | `tools/probe_llm.py` (kapasitas endpoint), `kit_doctor.py --docker` (RAM sandbox), simulasi 20 pengguna. | §10 |
 | **Image sandbox tim** | Dockerfile berisi toolchain backend. | Langkah 8 |
 | **Egress bawaan Hermes** | Sandbox hanya memegang token proxy, bukan key asli. | Langkah 8, §8 |
 | **Uji dan CI** | Uji unit + uji integrasi terhadap Hermes yang dipin dan `main` (mingguan); `selftest.sh` di server. | Langkah 9 |
@@ -522,7 +525,7 @@ Satu-satunya bagian yang dipasang terpisah adalah timer pemakaian (§10b); `kit_
 |---|---|
 | `kit_base.py`, `kit_discord.py` | Dasar (versi, `TeamError`, tokenizer `.env`) dan klien Discord REST ringan; diimpor `hermes_team.py` dan tetap terlihat sebagai `hermes_team.DiscordAPI` dst. |
 | `hermes_team.py` | CLI provisioning & operasi (check, apply, managed, add-member, onboard, offboard, set-model, share-skill, …). Juga dipakai plugin dan tool admin. |
-| `teamctl_mcp.py` | Server MCP 25 tool: admin tim, kelola server Discord, dan `usage_report`; dipasang otomatis hanya di profile `team-admin`. |
+| `teamctl_mcp.py` | Server MCP 27 tool: admin tim, kelola server Discord, dan `usage_report`; dipasang otomatis hanya di profile `team-admin`. |
 | `plugins/team-guard/` (v3.1.0, modul kecil: `onboarding`, `livereload`, `secrets`, `guard`, `redact`, `ratelimit`, …) | Plugin Hermes: `/env-set`, penyamaran secret, guard perintah, rate limit & antrean, **onboarding otomatis, live reload rute**. Dipasang ke semua profile. |
 | `team.example.yaml` | Setelan tim (guild, role, admin, channel, model, sandbox, thread, skala, pemakaian, secret, onboarding, kelola server). |
 | `members.example.yaml` | Anggota + model per orang (juga ditulis otomatis oleh onboarding). |
@@ -531,7 +534,9 @@ Satu-satunya bagian yang dipasang terpisah adalah timer pemakaian (§10b); `kit_
 | `skills/team-usage-report/` | Skill admin untuk laporan pemakaian (dipanggil manual atau oleh cron). Terbaca otomatis oleh profile `team-admin` setelah `apply`. |
 | `systemd/` | Timer user untuk memotret pemakaian tiap 15 menit. |
 | `usage_report.py` | Laporan sekali-jalan langsung dari `state.db` (tanpa buku besar). |
-| `docs/RENCANA-SKALA.md` | Celah skala yang sudah diketahui dan urutan perbaikannya. |
+| `tools/` | `probe_llm.py` (ukur kapasitas endpoint LLM), `sandbox_idle.py` (laporkan/hentikan sandbox menganggur). |
+| `tests/loadtest/` | Simulasi 20 pengguna dan server LLM tiruan untuk uji beban. |
+| `docs/RENCANA-SKALA.md` | Rencana skala beserta status tiap butir. |
 | `docker/sandbox/` | Dockerfile image sandbox tim (PHP, Go, Java, Node, Python, klien DB, `gh`). |
 | `.github/workflows/ci.yml` | CI: uji unit + uji integrasi terhadap Hermes yang dipin dan `main` (mingguan). |
 | `tests/` | `selftest.sh` menguji seluruh kit memakai Python milik Hermes di server ini (HOME sementara, Discord tiruan). Uji integrasi (resolver rute, loader plugin) dilewati bila Hermes tidak bisa di-import. |
@@ -625,6 +630,8 @@ Tulis biasa, Hermes memanggil tool `teamctl`, menjelaskan rencananya, lalu menam
 | "Tambahkan anggota: nama be3, user ID 5000…, pakai channel 6000…" | `add_member` dengan nama/channel/model tertentu. |
 | "Ganti model be1 ke td-normal" / "semua anggota pakai td-simple" | `members.yaml` + config profile. Berlaku di sesi baru (`/new`). |
 | "Nonaktifkan citra" | Rute dicabut (live), akses channel dilepas, profile diparkir, data tetap. |
+| "Bagaimana beban sekarang?" | `team_status`: sesi aktif, antrean, panggilan LLM, 429, anggaran hari ini (§10). |
+| "Tambah kuota budi 2 juta token" | `set_usage_budget_extra`: jatah tambahan hari ini, dengan konfirmasi. |
 | "Pemakaian token minggu lalu" / "pemakaian budi bulan ini" | `usage_report`: request, token, sesi, biaya per orang. Hanya-baca, tanpa tombol konfirmasi (§10b). |
 | "Bagikan skill deploy-checklist milik be1 ke semua anggota" | Dipindai dulu (secret pemilik, pola kredensial, pemindai Hermes, symlink), lalu disalin ke `skills/shared/`. |
 
@@ -775,35 +782,87 @@ flowchart TD
 
 ## 10. Skala 20 orang
 
-Mekanisme di bawah ini adalah yang **ada sekarang**. Celah yang sudah diketahui (sesi paralel per
-orang, cron/`/goal`/subagent di luar pembatas, anggaran token, RAM sandbox) dan urutan perbaikannya
-ada di **[docs/RENCANA-SKALA.md](docs/RENCANA-SKALA.md)**.
+Pembatas bekerja berlapis. Semua angka diatur di `team.yaml` → `scale`.
 
 ```mermaid
 flowchart TD
     M["Pesan anggota"] --> ADM{"Admin atau<br/>perintah slash?"}
     ADM -- ya --> RUN["Diproses"]
-    ADM -- tidak --> RL{"Token bucket<br/>per orang"}
+    ADM -- tidak --> BG{"Anggaran token<br/>hari ini?"}
+    BG -- "habis" --> NO0["Ditolak sampai besok<br/>admin dikabari"]
+    BG -- "masih ada" --> RL{"Token bucket<br/>per orang"}
     RL -- "tunggu lebih dari 45 dtk" --> NO1["Ditolak sopan"]
-    RL -- lolos --> Q{"Slot sesi<br/>tersedia?"}
+    RL -- lolos --> UC{"Sesi aktif orang ini<br/>di bawah batas?"}
+    UC -- tidak --> WU["Antre di baris<br/>orang itu sendiri"]
+    UC -- ya --> Q{"Slot sesi dan<br/>kapasitas LLM tersedia?"}
+    WU -- "satu sesinya selesai" --> Q
     Q -- ya --> RUN
-    Q -- tidak --> W["Antre FIFO<br/>dengan posisi"]
-    W -- "slot kosong" --> RUN
+    Q -- tidak --> W["Antre adil<br/>satu tiket per orang"]
+    W -- "giliran tiba" --> RUN
     W -- "lebih dari 3 menit" --> NO2["Ditolak sopan"]
+    WU -- "lebih dari 3 menit" --> NO2
 ```
 
-| Masalah | Mekanisme | Setelan (`team.yaml` → `scale`) |
+| Masalah | Mekanisme | Setelan |
 |---|---|---|
+| Satu orang membanjiri pesan | Token bucket per orang: 4 pesan langsung, lalu 6/menit; ditolak sopan bila harus menunggu > 45 detik | `user_rate_per_minute`, `user_burst` |
+| Satu orang membuka banyak thread sekaligus | Maks 2 sesi aktif per orang; pesan berikutnya menunggu di barisnya sendiri | `user_max_concurrent` |
+| Semua orang bersamaan | Maks 8 sesi anggota aktif (+2 slot admin); antrean **adil**: satu tiket per orang, bergiliran; maks 3 menit | `max_concurrent_sessions`, `admin_reserved_slots`, `queue_max_wait_seconds` |
+| Beban LLM tak terlihat (cron, subagent) | Panggilan LLM yang sedang berjalan dihitung dari hook API; bila mencapai batas, pesan baru antre | `max_llm_parallel` (isi dari `tools/probe_llm.py`) |
+| Endpoint mengembalikan 429 | Retry dan fallback bawaan Hermes; **pembatas adaptif**: 3× 429 dalam 60 detik → batas sesi efektif dibagi dua, pulih +1 per menit setelah tenang; admin dikabari | `adaptive_throttle`, `llm.fallback` |
+| Biaya tak terkendali | Anggaran token harian per orang dan per tim dari buku besar pemakaian: 80% diperingatkan, 100% ditolak sampai tengah malam; admin bisa menambah jatah hari itu | `daily_token_budget`, `team_daily_token_budget` |
+| Agent berputar terlalu lama | Maks 60 langkah tool per giliran; subagent maks 1; `/goal` mati untuk anggota (bila dibuka: maks 4 lanjutan) | `agent_max_turns`, `delegation_max_children`, `allow_goals`, `goals_max_turns` |
+| Cron menumpuk | Toolset cron mati untuk anggota dan `#hermes-shared`; bila dibuka, jadwal lebih rapat dari 15 menit ditolak; cron memakai model murah, satu job per profile sekaligus | `allow_member_cron`, `cron_min_interval_minutes` |
 | Riwayat chat membengkak | Kompresi paling lambat di 64k token; output tool lama dipangkas tanpa LLM; sesi yang dibuka lagi setelah 1 jam diringkas dulu | `compression_threshold_tokens`, `proactive_prune_tokens`, `idle_compact_after_seconds` |
-| Agent berputar terlalu lama | Maks 60 langkah tool per giliran, `/goal` maks 8 lanjutan, subagent maks 2 | `agent_max_turns`, `goals_max_turns`, `delegation_max_children` |
-| Satu orang membanjiri | Token bucket per orang: 4 pesan langsung, lalu 6/menit; kelebihan ditunda, ditolak sopan bila harus menunggu > 45 detik | `user_rate_per_minute`, `user_burst` |
-| Semua orang bersamaan | Maks 8 sesi anggota aktif; berikutnya antre FIFO dengan posisi, maks 3 menit. 2 slot dicadangkan untuk admin | `max_concurrent_sessions`, `admin_reserved_slots`, `queue_max_wait_seconds` |
+| `state.db` tumbuh terus | Sesi yang sudah berakhir lebih dari 90 hari dipangkas Hermes (riwayat pemakaian tetap ada di buku besar) | `session_retention_days` |
 | Mengirim pesan saat bot sibuk | Masuk antrean sesi, tidak memotong pekerjaan | `busy_input_mode: queue` |
-| Throttle / 429 dari provider | Retry + backoff bawaan Hermes, fallback model, tugas auxiliary ke model murah, judul sesi tanpa LLM | `llm.fallback`, `llm.aux_model`, `title_llm` |
-| Banyak orang di-onboard sekaligus | Diproses berurutan di bawah kunci tim; tidak ada restart gateway | `onboarding.*` |
-| Beban RAM | Browser otomatis & computer use (jalan di host) mati | `allow_browser: false` |
+| Tugas kecil memakai model mahal | Tugas auxiliary ke model murah, judul sesi tanpa LLM | `llm.aux_model`, `title_llm` |
+| Banyak orang di-onboard sekaligus | `onboard-batch`: semua channel dibuat, lalu satu `apply`; onboarding lewat role tetap berurutan | `onboarding.*` |
+| Beban RAM | Browser otomatis & computer use mati; `kit_doctor.py --docker` melaporkan RAM tiap sandbox | `allow_browser: false` |
 
-Patokan: `max_concurrent_sessions` ≤ jumlah request paralel yang sanggup dilayani endpoint LLM.
+### Mengukur, bukan menebak
+
+```bash
+# 1. Kapasitas endpoint LLM → saran max_llm_parallel dan max_concurrent_sessions
+TD_API_KEY=… python3 /opt/hermes-team/tools/probe_llm.py --team ~/.hermes-team/team.yaml --alias td-simple
+
+# 2. Beban sekarang: di #hermes-admin tulis "bagaimana beban sekarang?" (tool team_status), atau
+cat ~/.hermes-team/state/metrics.json
+
+# 3. RAM sandbox dan ukuran state.db
+python3 /opt/hermes-team/kit_doctor.py --docker
+```
+
+`probe_llm.py` mengirim permintaan pendek sungguhan ke endpoint (memakai kuota), membaca key dari
+variabel lingkungan, dan tidak pernah mencetaknya.
+
+`metrics.json` ditulis plugin tiap 30 detik: sesi aktif, sesi per orang, panggilan LLM berjalan,
+panjang dan lama antrean, jumlah penolakan per jenis, 429 per menit, batas efektif. Admin dikabari
+bila antrean lebih dari 5 selama 2 menit atau ada penolakan karena antrean penuh.
+
+Menambah jatah token seseorang untuk hari ini: di `#hermes-admin` tulis "tambah kuota budi 2 juta
+token" (tool `set_usage_budget_extra`, dengan tombol konfirmasi). Tambahan hangus saat hari berganti.
+
+### Yang perlu diketahui
+
+- **Perubahan bawaan saat upgrade:** anggota dan `#hermes-shared` kehilangan toolset cron serta `/goal`
+  dan `/subgoal` pada `apply` berikutnya. Buka lagi dengan `allow_member_cron: true` / `allow_goals: true`.
+- **Anggaran token butuh buku besar pemakaian** (§10b). Tanpa itu anggaran tidak ditegakkan (gagal terbuka,
+  satu baris di log). Angka pemakaian bisa tertinggal sampai ±2 menit.
+- **Batas per orang baru aktif penuh setelah satu sesi selesai** sejak gateway start; pada menit-menit
+  pertama hanya reservasi singkat yang dihitung.
+- **Panggilan auxiliary** (judul, kompresi) tidak ikut dihitung di `max_llm_parallel`.
+- `check` dan `apply` memberi peringatan bila semua fallback sebuah model ada di provider yang sama;
+  contoh konfigurasi bawaan memang memicunya sampai kamu menambah provider kedua.
+- `tools/sandbox_idle.py` (menghentikan container sandbox yang menganggur) **hanya melaporkan** secara
+  bawaan. Apakah Hermes menyalakan lagi container yang dihentikan belum dibuktikan; uji di server
+  percobaan sebelum memakai `--apply`.
+
+Simulasi 20 pengguna (`tests/test_scale_sim.py`) memeriksa bahwa pembatas di atas bekerja bersama:
+satu pembanjir tidak membuat orang lain kelaparan, batas tidak pernah terlampaui, pembatas adaptif
+turun lalu pulih. Itu simulasi dengan jam tiruan, **bukan** uji terhadap gateway sungguhan; cara uji
+manual memakai LLM tiruan ada di [tests/loadtest/README.md](tests/loadtest/README.md). Status tiap
+butir rencana ada di [docs/RENCANA-SKALA.md](docs/RENCANA-SKALA.md).
 
 ## 10b. Pencatatan pemakaian token dan request
 
@@ -952,10 +1011,9 @@ Yang perlu diketahui admin saat naik dari v3.0:
 
 - **Thread per percakapan** mengandalkan `discord.free_response_auto_thread` Hermes. Pesan berupa *balasan*
   (reply) tidak membuka thread baru, dan thread diarsipkan otomatis oleh Discord (bisa dibuka lagi).
-  Satu orang bisa menjalankan beberapa thread sekaligus dan memakai beberapa slot sesi; pembatas per
-  orang belum ada (lihat [docs/RENCANA-SKALA.md](docs/RENCANA-SKALA.md)).
-- **Pencatatan pemakaian** hanya mencatat; belum ada anggaran atau pemblokiran otomatis. Batas hari bisa
-  bergeser paling lama selang timer. Laporan terjadwal ke channel lewat cron belum dibuat (§10b).
+  Jumlah thread yang berjalan bersamaan per orang dibatasi `scale.user_max_concurrent`.
+- **Pencatatan pemakaian**: batas hari bisa bergeser paling lama selang timer. Anggaran token (§10) memakai
+  data ini dan mati secara bawaan (`daily_token_budget: 0`). Laporan terjadwal ke channel lewat cron belum dibuat (§10b).
 
 - Live reload memakai struktur internal gateway Hermes (dicek dengan resolver rute Hermes sendiri
   setiap kali). Bila update Hermes mengubahnya, kit jatuh ke restart halus (atau `/restart` manual)
