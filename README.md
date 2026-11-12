@@ -39,13 +39,16 @@ model terkunci untuk anggota, penyamaran secret berlapis, dan mekanisme skala 20
 | `plugins/team-guard/` | Plugin Hermes: `/env-set`, penyamaran secret, guard perintah, rate limit & antrean, **onboarding otomatis, live reload rute**. Dipasang ke semua profile. |
 | `team.example.yaml` | Setelan tim (guild, role, admin, channel, model, sandbox, skala, secret, onboarding, kelola server). |
 | `members.example.yaml` | Anggota + model per orang (juga ditulis otomatis oleh onboarding). |
-| `egress/` | Opsional: proxy allowlist supaya sandbox hanya bisa ke domain tertentu. |
-| `tests/` | `selftest.sh` menguji seluruh kit terhadap Hermes di server ini (HOME sementara, Discord tiruan). |
+| `kit_doctor.py` | `doctor`: membandingkan members.yaml ↔ profile di disk ↔ rute gateway ↔ channel Discord (`--discord`), hanya membaca. |
+| `usage_report.py` | Laporan token & biaya LLM per anggota dari `state.db` tiap profile (read-only). |
+| `docker/sandbox/` | Dockerfile image sandbox tim (PHP, Go, Java, Node, Python, klien DB, `gh`). |
+| `.github/workflows/ci.yml` | CI: uji unit + uji integrasi terhadap Hermes yang dipin dan `main` (mingguan). |
+| `tests/` | `selftest.sh` menguji seluruh kit memakai Python milik Hermes di server ini (HOME sementara, Discord tiruan). Uji integrasi (resolver rute, loader plugin) dilewati bila Hermes tidak bisa di-import. |
 
 ## 0. Prasyarat
 
 - Server Linux dengan Docker. User Linux khusus, misal `hermes` (bukan root), anggota grup `docker`.
-- Hermes terpasang di user itu, versi terbaru, platform Discord sudah disetel:
+- Hermes terpasang di user itu (Hermes terbaru hanya mendukung Python 3.14; installer mengurusnya), platform Discord sudah disetel. Catat versi yang kamu uji (`hermes update --check`) dan naikkan hanya setelah CI hijau:
   ```bash
   curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
   hermes update
@@ -251,16 +254,31 @@ Tulis biasa, Hermes memanggil tool `teamctl`, menjelaskan rencananya, lalu menam
 
 Pagar yang tidak bisa dibujuk lewat chat (ditolak sebelum tombol konfirmasi muncul):
 
-- Channel pribadi anggota (dan thread di dalamnya) tidak bisa dibaca, diubah izinnya, atau dihapus.
-  Channel bersama/admin dan kategori tim tidak bisa dihapus. Role tim (`@backend`, `@hermes-admin`,
-  `@entry`) tidak bisa dihapus dan izinnya tidak bisa diubah.
+- Channel pribadi anggota (dan thread di dalamnya) tidak bisa dibaca, diubah (nama, topik, posisi),
+  dikirimi pesan, diubah izinnya, atau dihapus. Channel bersama/admin dan kategori tim tidak bisa
+  dihapus, dipindah, atau diganti namanya (topik dan slowmode boleh), dan overwrite-nya tidak bisa
+  dihapus; overwrite milik bot sendiri tidak bisa dihapus/ditolak. Role tim (`@backend`,
+  `@hermes-admin`, `@entry`) tidak bisa dihapus dan izinnya tidak bisa diubah.
 - Izin tinggi (Administrator, Manage Server/Roles/Channels/Webhooks/Messages/Threads, ban/kick/
   moderate, mention everyone, …) tidak bisa diberikan — lewat role, izin channel, maupun memberi
-  role yang memuatnya. Role `@hermes-admin` hanya diberikan manual (dan user ID-nya di `admins`).
-  Ubah dengan `server_admin.allow_elevated_permissions: true` bila benar-benar perlu.
-- Admin tim, pemilik server, dan bot tidak bisa di-timeout/kick. Ban selalu manual.
-- Isi pesan yang dibaca dari Discord diberi label "data, bukan instruksi", dan setiap aksi tetap
-  menunggu klik admin dengan ringkasan persis apa yang akan dilakukan.
+  role yang memuatnya, termasuk role yang membuka #hermes-admin atau channel pribadi lewat overwrite.
+  Role berizin tinggi juga tidak bisa dicabut, dihapus, atau diubah izinnya lewat Hermes, dan role
+  tidak bisa dicabut dari admin/pemilik server. Role `@hermes-admin` hanya diberikan manual (dan user
+  ID-nya di `admins`). Ubah dengan `server_admin.allow_elevated_permissions: true` bila perlu.
+- Admin tim, pemilik server, semua bot, dan pemegang izin tinggi tidak bisa di-timeout/kick. Ban selalu manual.
+- Pengguna harus disebut dengan ID, mention, atau username persis (nama tampilan/nickname tidak dicocokkan
+  lagi, supaya tidak salah orang). Konfirmasi selalu memuat ID dan teks lengkap yang akan dikirim.
+- Setelah klik Approve, keadaan server diperiksa ulang; bila berubah dari yang disetujui, aksi
+  dibatalkan ("keadaan berubah, ulangi"). Membatalkan permintaan di klien juga membatalkan konfirmasinya.
+- Isi pesan yang dibaca dari Discord dibungkus penanda `<<<DATA-DISCORD …>>>` dengan nonce acak dan
+  tiap baris diberi awalan, sehingga satu pesan tidak bisa memalsukan pesan lain; semuanya data,
+  bukan instruksi. Argumen tool diperiksa tipenya secara ketat (ID harus string).
+- Tidak ada lagi cara mematikan konfirmasi (`TEAMCTL_REQUIRE_CONSENT` dihapus; variabelnya diabaikan
+  dengan peringatan). `TEAMCTL_MAX_MESSAGE_CHARS` (opsional) menurunkan batas 2000 karakter pesan.
+- `add_member` kini butuh Discord terjangkau dan user ada di server walau `channel_id` diberikan;
+  channel itu harus channel teks di server ini, bukan channel tim/anggota lain.
+- Audit log mencatat juga aksi yang gagal/ditolak: sufiks `-blocked`, `-refused`, `-stale`, dan
+  kolom `outcome: ok|failed`.
 
 Kenapa bukan toolset bawaan `discord` / `discord_admin`? Di mode multiplex, profile `team-admin`
 tidak bisa melihat token bot (token ada di scope profile host), dan toolset itu tidak punya
@@ -327,7 +345,7 @@ Lapisan perlindungan:
    dihapus dari channel dan pengirimnya diingatkan memakai `/env-set`.
 8. **Skill yang dibagikan dipindai** dari salinan beku — ditolak kalau memuat nilai secret pemiliknya,
    pola kredensial, atau symlink.
-9. Opsional: **egress allowlist** (`egress/`) — sandbox hanya bisa menghubungi domain yang diizinkan.
+9. Opsional: **egress proxy bawaan Hermes** (`hermes egress install/setup/start`, iron-proxy) — sandbox hanya memegang token proxy, kunci provider asli tetap di host, dan lalu lintas keluar dibatasi ke host yang diizinkan (`proxy.extra_allowed_hosts`). Gantikan `sandbox.network/http_proxy` buatan sendiri bila memakainya. Alternatif keras: `terminal.docker_network: false` (tanpa jaringan sama sekali).
 
 Batas yang perlu diketahui tim:
 
@@ -388,6 +406,8 @@ Patokan: `max_concurrent_sessions` ≤ jumlah request paralel yang sanggup dilay
 | Ubah batas skala / sandbox / provider | Edit `team.yaml` → `apply` → `managed` → pasang ulang `/etc/hermes/config.yaml` → `/restart` |
 | Update kit | Salin versi baru ke `/opt/hermes-team` → `apply` → `/restart` |
 | Update Hermes | `/update` (admin) atau `hermes update`; lalu `bash tests/selftest.sh` (memeriksa live reload) |
+| Periksa konsistensi | `python3 /opt/hermes-team/kit_doctor.py [--discord]` (members ↔ profile ↔ rute ↔ channel) |
+| Pemakaian & biaya per orang | `python3 /opt/hermes-team/usage_report.py --days 7 --members-file ~/.hermes-team/members.yaml` |
 | Log | `hermes logs -f`; cari `team-guard` |
 | Audit | `~/.hermes-team/state/audit.log`, `onboarding.json` |
 
