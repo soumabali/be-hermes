@@ -172,7 +172,7 @@ class LiveReloader:
                                                                     else " (masih memuat channel lama)"))
         return True, f"{len(roster.profile_routes)} rute, {len(roster.allowed_channels)} channel"
 
-    async def _ensure_served(self, runner: Any, roster: Any, wait: bool) -> tuple[bool, str]:
+    async def _ensure_served(self, runner: Any, roster: Any, wait: bool = True) -> tuple[bool, str]:
         """Profile yang dirutekan harus termasuk yang dilayani multiplexer. Profile baru biasanya sudah
         dilayani (rescan 30 dtk); soket kontrol `rescan-profiles` mempercepatnya."""
         wanted = roster.profiles() - {"default"}
@@ -219,7 +219,7 @@ class LiveReloader:
                 if ok:
                     ok, detail = self.apply_gates(adapter, roster)
                 if ok:
-                    ok, detail = await self._ensure_served(runner, roster, wait_served and not startup)
+                    ok, detail = await self._ensure_served(runner, roster, wait_served)
                 if ok:
                     ok, detail = self.verify(runner, adapter, roster)
             if ok:

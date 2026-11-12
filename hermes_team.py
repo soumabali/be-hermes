@@ -100,10 +100,15 @@ DEFAULT_USER_COMMANDS = [
     "personality", "refine", "review", "profile",
 ]
 
+# Lobby = teks saja. Hermes menambah toolset baru dari waktu ke waktu dan mengaktifkannya otomatis,
+# jadi daftar ini HARUS menutup semua toolset yang ada; tests/test_hermes_config.py (uji integrasi,
+# jalan di CI terhadap Hermes yang dipin dan main) gagal bila ada toolset upstream yang belum tercakup.
 LOBBY_DISABLED_TOOLSETS = [
     "terminal", "file", "code_execution", "browser", "web", "search", "x_search", "vision", "video",
     "image_gen", "video_gen", "tts", "computer_use", "skills", "memory", "session_search", "todo",
     "cronjob", "delegation", "connections", "kanban", "discord", "discord_admin",
+    "project", "bot_room", "desktop_ui", "onboarding", "catalog", "clarify", "context_engine",
+    "feishu_doc", "feishu_drive", "debugging", "safe", "coding",
 ]
 # Toolset Discord bisa membaca channel lain yang terlihat bot — selalu matikan untuk pekerja.
 WORKER_DISABLED_TOOLSETS = ["discord", "discord_admin"]
@@ -111,8 +116,10 @@ WORKER_DISABLED_TOOLSETS = ["discord", "discord_admin"]
 # mati kecuali team.yaml `allow_browser: true`.
 HOST_SIDE_TOOLSETS = ["browser", "computer_use"]
 # Tugas auxiliary yang dialihkan ke model "murah" supaya beban & throttle di model utama turun.
+# Setiap nama harus ada di DEFAULT_CONFIG["auxiliary"] Hermes (dijaga tests/test_hermes_config.py).
+# `vision` sengaja tidak dialihkan: model murah belum tentu mendukung gambar.
 AUX_TASKS = ["compression", "title_generation", "approval", "mcp", "memory_query_rewrite",
-             "background_review", "goal_judge", "curator", "skills_hub", "profile_describer"]
+             "background_review", "goal_judge", "curator", "profile_describer"]
 
 DM_DECLINE_MESSAGE = ("Hermes tidak melayani DM. Pakai channel pribadimu "
                       "(#hermes-<nama>) atau #hermes-shared.")

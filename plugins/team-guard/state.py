@@ -176,6 +176,9 @@ class StateStore:
             self.data["failed"][str(user_id)] = {"reason": reason, "ts": now_iso(self.clock())}
             self.save()
 
+    def has_failed(self, user_id: Any) -> bool:
+        return str(user_id) in self.data["failed"]
+
     def set_pending(self, user_id: Any, channel_id: Any, message_id: Any) -> None:
         """Pesan "⏳ sedang disiapkan" yang masih harus dihapus (bertahan lintas restart)."""
         with self._lock:

@@ -305,7 +305,8 @@ class Onboarder:
         gid = str(getattr(getattr(member, "guild", None), "id", "") or "")
         return not gid or gid == self.rt.roster().guild_id
 
-    async def _give_entry(self, member: Any, why: str) -> bool:
+    async def _give_entry(self, member: Any, why: str, roleless_only: bool = True) -> bool:
+        """Beri role entry. Bawaan: hanya untuk user TANPA role apa pun (selain @everyone)."""
         roster = self.rt.roster()
         conf = roster.onboarding
         if not (conf.get("enabled") and conf.get("give_entry_role") and roster.entry_role):
@@ -313,7 +314,7 @@ class Onboarder:
         if getattr(member, "pending", False):
             return False                      # belum menyetujui aturan server (membership screening)
         roles = _role_ids(member) - {roster.guild_id}
-        if roles & {roster.member_role, roster.entry_role, roster.admin_role}:
+        if roles & {roster.member_role, roster.entry_role, roster.admin_role} or (roleless_only and roles):
             return False
         try:
             await self.port.add_role(member, roster.entry_role, f"Hermes: {why}")
@@ -353,7 +354,7 @@ class Onboarder:
             member = await self.port.get_member(uid)
         if member is None or getattr(member, "bot", False) or roster.member_role not in _role_ids(member):
             return                            # role sudah dicabut lagi / user sudah keluar sebelum giliran ini
-        if uid in roster.users:
+        if uid in roster.users and not self.rt.state.has_failed(uid):
             self.rt.state.unhold(uid)
             if not self.rt.state.was_welcomed(uid):
                 await self._activate(uid)
@@ -378,6 +379,9 @@ class Onboarder:
                 pending["message"] = message
                 if message is not None:
                     self.rt.state.set_pending(uid, event["channel_id"], getattr(message, "id", ""))
+                what = "dibuat" if event.get("created") else "dipakai lagi"
+                await self.notify(f"⏳ Menyiapkan <@{uid}>: channel <#{event['channel_id']}> {what}; membuat "
+                                  "profile, rute, dan sandbox…")
 
         args = ["--user-id", uid, "--username", str(getattr(member, "name", "") or ""),
                 "--display-name", str(getattr(member, "display_name", "") or getattr(member, "name", "") or "")]
@@ -386,8 +390,9 @@ class Onboarder:
             reason = outcome.describe()
             self.rt.state.set_failed(uid, reason)
             await self._drop_pending(uid, pending.get("message"))
-            await self.notify(f"❌ Onboarding <@{uid}> gagal: {reason}. Tidak ada sambutan yang dikirim. Perbaiki "
-                              f"lalu tulis \"lanjutkan onboarding <@{uid}>\" (detail: audit.log).")
+            await self.notify(f"❌ Onboarding <@{uid}> gagal: {reason}. Tidak ada sambutan yang dikirim. Setelah "
+                              "penyebabnya diperbaiki, plugin mencoba lagi pada susulan berikutnya (atau cabut lalu "
+                              "beri lagi role @backend). Detail: audit.log.")
             return
         await self._activate(uid, info=outcome.result, started=started, pending=pending.get("message"),
                              status=str(outcome.result.get("status") or ""))
@@ -414,6 +419,8 @@ class Onboarder:
         if self.rt.state.was_welcomed(uid):
             await self._drop_pending(uid, pending)
             return
+        if info is None and self.rt.state.has_failed(uid):
+            return                            # onboarding-nya gagal sebagian: tunggu percobaan ulang yang bersih
         info = {**user, **{k: v for k, v in (info or {}).items() if v not in (None, "")}}
         if not ok:
             # Sambutan baru dikirim setelah rute benar-benar berlaku; setelah restart, pengawas melanjutkan.
@@ -475,7 +482,7 @@ class Onboarder:
                 await self.notify(f"ℹ️ <@{uid}> {reason}, tetapi penonaktifan otomatis dimatikan "
                                   "(onboarding.offboard_on_role_remove). Nonaktifkan manual bila perlu.")
         if not left and member is not None and conf.get("entry_role_on_offboard", True):
-            await self._give_entry(member, "kembali ke entry setelah @backend dicabut")
+            await self._give_entry(member, "kembali ke entry setelah @backend dicabut", roleless_only=False)
 
     # ------------------------------------------------------------------ susulan & pengawas
     async def reconcile(self) -> dict:
@@ -496,7 +503,8 @@ class Onboarder:
             roles = _role_ids(member)
             if roster.member_role and roster.member_role in roles:
                 self.rt.state.clear_notified(f"lost-role:{uid}")
-                if uid not in roster.users and not self.rt.state.is_held(uid):
+                retry = self.rt.state.has_failed(uid) and not self.rt.state.was_welcomed(uid)
+                if (uid not in roster.users or retry) and not self.rt.state.is_held(uid):
                     summary["onboard"] += self.submit("onboard", uid, member=member, source="reconcile")
             elif uid in roster.users:
                 if uid not in roster.admins and self.rt.state.notify_once(f"lost-role:{uid}"):
@@ -522,9 +530,9 @@ class Onboarder:
         state = self.rt.state
         if state.baseline_needed:
             state.baseline(roster.users)
-        await self.live.apply("gateway start" if startup else "roster.json berubah", startup=startup,
-                              wait_served=not startup)
+        await self.live.apply("gateway start" if startup else "roster.json berubah", startup=startup)
         for uid in sorted(roster.users):
+            state.unhold(uid)                 # ada di roster = sudah disetujui admin (tool admin / CLI)
             if not state.was_welcomed(uid):
                 self.submit("activate", uid)
         for uid, entry in list(state.data["welcomed"].items()):

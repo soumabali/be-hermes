@@ -122,7 +122,7 @@ class Dispatcher:
 
         # E. Gerbang akses: ditahan / nonaktif ditolak di semua channel, termasuk #hermes-shared.
         if not admin:
-            if self.rt.state.is_held(uid):
+            if self.rt.state.is_held(uid) and roster.user_status(uid) != "active":
                 await self._say(gateway, source, "held", MSG_HELD.format(uid=uid))
                 return {"action": "skip", "reason": "team-guard: onboarding ditahan"}
             if roster.user_status(uid) == "inactive":

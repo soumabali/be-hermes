@@ -138,7 +138,7 @@ def build_commands(rt: Any, *, runner: Any = None) -> dict:
     def target(interaction: Any) -> tuple:
         roster = rt.roster()
         uid = getattr(getattr(interaction, "user", None), "id", "")
-        if roster and not roster.is_admin(uid) and rt.state.is_held(uid):
+        if roster and roster.user_status(uid) not in ("admin", "active") and rt.state.is_held(uid):
             return roster, None, "Onboarding-mu masih menunggu persetujuan admin tim."
         profile, error = resolve_env_target(roster, uid, interaction_channels(interaction))
         return roster, profile, error

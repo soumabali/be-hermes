@@ -673,10 +673,10 @@ class TestDiscordSlashCommands:
 
     def test_held_user_cannot_use_env_commands(self, env):
         async def main():
-            env.rt().state.hold(S.U_BUDI, "uji")
+            env.rt().state.hold(S.U_CITRA, "uji")
             built = commands.build_commands(env.rt())
             env_list = next(c for c in built["commands"] if c.name == "env-list")
-            inter = interaction(S.U_BUDI, S.CH_BUDI)
+            inter = interaction(S.U_CITRA, S.CH_SHARED)
             await env_list.callback(inter)
             assert "menunggu persetujuan" in inter.response.messages[0]["content"]
 
@@ -1038,9 +1038,14 @@ class TestDispatchGate:
         assert len(self.said()) == 2
 
     def test_unhold_restores_service(self, d):
-        self.rt.state.hold(S.U_BUDI, "x")
-        assert self.go(d, event(S.U_BUDI, S.CH_BUDI))["action"] == "skip"
-        self.rt.state.unhold(S.U_BUDI)
+        self.rt.state.hold(S.U_CITRA, "x")
+        assert self.go(d, event(S.U_CITRA, S.CH_SHARED))["action"] == "skip"
+        self.rt.state.unhold(S.U_CITRA)
+        assert self.go(d, event(S.U_CITRA, S.CH_SHARED)) is None
+
+    def test_member_already_in_roster_is_never_treated_as_held(self, d):
+        """Admin sudah menyetujui (anggota aktif di roster) → tahanan lama tidak boleh memblokirnya."""
+        self.rt.state.hold(S.U_BUDI, "sisa tahanan lama")
         assert self.go(d, event(S.U_BUDI, S.CH_BUDI)) is None
 
     def test_inactive_member_refused(self, d):
