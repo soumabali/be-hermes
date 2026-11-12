@@ -1,0 +1,101 @@
+# HANDOFF — Hermes Team Kit (Discord, tim backend)
+
+Berkas ini untuk melanjutkan pekerjaan di Claude lain. Tempel isinya di awal chat baru dan
+lampirkan folder `v3/` (dan `arsip-versi-lama/` bila perlu).
+
+## 1. Tujuan proyek
+Satu instalasi **Hermes Agent** (Nous Research) untuk tim backend (~20 orang) di Discord:
+- 1 bot, 1 gateway (mode multiplex), **1 profile per anggota**; channel privat tiap orang
+  dirutekan ke profile-nya (`gateway.profile_routes`).
+- Channel bersama `#hermes-shared` dan channel admin `#hermes-admin`.
+- Sandbox terpisah per orang (`terminal.backend: docker`; profile saja BUKAN sandbox).
+
+Riwayat versi:
+- **v1**: provisioning dasar (`hermes-team.py`).
+- **v2**: admin bisa tambah user, bagikan skill, set model per user (mis. BE1 `td-normal`,
+  lainnya `td-simple`); anggota set `.env` aman lewat perintah Discord; AI tidak boleh
+  mengambil/membagikan secret; user tidak bisa ganti model; batas konteks/memori dan throttling
+  untuk 20 anggota.
+- **v3** (terbaru): saat user baru masuk server dapat role `@entry`; begitu diberi `@backend`
+  otomatis dibuat channel pribadi, profile, scope env, sandbox, user + bot dimasukkan ke channel,
+  bot mengirim pesan pembuka dengan mention. Hermes juga bisa mengelola server Discord
+  (14 tool `discord_*`) dengan guardrail.
+
+## 2. Isi folder
+```
+v3/
+  hermes_team.py          # CLI provisioning (~2397 baris, KIT_VERSION 3.0.0)
+  teamctl_mcp.py          # server MCP admin, 24 tool (~1455 baris)
+  team.example.yaml       # konfigurasi (roles.entry, onboarding, live_reload, server_admin, ...)
+  members.example.yaml
+  README.md               # dokumentasi lengkap (Indonesia)
+  tests/fake_discord.py   # Discord REST tiruan untuk uji
+arsip-versi-lama/v1, v2   # versi lama (referensi)
+```
+
+## 3. YANG HILANG (penting)
+File berikut ada di container sebelumnya dan **tidak bisa dipulihkan** (container diganti dan
+isinya tidak ikut terlampir). Minta Claude baru membangunnya ulang dari spesifikasi di bawah:
+- `plugins/team-guard/__init__.py` (~2304 baris) + `plugin.yaml` v3.0.0
+- `tests/selftest.sh`, `test_kit_units.py`, `test_hermes_config.py`, `test_plugin.py`,
+  `test_teamctl.py`, `test_onboarding.py` (total terakhir: 375 PASS, 0 FAIL)
+- `fake_discord.py` sudah dibuat ulang (versi baru; isinya sama dengan yang terakhir dibaca).
+
+Spesifikasi plugin `team-guard` (apa yang dulu dilakukannya):
+- Listener Discord: `on_member_join`, `on_member_update`, `on_member_remove`.
+- `onboard_flow` / `offboard_flow`, `_activate_member`, `_sync_once`, `team_watcher`,
+  `reconcile_members` (jalankan `hermes_team.py` sebagai subprocess dengan `--events`).
+- `apply_live_gateway` / `verify_live_gateway`: reload rute tanpa restart (control socket
+  `rescan-profiles`); `_fallback_restart` (jangan loop restart bila gagal tepat setelah start;
+  beri tahu admin untuk `/restart` manual).
+- `find_role_actor` (audit log) dan `actor_trusted` (hanya pemberi role tepercaya yang memicu onboarding).
+- Gating di `_on_pre_gateway_dispatch`: user @backend yang belum terverifikasi ("held") tidak
+  boleh memakai `#hermes-shared`; `_unhold` saat role dicabut/keluar.
+- `render_welcome` (template `DEFAULT_WELCOME`, `DEFAULT_WELCOME_BACK`), `AllowedMentions`
+  agar hanya user target yang di-mention.
+- Hook/middleware: throttling, batas konteks, pencegahan pembocoran secret.
+- Plugin API Hermes: `register_hook`, `register_middleware`, `register_platform_handler`.
+
+## 4. Fakta teknis kunci
+- Profile = `HERMES_HOME` terpisah (`~/.hermes/profiles/<name>`).
+- Rute multiplex: `gateway.multiplex_profiles` + `gateway.profile_routes`; spesifisitas
+  `user_id` 16 > `thread_id` 8 > `chat_id` 4 > `guild_id` 2.
+- Control socket: `rescan-profiles`, `serve-profile`, `reload-plugins`; watcher rescan tiap 30 dtk.
+- Intent Members aktif hanya bila ada allowlist role/username (`DISCORD_ALLOWED_ROLES`).
+- Toolset `discord`/`discord_admin` bawaan Hermes tidak bisa dipakai di multiplex untuk profile
+  admin (token ada di scope host) — makanya kit punya tool `discord_*` sendiri di `teamctl_mcp.py`.
+- Restart: exit code 75 di bawah systemd (`RestartForceExitStatus=75`).
+- Scope terkelola: `/etc/hermes/config.yaml`; **token bot jangan** di `/etc/hermes/.env`,
+  taruh di `~/.hermes/.env` (`DISCORD_BOT_TOKEN`).
+- Hermes butuh Python 3.14 (ruamel.yaml dipin untuk >=3.14).
+- Uji: `import discord` harus sebelum `import gateway.run` (yang menggeser `sys.path`).
+- Guardrail server admin: channel pribadi tak tersentuh, role/channel tim terlindungi, izin
+  elevated diblokir, tidak boleh moderasi admin/owner/bot, ban manual; hasil baca ditandai
+  sebagai data dan token dimasking.
+
+## 5. Status
+- Teruji (tiruan Discord + resolver rute Hermes asli): 375 uji lulus, saat plugin & tests masih ada.
+- **Belum teruji**: server Discord sungguhan, pembuatan sandbox Docker sungguhan, egress proxy.
+
+## 6. Langkah setup bot Discord (sudah dipandu pada chat ini)
+Developer Portal → New Application → tab **Bot**:
+- Public Bot: **mati** (bila error "Private application cannot have a default authorization
+  link": tab *Installation* → Install Link = **None**, lalu simpan; atau matikan User Install).
+- Presence Intent: mati. **Server Members Intent: ON. Message Content Intent: ON.**
+- Reset Token → simpan ke `~/.hermes/.env` sebagai `DISCORD_BOT_TOKEN`. Jangan tempel token di chat.
+- OAuth2 → URL Generator: scope `bot` + `applications.commands`; izin: View Channels, Manage
+  Channels, Manage Roles, View Audit Log, Send Messages, Send Messages in Threads, Create Public
+  Threads, Manage Messages, Manage Threads, Embed Links, Attach Files, Read Message History,
+  Add Reactions, Use Slash Commands. **Tanpa Administrator.** Redirects/Client Secret tidak dipakai.
+- Undang bot, lalu di Server Settings → Roles seret role bot **di atas** `entry` dan `backend`.
+- Aktifkan Developer Mode, salin ID server/role/user ke `team.yaml`.
+- Jalankan: `hermes gateway setup` → `hermes_team.py check team.yaml` → `apply` → `hermes gateway run`.
+- Tes: beri role `@entry`, lalu `@backend`; channel pribadi harus terbentuk dan bot menyapa.
+
+Posisi user terakhir: sudah membuat aplikasi "TanuKode", sedang di halaman Bot dan OAuth2 URL
+Generator; belum selesai mengundang bot dan menjalankan gateway.
+
+## 7. Saran langkah berikutnya untuk Claude baru
+1. Baca `v3/README.md` dan `v3/team.example.yaml`.
+2. Bangun ulang `plugins/team-guard` dan `tests/` sesuai bagian 3, jalankan hingga hijau.
+3. Bantu user menyelesaikan setup bot (bagian 6) dan uji di server nyata.

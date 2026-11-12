@@ -1,0 +1,26 @@
+# members.yaml — anggota tim Hermes dan model AI per orang.
+# Boleh diedit manual lalu jalankan `python3 hermes_team.py apply`; juga ditulis oleh tool admin
+# di #hermes-admin ("tambahkan Citra…", "ganti model be1 ke td-normal") dan oleh
+# `hermes_team.py add-member` / `set-model`.
+
+members:
+  - name: be1                           # huruf kecil/angka/-/_  → profile be-be1, channel #hermes-be1
+    display_name: BE1
+    discord_user_id: "500000000000000001"
+    channel_id: "600000000000000001"    # #hermes-be1 (privat: BE1 + bot)
+    model: td-normal                    # model khusus; tanpa baris ini → llm.default_model (td-simple)
+  - name: budi
+    display_name: Budi
+    discord_user_id: "500000000000000002"
+    channel_id: "600000000000000002"
+  # - name: citra
+  #   display_name: Citra
+  #   discord_user_id: "500000000000000003"
+  #   channel_id: "600000000000000003"
+  #   active: false                     # nonaktif: rute dicabut, data tetap disimpan
+
+# Opsional — model untuk profile bukan anggota (menimpa team.yaml).
+# models:
+#   shared: td-simple
+#   admin: td-normal
+#   lobby: td-simple

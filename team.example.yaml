@@ -1,0 +1,161 @@
+# team.yaml — setelan tim Hermes (kit v3). Anggota ada di members.yaml.
+# Salin ke ~/.hermes-team/team.yaml, isi semua ID, lalu:  python3 hermes_team.py check
+#
+# Cara ambil ID: Discord → Settings → Advanced → Developer Mode ON, lalu klik kanan
+# server / kategori / channel / user / role → "Copy ID". Tulis ID dalam tanda kutip.
+
+team_name: Backend
+guild_id: "100000000000000001"          # ID server Discord
+
+roles:
+  member: "200000000000000001"          # role @backend  (boleh pakai bot; diberikan → onboarding otomatis)
+  admin: "200000000000000002"           # role @hermes-admin
+  entry: "200000000000000003"           # role @entry: otomatis untuk user baru di server (opsional)
+
+# User ID yang boleh menjalankan SEMUA slash command (/update, /restart, /model, ...) dan satu-satunya
+# yang dilayani profile team-admin di #hermes-admin (tool admin: tambah anggota, bagikan skill, ganti model).
+admins:
+  - "300000000000000001"
+
+# Kategori Discord tempat channel pribadi baru dibuat (onboarding / add_member). Maks 50 channel per kategori.
+category_id: "400000000000000009"
+channel_prefix: "hermes-"               # #hermes-andi, #hermes-budi, ...
+
+profile_prefix: "be-"                   # profile be-andi, be-budi, ...
+template_profile: be-template           # sumber clone profile pribadi
+
+shared:
+  profile: team-shared
+  channel_id: "400000000000000001"      # #hermes-shared  (semua @backend, wajib @mention → thread)
+  auto_skills: []                       # opsional, mis. [team-conventions] dimuat tiap sesi baru
+admin:
+  profile: team-admin
+  channel_id: "400000000000000002"      # #hermes-admin   (hanya @hermes-admin)
+  auto_skills: []
+
+# Repo skill tim (git), dimiliki root dan READ-ONLY untuk user Linux Hermes.
+team_skills_dir: /srv/hermes-team/skills
+team_skills_in_personal: true
+
+# false (disarankan): siapa pun yang bisa melihat channel pribadi dilayani profile pemiliknya
+#                     (batasi lewat izin channel Discord); cron pribadi tetap bisa kirim ke channel.
+# true            : hanya pemilik yang dilayani; orang lain jatuh ke lobby; cron tidak bisa kirim ke sana.
+strict_personal_routes: false
+# true (disarankan): #hermes-admin hanya melayani user di `admins`, walau izin channel bocor.
+strict_admin_routes: true
+
+# true = profile default (lobby, untuk pesan tanpa rute) hanya bisa membalas teks, tanpa tool.
+lobby_restrict: true
+
+# Browser otomatis (Chromium) & computer use berjalan di server host, BUKAN di sandbox Docker,
+# dan memakan RAM besar kalau 20 orang memakainya. false = dimatikan untuk semua profile.
+allow_browser: false
+
+# --------------------------------------------------------------------------- model AI
+# Satu provider OpenAI-compatible (mis. gateway LLM internal) dengan beberapa model.
+# API key-nya TIDAK ditulis di sini. Taruh di /etc/hermes/.env (milik root, berlaku untuk semua
+# profile dan tidak bisa ditimpa user):   TD_API_KEY=...
+llm:
+  providers:
+    td:
+      api: https://llm.example.internal/v1   # base URL OpenAI-compatible
+      key_env: TD_API_KEY
+  models:                                    # alias → provider + nama model di endpoint
+    td-normal: {provider: "custom:td", model: td-normal}
+    td-simple: {provider: "custom:td", model: td-simple}
+  default_model: td-simple    # anggota tanpa `model` di members.yaml
+  admin_model: td-normal      # profile team-admin
+  shared_model: td-simple     # profile team-shared (#hermes-shared)
+  lobby_model: td-simple      # profile default (lobby)
+  aux_model: td-simple        # kompresi konteks, judul, review memory, approval, dll.
+  fallback: [td-simple]       # dipakai bila model utama error/throttle (model yang sama dilewati)
+  per_user_keys: false        # true = tiap profile boleh punya key sendiri (hermes_team.py llm-key)
+
+# --------------------------------------------------------------------------- sandbox
+# Dipin lewat /etc/hermes/config.yaml. image kosong = image bawaan Hermes. Untuk tim backend,
+# pertimbangkan image sendiri berisi toolchain tim (PHP/Composer, Go, Java, Node, Python, client DB).
+sandbox:
+  image: ""
+  cpu: 1
+  memory_mb: 2048
+  # Opsional — batasi internet sandbox lewat proxy allowlist (lihat folder egress/):
+  # network: hermes-sandbox
+  # http_proxy: http://hermes-egress:3128
+
+# --------------------------------------------------------------------------- skala (20 orang)
+scale:
+  max_concurrent_sessions: 8        # sesi anggota yang boleh berjalan bersamaan (lebih → antre)
+  admin_reserved_slots: 2           # slot tambahan khusus admin, jadi admin tidak ikut antre
+  user_rate_per_minute: 6           # pesan per menit per orang (0 = tanpa batas)
+  user_burst: 4                     # pesan beruntun yang langsung lolos
+  queue_max_wait_seconds: 180       # lama antre saat semua slot penuh sebelum pesan ditolak sopan
+  agent_max_turns: 60               # langkah tool per giliran (mencegah loop tak berujung)
+  goals_max_turns: 8                # batas lanjutan otomatis /goal
+  delegation_max_children: 2        # subagent paralel per giliran
+  compression_threshold_tokens: 64000   # kompres konteks paling lambat di angka ini
+  proactive_prune_tokens: 48000     # pangkas output tool lama tanpa LLM
+  idle_compact_after_seconds: 3600  # sesi yang dibuka lagi setelah 1 jam diringkas dulu
+  busy_input_mode: queue            # pesan susulan saat bot sibuk masuk antrean, tidak memotong
+  title_llm: false                  # judul sesi tanpa request LLM
+
+# --------------------------------------------------------------------------- secret (/env-set)
+secrets:
+  max_keys: 40                      # per profile
+  min_length: 6                     # nilai lebih pendek ditolak (tidak bisa disamarkan dengan aman)
+  scrub_chat: true                  # kredensial yang diketik di chat disamarkan sebelum sampai ke AI
+  delete_secret_messages: true      # dan pesan aslinya dihapus (bot butuh Manage Messages)
+  block_env_dump: true              # blokir env/printenv/set/echo $SECRET di terminal
+  hint: true                        # beri tahu AI NAMA secret yang tersedia (bukan nilainya)
+  allow_names: []                   # pengecualian nama yang biasanya dilarang
+  deny_names: []                    # nama tambahan yang dilarang
+
+# --------------------------------------------------------------------------- onboarding otomatis
+# User baru masuk server → role entry. Admin memberi @backend → bot membuat channel privat
+# #hermes-<username>, profile be-<username> (memory, .env, sandbox sendiri), rute gateway, lalu
+# mengirim pesan sambutan yang me-mention orangnya. Role @backend dicabut / user keluar → dinonaktifkan.
+onboarding:
+  enabled: true
+  give_entry_role: true             # butuh roles.entry
+  remove_entry_role: true           # role entry dicabut setelah onboarding selesai
+  verify_actor: true                # @backend harus diberikan admin tim / pemilik server / bot ini (audit log;
+                                    # bot butuh izin View Audit Log). Lainnya → ditahan, admin diberi tahu.
+  trusted_actor_ids: []             # bot lain yang boleh memberi @backend (mis. bot verifikasi)
+  offboard_on_role_remove: true     # @backend dicabut / keluar server → anggota dinonaktifkan (data tetap)
+  hide_channel_on_offboard: true    # sekaligus cabut izin melihat channel pribadinya
+  entry_role_on_offboard: true      # yang masih di server kembali mendapat role entry
+  reconcile_minutes: 10             # susulan berkala untuk perubahan role saat bot offline (0 = mati)
+  admin_notices: true               # kabar onboarding di #hermes-admin
+  # Placeholder: {mention} {display_name} {name} {team_name} {model} {channel} {shared_channel}
+  #              {admin_channel} {profile}. Kosongkan baris di bawah untuk memakai teks bawaan.
+  # welcome_message: |
+  #   Halo {mention}, selamat datang di tim {team_name}! 👋
+  #   Ini ruang kerja Hermes pribadimu. Tulis langsung di sini; simpan token dengan /env-set.
+  #   Skill & konteks tim ada di {shared_channel}. Model AI-mu: {model}.
+  # welcome_back_message: "Halo lagi {mention}, ruang kerja Hermes-mu aktif kembali."
+
+# Rute & channel baru diterapkan plugin ke gateway yang sedang jalan, tanpa restart.
+live_reload: true
+# Kalau live reload gagal (mis. versi Hermes baru mengubah internal gateway):
+#   idle   = restart halus otomatis saat tidak ada sesi aktif (sesi berjalan tidak diputus)
+#   manual = admin diberi tahu untuk mengetik /restart
+restart_fallback: idle
+
+# --------------------------------------------------------------------------- kelola server Discord
+# Tool discord_* di #hermes-admin (selalu dengan tombol konfirmasi).
+server_admin:
+  enabled: true
+  allow_moderation: true            # timeout & kick (ban selalu manual)
+  allow_elevated_permissions: false # izin tinggi (Administrator, Manage Roles/Channels/Server, ban/kick, …)
+  read_messages: true               # baca pesan channel non-pribadi (channel pribadi anggota selalu ditolak)
+
+# Opsional — perintah slash yang boleh dipakai anggota non-admin (tanpa garis miring).
+# Kosongkan untuk memakai daftar bawaan (tanpa /model, /moa, /reasoning, /tools, /config, ...).
+# user_allowed_commands: [new, reset, retry, undo, status, stop, thread, usage]
+
+# Opsional — rute tambahan, mis. satu thread khusus diberi "otak" sendiri.
+# extra_routes:
+#   - name: andi-payment-thread
+#     platform: discord
+#     guild_id: "100000000000000001"
+#     thread_id: "700000000000000001"
+#     profile: be-andi-payment
