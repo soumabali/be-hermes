@@ -2083,7 +2083,7 @@ class TeamCtl:
                 def run() -> str:
                     srv.api.kick_member(srv.g, uid, srv.reason(why or "kick"))
                     return f"{label} di-kick dari server."
-            return Plan(team, preview, run, user=uid, reason=why)
+            return Plan(team, preview, run, user=uid, mod_reason=why)
 
         return self._guarded(f"discord-{action}", plan)
 

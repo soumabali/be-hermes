@@ -51,7 +51,7 @@ def start_fake():
     state = fd.State()
     handler = type("BoundHandler", (Handler,), {"state": state})
     server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
-    threading.Thread(target=server.serve_forever, daemon=True).start()
+    threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.02}, daemon=True).start()
     return state, f"http://127.0.0.1:{server.server_address[1]}/api/v10", server
 
 

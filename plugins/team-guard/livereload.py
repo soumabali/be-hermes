@@ -99,7 +99,7 @@ class LiveReloader:
             parsed = list(self.upstream.parse_profile_routes(roster.profile_routes))
         except Exception as exc:
             return False, f"parse_profile_routes gagal ({type(exc).__name__}: {exc})"
-        if len(parsed) != len([r for r in roster.profile_routes if r.get("enabled", True) is not None]):
+        if len(parsed) != len(roster.profile_routes):
             return False, f"{len(roster.profile_routes) - len(parsed)} rute ditolak parse_profile_routes"
         try:
             current = config.profile_routes
