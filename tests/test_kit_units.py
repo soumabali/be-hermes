@@ -1635,3 +1635,46 @@ class TestParking:
         team = kit.team()
         ht.sync_parking(team, kit.hermes())          # be-budi belum pernah dibuat: tidak membuat folder
         assert not kit.home("be-budi").exists()
+
+
+# =========================================================================== thread per percakapan
+class TestThreadsPerConversation:
+    def _settings(self, kit, **threads):
+        kit.write_team(**({"threads": threads} if threads else {}))
+        return dict(ht.host_settings(kit.team()))
+
+    def test_default_personal_channels_open_a_thread_per_message(self, kit):
+        st = self._settings(kit)
+        assert st["discord.free_response_auto_thread"] is True
+        assert st["discord.auto_thread"] is True and st["discord.require_mention"] is True
+        assert st["discord.no_thread_channels"] == [kit.team()["admin"]["channel_id"]]   # admin tetap inline
+
+    def test_can_turn_threads_off(self, kit):
+        assert self._settings(kit, personal=False)["discord.free_response_auto_thread"] is False
+
+    def test_admin_threads_opt_in(self, kit):
+        assert self._settings(kit, admin=True)["discord.no_thread_channels"] == []
+
+    def test_invalid_threads_section_rejected(self, kit):
+        kit.write_team(threads=["x"])
+        with pytest.raises(ht.TeamError):
+            kit.team()
+        kit.write_team(threads={"personal": "mungkin"})
+        with pytest.raises(ht.TeamError):
+            kit.team()
+
+    def test_apply_writes_keys_and_is_idempotent(self, kit, discord):
+        team = kit.team()
+        ht.cmd_apply(team, kit.hermes())
+        sets = {(p, k): v for p, k, v in kit.config_sets()}
+        assert sets[("default", "discord.free_response_auto_thread")] == "true"
+        assert sets[("default", "discord.no_thread_channels")] == team["admin"]["channel_id"]
+        kit.clear_log()
+        ht.cmd_apply(kit.team(), kit.hermes())
+        assert kit.config_sets() == []                      # apply kedua: nol `config set`
+
+    def test_changing_the_option_needs_a_gateway_restart(self, kit, discord):
+        ht.cmd_apply(kit.team(), kit.hermes())
+        kit.write_team(threads={"personal": False})
+        result = ht.cmd_apply(kit.team(), kit.hermes())
+        assert result["restart_needed"] is True

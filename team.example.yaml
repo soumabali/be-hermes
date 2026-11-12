@@ -47,6 +47,15 @@ strict_admin_routes: true
 # true = profile default (lobby, untuk pesan tanpa rute) hanya bisa membalas teks, tanpa tool.
 lobby_restrict: true
 
+# Thread per percakapan. Di channel pribadi tiap pesan BARU (bukan balasan) otomatis membuka thread baru
+# = sesi baru dengan konteks sendiri; selama kamu membalas di dalam thread itu, konteksnya tetap satu.
+# Memory, skill, secret, dan sandbox (/workspace) milik profile-mu sama di semua thread, jadi hal yang
+# sudah dipelajari tidak hilang. false = semua pesan di channel utama berbagi satu sesi (dipotong /new).
+# Mengubah ini butuh /restart sekali.
+threads:
+  personal: true     # channel pribadi anggota
+  admin: false       # #hermes-admin tetap satu aliran (true = ikut membuat thread)
+
 # Browser otomatis (Chromium) & computer use berjalan di server host, BUKAN di sandbox Docker,
 # dan memakan RAM besar kalau 20 orang memakainya. false = dimatikan untuk semua profile.
 allow_browser: false

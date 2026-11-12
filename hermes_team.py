@@ -507,6 +507,11 @@ def load_team(team_path: Path, members_path: Optional[Path] = None) -> dict:
     team["admin_strict"] = _bool(raw.get("strict_admin_routes"), "strict_admin_routes", True)
     team["lobby_restrict"] = _bool(raw.get("lobby_restrict"), "lobby_restrict", True)
     team["allow_browser"] = _bool(raw.get("allow_browser"), "allow_browser", False)
+    threads = raw.get("threads") or {}
+    if not isinstance(threads, dict):
+        raise TeamError("threads: harus mapping (personal, admin)")
+    team["threads"] = {"personal": _bool(threads.get("personal"), "threads.personal", True),
+                       "admin": _bool(threads.get("admin"), "threads.admin", False)}
     prefix = str(raw.get("profile_prefix", "be-"))
     team["prefix"] = prefix
     team["template"] = _profile(str(raw.get("template_profile") or f"{prefix}template"), "template_profile")
@@ -807,7 +812,11 @@ def host_settings(team: dict) -> list[tuple[str, object]]:
         ("group_sessions_per_user", True),
         ("discord.allowed_channels", allowed),
         ("discord.free_response_channels", free),
-        ("discord.free_response_auto_thread", False),
+        # Channel tanpa-@mention (pribadi, admin): tiap pesan baru di channel membuka THREAD baru = sesi baru
+        # dengan konteks sendiri; balasan di dalam thread tetap satu sesi. Memory/skill/.env/sandbox milik
+        # profile tetap sama di semua thread. #hermes-admin dikecualikan lewat no_thread_channels.
+        ("discord.free_response_auto_thread", bool(team["threads"]["personal"])),
+        ("discord.no_thread_channels", [] if team["threads"]["admin"] else [admin]),
         ("discord.require_mention", True),
         ("discord.auto_thread", True),
         # Hanya pemegang role tim yang dilayani. Role tidak berlaku di DM → DM ditolak.
@@ -985,7 +994,8 @@ def roster_data(team: dict, hermes_root: Path, hermes_bin: str) -> dict:
 
 # --------------------------------------------------------------------------- nilai untuk `hermes config set`
 # String CSV untuk key yang default-nya string; JSON untuk struktur lain.
-CSV_KEYS = {"discord.allowed_channels", "discord.free_response_channels", "DISCORD_ALLOWED_ROLES"}
+CSV_KEYS = {"discord.allowed_channels", "discord.free_response_channels", "discord.no_thread_channels",
+            "DISCORD_ALLOWED_ROLES"}
 
 
 def cli_value(key: str, value: object) -> str:
@@ -1340,7 +1350,7 @@ def provision_host(team: dict, hermes: Hermes) -> int:
 RESTART_KEYS = {
     "gateway.profile_routes", "gateway.multiplex_profiles", "group_sessions_per_user",
     "discord.allowed_channels", "discord.free_response_channels", "discord.free_response_auto_thread",
-    "discord.require_mention", "discord.auto_thread", "DISCORD_ALLOWED_ROLES", "DISCORD_HOME_CHANNEL",
+    "discord.no_thread_channels", "discord.require_mention", "discord.auto_thread", "DISCORD_ALLOWED_ROLES", "DISCORD_HOME_CHANNEL",
     "unauthorized_dm_behavior", "gateway.unauthorized_dm_decline_message", "max_concurrent_sessions",
     "plugins.enabled", "mcp_servers.teamctl",
 }
