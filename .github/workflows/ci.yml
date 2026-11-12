@@ -1,0 +1,55 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: "17 2 * * 1"   # mingguan: deteksi dini perubahan Hermes yang merusak kit
+  workflow_dispatch:
+    inputs:
+      hermes_ref:
+        description: "Ref hermes-agent untuk uji integrasi (kosong = pakai HERMES_REF di bawah)"
+        required: false
+
+permissions:
+  contents: read
+
+env:
+  # Versi Hermes yang dipakai tim. Naikkan lewat PR setelah uji integrasi hijau,
+  # baru jalankan `hermes update` di server.
+  HERMES_REF: 5d87ea2242c7e5a4ce76098b6113f04bf11348c6
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ["3.11", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: pip install -r requirements-dev.txt
+      - run: python -m pytest tests -q
+
+  integration:
+    # Uji yang butuh Hermes asli (resolver rute, loader plugin). Di mesin tanpa Hermes uji ini dilewati.
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        hermes: [pinned, main]
+    continue-on-error: ${{ matrix.hermes == 'main' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"   # Hermes hanya mendukung 3.14
+      - name: Pasang Hermes
+        env:
+          REF: ${{ matrix.hermes == 'main' && 'main' || (inputs.hermes_ref || env.HERMES_REF) }}
+        run: |
+          pip install -r requirements-dev.txt
+          pip install "hermes-agent[discord] @ git+https://github.com/NousResearch/hermes-agent.git@${REF}"
+      - run: python -m pytest tests -q -rs
