@@ -72,13 +72,20 @@ llm:
   per_user_keys: false        # true = tiap profile boleh punya key sendiri (hermes_team.py llm-key)
 
 # --------------------------------------------------------------------------- sandbox
-# Dipin lewat /etc/hermes/config.yaml. image kosong = image bawaan Hermes. Untuk tim backend,
-# pertimbangkan image sendiri berisi toolchain tim (PHP/Composer, Go, Java, Node, Python, client DB).
+# Dipin lewat /etc/hermes/config.yaml. image kosong = image bawaan Hermes. Untuk tim backend pakai image
+# sendiri berisi toolchain (PHP/Composer, Go, Java, Node, Python, klien DB, gh): lihat docker/sandbox/Dockerfile,
+#   docker build -t hermes-team-sandbox:2026.11 docker/sandbox   →   image: "hermes-team-sandbox:2026.11"
+# Pakai tag bertanggal, bukan :latest, supaya semua sandbox sama dan rollback mudah.
 sandbox:
   image: ""
   cpu: 1
   memory_mb: 2048
-  # Opsional — batasi internet sandbox lewat proxy allowlist (lihat folder egress/):
+  # Membatasi internet sandbox — pilih salah satu:
+  #  1) Proxy bawaan Hermes (disarankan): di server jalankan `hermes egress install && hermes egress setup &&
+  #     hermes egress start`. Sandbox hanya memegang token proxy (kunci provider asli tetap di host) dan
+  #     hanya bisa ke host yang diizinkan (proxy.extra_allowed_hosts di config host). Tidak perlu setelan di sini.
+  #  2) Tanpa jaringan sama sekali: `terminal.docker_network: false` (tool yang butuh internet tidak jalan).
+  #  3) Proxy sendiri (lama): isi dua baris berikut dengan jaringan Docker + URL proxy buatanmu.
   # network: hermes-sandbox
   # http_proxy: http://hermes-egress:3128
 

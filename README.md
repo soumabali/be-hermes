@@ -104,6 +104,12 @@ cp /opt/hermes-team/members.example.yaml ~/.hermes-team/members.yaml
 Skill tim read-only (opsional): repo git di `/srv/hermes-team/skills` milik root, `git pull` lewat
 cron root. Isi `team_skills_dir` di team.yaml.
 
+Alternatif bawaan Hermes untuk mendistribusikan **profile template** (SOUL, skill, setelan dasar) ke
+server lain atau memperbarui anggota sekaligus: *profile distributions* — `hermes profile install
+github.com/org/be-template --name be-template` lalu `hermes profile update be-template`. Distribusi tidak
+pernah membawa `.env`, memory, atau sesi, jadi aman untuk repo git tim. Pakai itu untuk template; skill
+buatan anggota tetap dibagikan lewat `share-skill` (dipindai dulu) atau repo skill tim di atas.
+
 ## 3. API key LLM
 
 Key disimpan di `.env` managed: milik root, berlaku untuk semua profile, selalu menang atas `.env`
