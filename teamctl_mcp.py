@@ -57,6 +57,7 @@ import os
 import re
 import secrets
 import shutil
+import sqlite3
 import sys
 import threading
 import traceback
@@ -94,6 +95,25 @@ TOOLS: list[dict] = [
         "name": "team_status",
         "description": "Ringkasan tim: anggota, channel, profile, model per orang, status plugin, batas skala.",
         "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+        "annotations": {"readOnlyHint": True},
+    },
+    {
+        "name": "usage_report",
+        "description": ("Pemakaian LLM per orang (request ke model, token masuk/keluar, jumlah sesi, biaya) untuk satu "
+                        "periode: harian, mingguan (Senin–Minggu), atau bulanan. Hanya-baca dan tanpa konfirmasi; data "
+                        "dipotret dulu supaya terbaru. Tidak memuat isi percakapan. Contoh: minggu lalu → period=week, "
+                        "offset=1; 7 hari terakhir per hari → period=day, last=7."),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "period": {"type": "string", "enum": ["day", "week", "month"], "description": "bawaan: day"},
+                "offset": {"type": "integer", "description": "0 = periode berjalan, 1 = periode sebelumnya, dst."},
+                "last": {"type": "integer", "description": "N hari terakhir dengan rincian per hari (hanya period=day, 1–92)"},
+                "user": {"type": "string", "description": "saring satu orang: nama anggota, nama tampilan, atau ID user"},
+                "format": {"type": "string", "enum": ["markdown", "text", "json"], "description": "bawaan: markdown"},
+            },
+            "additionalProperties": False,
+        },
         "annotations": {"readOnlyHint": True},
     },
     {
@@ -1190,6 +1210,28 @@ class TeamCtl:
             text += "\n\nSkill yang dibagikan: " + ", ".join(
                 f"{k} (dari {v.get('origin_member')}, {v.get('scope')})" for k, v in sorted(registry.items()))
         return text
+
+    def tool_usage_report(self, args: dict) -> str:
+        import usage_ledger as ul
+        team = self.team()
+        ledger = Path(team["paths"]["state_dir"]) / "usage.db"
+        period = str(args.get("period") or "day")
+        offset, last = int(args.get("offset") or 0), int(args.get("last") or 0)
+        if not 0 <= offset <= 36:
+            raise ToolError("offset harus 0–36")
+        try:
+            tz = ul.resolve_tz(team["usage"]["timezone"] or None)
+            owners, people = ul.load_members(self.members_file)
+            note = ""
+            try:
+                ul.collect(ledger, self.hermes_root, owners=owners, tz=tz)
+            except (OSError, sqlite3.Error) as exc:      # tetap laporkan data terakhir
+                note = f"\n\n(Potret terbaru gagal: {_clean(str(exc), 120)} — angka di atas dari potret sebelumnya.)"
+            text = ul.report(ledger, period, offset=offset, last=last, user=(str(args["user"]) if args.get("user") else None),
+                             fmt=str(args.get("format") or "markdown"), people=people, tz=tz)
+        except ul.LedgerError as exc:
+            raise ToolError(str(exc))
+        return text + note
 
     def tool_list_models(self, args: dict) -> str:
         team = self.team()

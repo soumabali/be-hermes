@@ -107,6 +107,9 @@ subagent dari #2). Jalankan saat instalasi dan tiap ganti endpoint.
 
 ### 5. Tidak ada anggaran token per orang — P1, terbukti
 
+> **Sebagian sudah ada:** pencatatannya (`usage_ledger.py`, README §10b) sudah dibuat. Yang belum:
+> penegakan anggaran (peringatan 80%, penolakan 100%) di plugin.
+
 **Sekarang.** Pembatas menghitung pesan. Satu pesan bisa menghabiskan 60 langkah tool dengan
 konteks 64k token, jadi 6 pesan per menit bisa berarti jutaan token. `usage_report.py` hanya
 melaporkan setelah kejadian.

@@ -82,6 +82,7 @@ KIT_DIR = Path(__file__).resolve().parent
 PLUGIN_NAME = "team-guard"
 PLUGIN_SRC = KIT_DIR / "plugins" / PLUGIN_NAME
 TEAMCTL = KIT_DIR / "teamctl_mcp.py"
+KIT_SKILLS = KIT_DIR / "skills"
 DEFAULT_TEAM_DIR = Path(os.environ.get("HERMES_TEAM_DIR") or "~/.hermes-team").expanduser()
 
 PROFILE_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")     # aturan nama profile Hermes
@@ -512,6 +513,10 @@ def load_team(team_path: Path, members_path: Optional[Path] = None) -> dict:
         raise TeamError("threads: harus mapping (personal, admin)")
     team["threads"] = {"personal": _bool(threads.get("personal"), "threads.personal", True),
                        "admin": _bool(threads.get("admin"), "threads.admin", False)}
+    usage = raw.get("usage") or {}
+    if not isinstance(usage, dict):
+        raise TeamError("usage: harus mapping (timezone)")
+    team["usage"] = {"timezone": str(usage.get("timezone") or "").strip()}
     prefix = str(raw.get("profile_prefix", "be-"))
     team["prefix"] = prefix
     team["template"] = _profile(str(raw.get("template_profile") or f"{prefix}template"), "template_profile")
@@ -880,7 +885,8 @@ def profile_settings(team: dict, role: str, member: Optional[dict] = None, *,
             ("memory.user_profile_enabled", True),
             ("memory.write_approval", False),
             ("skills.write_approval", False),
-            ("skills.external_dirs", skills_dir),
+            # Skill bawaan kit (mis. team-usage-report) dibaca langsung dari folder kit yang dimiliki root.
+            ("skills.external_dirs", skills_dir + ([str(KIT_SKILLS)] if KIT_SKILLS.is_dir() else [])),
             ("mcp_servers.teamctl", teamctl_server(team, hermes_bin, hermes_root or Path("~/.hermes").expanduser())),
         ]
     else:

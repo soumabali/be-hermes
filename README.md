@@ -381,6 +381,8 @@ hermes gateway status
 
 Log: `hermes logs -f` (cari `team-guard`).
 
+Pasang juga pemotret pemakaian token (timer tiap 15 menit); perintahnya ada di [§10b](#10b-pencatatan-pemakaian-token-dan-request).
+
 Yang seharusnya terlihat: bot online di Discord, dan di log ada baris plugin `team-guard` dimuat
 tanpa galat.
 
@@ -486,7 +488,10 @@ model terkunci untuk anggota, penyamaran secret berlapis, dan mekanisme skala 20
 | `team.example.yaml` | Setelan tim (guild, role, admin, channel, model, sandbox, skala, secret, onboarding, kelola server). |
 | `members.example.yaml` | Anggota + model per orang (juga ditulis otomatis oleh onboarding). |
 | `kit_doctor.py` | `doctor`: membandingkan members.yaml ↔ profile di disk ↔ rute gateway ↔ channel Discord (`--discord`), hanya membaca. |
-| `usage_report.py` | Laporan token & biaya LLM per anggota dari `state.db` tiap profile (read-only). |
+| `usage_ledger.py` | Buku besar pemakaian: token & request per orang per hari/minggu/bulan, tahan terhadap pembersihan sesi (§10b). |
+| `skills/team-usage-report/` | Skill admin untuk laporan pemakaian (dipanggil manual atau oleh cron). |
+| `systemd/` | Timer user untuk memotret pemakaian tiap 15 menit. |
+| `usage_report.py` | Laporan sekali-jalan langsung dari `state.db` (tanpa buku besar). |
 | `docker/sandbox/` | Dockerfile image sandbox tim (PHP, Go, Java, Node, Python, klien DB, `gh`). |
 | `.github/workflows/ci.yml` | CI: uji unit + uji integrasi terhadap Hermes yang dipin dan `main` (mingguan). |
 | `tests/` | `selftest.sh` menguji seluruh kit memakai Python milik Hermes di server ini (HOME sementara, Discord tiruan). Uji integrasi (resolver rute, loader plugin) dilewati bila Hermes tidak bisa di-import. |
@@ -758,6 +763,90 @@ flowchart TD
 
 Patokan: `max_concurrent_sessions` ≤ jumlah request paralel yang sanggup dilayani endpoint LLM.
 
+## 10b. Pencatatan pemakaian token dan request
+
+`usage_ledger.py` mencatat pemakaian LLM **per orang, per hari** ke buku besar sendiri
+(`~/.hermes-team/state/usage.db`), sehingga laporan harian, mingguan, dan bulanan bisa diambil kapan saja.
+
+```mermaid
+flowchart LR
+    subgraph Hermes["Data Hermes (hanya dibaca)"]
+        S1["state.db be-andi"]
+        S2["state.db be-budi"]
+        S3["state.db team-shared"]
+    end
+    T["Timer systemd<br/>tiap 15 menit"] --> C["usage_ledger.py collect<br/>hitung selisih"]
+    S1 -. "mode=ro" .-> C
+    S2 -. "mode=ro" .-> C
+    S3 -. "mode=ro" .-> C
+    C --> L[("usage.db<br/>per hari, per orang<br/>mode 0600")]
+    L --> R1["CLI: usage_ledger.py report"]
+    L --> R2["Tool teamctl: usage_report<br/>hanya-baca"]
+    R2 --> SK["Skill team-usage-report"]
+    SK --> CR["Cron job profile admin"]
+    CR --> CH["Channel laporan"]
+```
+
+**Yang dicatat:** request ke model (`api_call_count`), token masuk, token keluar, token cache dan
+reasoning, jumlah sesi, biaya, per model. "Request" adalah panggilan API ke model, bukan jumlah pesan;
+satu pesan bisa menghasilkan banyak request.
+
+**Atribusi per orang:** pemakaian dipasangkan ke user Discord pengirimnya (kolom `user_id` di tabel
+`sessions` Hermes), jadi pemakaian di `#hermes-shared` terbagi ke orang yang benar. Sesi tanpa pengirim
+(cron, subagent) ikut pemilik profile; di profile bersama ia tampil sebagai "(team-shared, tanpa pengirim)".
+
+**Kenapa aman:**
+- `state.db` Hermes dibuka hanya-baca; kit tidak pernah menulis ke data Hermes.
+- Buku besar hanya berisi angka, nama model, nama profile, dan ID user. Tidak ada isi percakapan,
+  judul sesi, prompt, atau secret.
+- Berkasnya bermode 0600 di folder 0700 milik user `hermes`; satu penulis pada satu waktu (kunci
+  berkas), tiap profile satu transaksi.
+- Riwayat tetap ada walau sesi di Hermes dihapus (`hermes sessions prune`); disimpan ±800 hari.
+- Agent tidak bisa membukanya dari sandbox Docker. Satu-satunya jalur untuk AI adalah tool
+  `usage_report`, yang hanya-baca dan hanya ada di profile `team-admin`.
+
+**Pasang pemotret berkala** (sekali, sebagai user `hermes`):
+
+```bash
+mkdir -p ~/.config/systemd/user
+cp /opt/hermes-team/systemd/hermes-usage-collect.* ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now hermes-usage-collect.timer
+```
+
+Atur zona waktu batas hari di `team.yaml` → `usage.timezone` (mis. `Asia/Makassar`). Potret pertama
+menaruh riwayat lama pada hari tiap sesi terakhir aktif.
+
+**Ambil data kapan saja:**
+
+```bash
+U=/opt/hermes-team/usage_ledger.py
+python3 $U report --period day                              # hari ini
+python3 $U report --period day --last 7                     # 7 hari terakhir, per hari
+python3 $U report --period week --offset 1 --format markdown  # minggu lalu
+python3 $U report --period month --user budi --format json  # satu orang, data mentah
+```
+
+Di `#hermes-admin` cukup tulis biasa, misalnya "pemakaian token minggu lalu" atau "pemakaian budi bulan
+ini". Hermes memanggil tool `usage_report` (tanpa tombol konfirmasi, karena hanya membaca) lewat skill
+`team-usage-report`, yang melarang AI mengubah atau mengarang angka.
+
+**Laporan terjadwal lewat cron.** Skill-nya sudah siap dipanggil cron: di `#hermes-admin` minta
+"buat cron tiap Senin 09.00: jalankan skill team-usage-report untuk minggu lalu". Dua hal yang
+harus diputuskan sebelum itu dipakai:
+
+- **Channel tujuan.** Dengan `strict_admin_routes: true` (bawaan), hasil cron profile `team-admin`
+  tidak bisa dikirim ke `#hermes-admin` (lihat §13). Pilihannya: set `strict_admin_routes: false` dan
+  andalkan izin channel Discord, atau siapkan channel laporan tersendiri dengan rutenya. Yang kedua
+  belum dibuat di kit.
+- **Tanpa LLM.** Hermes punya cron mode skrip (keluaran skrip dikirim apa adanya, tanpa memanggil
+  model). Untuk laporan angka, itu lebih murah dan tidak mungkin salah kutip; skill tetap berguna
+  untuk pertanyaan bebas.
+
+Ketelitian: pemakaian dicatat pada hari saat dipotret, jadi selisih di sekitar tengah malam bisa
+bergeser paling lama selang timer (15 menit; timer juga berjalan pukul 23.59.30).
+`usage_report.py` yang lama tetap ada untuk melihat `state.db` secara langsung tanpa buku besar.
+
 ## 11. Uji di Discord
 
 Lihat daftar periksa di [Langkah 11](#langkah-11--uji-end-to-end-di-discord).
@@ -774,7 +863,7 @@ Lihat daftar periksa di [Langkah 11](#langkah-11--uji-end-to-end-di-discord).
 | Update kit | Salin versi baru ke `/opt/hermes-team` → `apply` → `/restart` |
 | Update Hermes | `/update` (admin) atau `hermes update`; lalu `bash tests/selftest.sh` (memeriksa live reload) |
 | Periksa konsistensi | `python3 /opt/hermes-team/kit_doctor.py [--discord]` (members ↔ profile ↔ rute ↔ channel) |
-| Pemakaian & biaya per orang | `python3 /opt/hermes-team/usage_report.py --days 7 --members-file ~/.hermes-team/members.yaml` |
+| Pemakaian token & request per orang | `python3 /opt/hermes-team/usage_ledger.py report --period week` atau tanya di #hermes-admin (§10b) |
 | Log | `hermes logs -f`; cari `team-guard` |
 | Audit | `~/.hermes-team/state/audit.log`, `onboarding.json` |
 

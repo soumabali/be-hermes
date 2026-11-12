@@ -1678,3 +1678,30 @@ class TestThreadsPerConversation:
         kit.write_team(threads={"personal": False})
         result = ht.cmd_apply(kit.team(), kit.hermes())
         assert result["restart_needed"] is True
+
+
+# =========================================================================== pencatatan pemakaian
+class TestUsageWiring:
+    def test_admin_profile_reads_kit_skills_only(self, kit):
+        team = kit.team()
+        admin = dict(ht.profile_settings(team, "admin"))["skills.external_dirs"]
+        member = dict(ht.profile_settings(team, "member", team["members"][0]))["skills.external_dirs"]
+        assert str(ht.KIT_SKILLS) in admin and str(ht.KIT_SKILLS) not in member
+
+    def test_kit_skill_has_valid_frontmatter_and_names_the_tool(self):
+        skill = ht.KIT_SKILLS / "team-usage-report" / "SKILL.md"
+        meta = ht._frontmatter(skill)
+        assert meta["name"] == "team-usage-report" and meta["description"]
+        assert "usage_report" in skill.read_text(encoding="utf-8")
+
+    def test_usage_timezone_is_loaded_and_validated(self, kit):
+        kit.write_team(usage={"timezone": "Asia/Makassar"})
+        assert kit.team()["usage"]["timezone"] == "Asia/Makassar"
+        kit.write_team(usage=["x"])
+        with pytest.raises(ht.TeamError):
+            kit.team()
+
+    def test_systemd_units_point_at_the_ledger(self):
+        unit = (ht.KIT_DIR / "systemd" / "hermes-usage-collect.service").read_text(encoding="utf-8")
+        timer = (ht.KIT_DIR / "systemd" / "hermes-usage-collect.timer").read_text(encoding="utf-8")
+        assert "usage_ledger.py collect" in unit and "OnCalendar=*:0/15" in timer

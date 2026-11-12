@@ -1,0 +1,10 @@
+# Potret pemakaian LLM ke buku besar tim (usage_ledger.py). Unit USER milik user hermes:
+#   mkdir -p ~/.config/systemd/user && cp /opt/hermes-team/systemd/hermes-usage-collect.* ~/.config/systemd/user/
+#   systemctl --user daemon-reload && systemctl --user enable --now hermes-usage-collect.timer
+[Unit]
+Description=Hermes team kit: potret pemakaian LLM per orang
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /opt/hermes-team/usage_ledger.py collect
+Nice=10

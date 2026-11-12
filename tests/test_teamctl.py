@@ -898,7 +898,7 @@ def test_stdio_roundtrip_accept_executes_and_audits(tc):
     init = p.initialize()
     assert init["result"]["serverInfo"]["name"] == "teamctl" and init["result"]["protocolVersion"] == "2025-06-18"
     tools = p.response(p.post("tools/list"))["result"]["tools"]
-    assert len(tools) == 24 and sum(1 for t in tools if t["name"].startswith("discord_")) == 14
+    assert len(tools) == 25 and sum(1 for t in tools if t["name"].startswith("discord_")) == 14
     mid = p.post("tools/call", {"name": "discord_send_message",
                                 "arguments": {"channel": "general", "content": "deploy ditunda", "mention_users": ["be1"]}})
     elicit = p.wait(lambda m: m.get("method") == "elicitation/create")
@@ -1140,7 +1140,7 @@ def test_server_admin_disabled_hides_and_refuses_discord_tools(tc):
     tc.patch_team(server_admin={"enabled": False})
     ctl = tc.ctl()
     names = [t["name"] for t in ctl.visible_tools()]
-    assert len(names) == 10 and not any(n.startswith("discord_") for n in names)
+    assert len(names) == 11 and not any(n.startswith("discord_") for n in names)
     with pytest.raises(tm.ToolError, match="tool tidak dikenal"):
         ctl.call("discord_delete_channel", channel="random")
     with pytest.raises(tm.ToolError, match="kelola server dimatikan"):
@@ -1163,10 +1163,10 @@ def test_channel_from_another_guild_is_rejected_everywhere(tc):
 
 def test_mutating_tools_are_not_marked_read_only_and_all_have_handlers(tc):
     read_only = {t["name"] for t in tm.ALL_TOOLS if (t.get("annotations") or {}).get("readOnlyHint")}
-    assert read_only == {"team_status", "list_models", "list_member_skills", "onboarding_status", "discord_overview",
+    assert read_only == {"team_status", "usage_report", "list_models", "list_member_skills", "onboarding_status", "discord_overview",
                          "discord_list_members", "discord_read_messages"}
     assert all(callable(getattr(tm.TeamCtl, f"tool_{t['name']}", None)) for t in tm.ALL_TOOLS)
-    assert len(tm.ALL_TOOLS) == 24
+    assert len(tm.ALL_TOOLS) == 25
 
 
 def test_set_model_requires_confirmation_and_validates(tc):
@@ -1253,3 +1253,51 @@ def test_unshare_skill_requires_confirmation(tc):
     ctl3 = tc.ctl()
     ctl3.call("unshare_skill", skill="deploy")
     assert not list((tc.root / "profiles" / "be-budi" / "skills").rglob("deploy"))
+
+
+# =========================================================================== 19. usage_report (hanya-baca)
+def _usage_db(tc, profile, sid, user_id, calls, tin, tout, seen):
+    import sqlite3
+    home = tc.root / "profiles" / profile
+    home.mkdir(parents=True, exist_ok=True)
+    con = sqlite3.connect(home / "state.db")
+    con.execute("CREATE TABLE IF NOT EXISTS session_model_usage (session_id TEXT, model TEXT, api_call_count INTEGER,"
+                " input_tokens INTEGER, output_tokens INTEGER, estimated_cost_usd REAL DEFAULT 0, last_seen REAL)")
+    con.execute("CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, source TEXT, user_id TEXT)")
+    con.execute("INSERT INTO sessions VALUES (?,?,?)", (sid, "discord", user_id))
+    con.execute("INSERT INTO session_model_usage (session_id, model, api_call_count, input_tokens, output_tokens, last_seen)"
+                " VALUES (?,?,?,?,?,?)", (sid, "td-simple", calls, tin, tout, seen))
+    con.commit()
+    con.close()
+
+
+def test_usage_report_is_read_only_without_confirmation(tc):
+    import time
+    _usage_db(tc, "be-be1", "s1", BE1, 3, 1200, 300, time.time())
+    _usage_db(tc, "team-shared", "s2", BUDI, 5, 900, 100, time.time())
+    ctl = tc.ctl()
+    before = len(mutating(tc.state))
+    out = ctl.call("usage_report", period="month")
+    assert ctl.previews == [] and len(mutating(tc.state)) == before      # tanpa konfirmasi, tanpa menyentuh Discord
+    assert "BE1" in out and "Budi" in out and "| 3 |" in out and "| 5 |" in out
+    assert (tc.team_dir / "state" / "usage.db").exists()
+    tool = next(t for t in tm.TOOLS if t["name"] == "usage_report")
+    assert tool["annotations"]["readOnlyHint"] is True
+
+
+def test_usage_report_filters_user_and_validates_arguments(tc):
+    import time
+    _usage_db(tc, "be-be1", "s1", BE1, 3, 1200, 300, time.time())
+    _usage_db(tc, "be-budi", "s2", BUDI, 5, 900, 100, time.time())
+    ctl = tc.ctl()
+    only = json.loads(ctl.call("usage_report", period="day", user="budi", format="json"))
+    assert [u["name"] for u in only["users"]] == ["budi"] and only["totals"]["requests"] == 5
+    for bad in ({"period": "year"}, {"offset": -1}, {"offset": 99}, {"period": "week", "last": 7}, {"last": "7"},
+                {"format": "html"}, {"rahasia": True}):
+        with pytest.raises((tm.ToolError, ht.TeamError)):
+            ctl.call("usage_report", **bad)
+
+
+def test_usage_report_with_no_data_says_so(tc):
+    out = tc.ctl().call("usage_report", period="week", offset=1)
+    assert "Tidak ada pemakaian" in out

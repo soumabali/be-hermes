@@ -114,6 +114,12 @@ scale:
   busy_input_mode: queue            # pesan susulan saat bot sibuk masuk antrean, tidak memotong
   title_llm: false                  # judul sesi tanpa request LLM
 
+# --------------------------------------------------------------------------- pencatatan pemakaian
+# usage_ledger.py memotret pemakaian token & request tiap orang ke ~/.hermes-team/state/usage.db
+# (hanya angka; tanpa isi percakapan). Batas hari/minggu/bulan memakai zona waktu ini.
+usage:
+  timezone: ""                      # mis. "Asia/Makassar" (WITA) atau "Asia/Jakarta"; kosong = zona waktu server
+
 # --------------------------------------------------------------------------- secret (/env-set)
 secrets:
   max_keys: 40                      # per profile

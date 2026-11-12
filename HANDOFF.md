@@ -25,7 +25,7 @@ Riwayat versi:
 ```
 v3/
   hermes_team.py          # CLI provisioning (~2397 baris, KIT_VERSION 3.0.0)
-  teamctl_mcp.py          # server MCP admin, 24 tool (~1455 baris)
+  teamctl_mcp.py          # server MCP admin, 25 tool
   team.example.yaml       # konfigurasi (roles.entry, onboarding, live_reload, server_admin, ...)
   members.example.yaml
   README.md               # dokumentasi lengkap (Indonesia)

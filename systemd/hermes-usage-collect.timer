@@ -1,0 +1,12 @@
+[Unit]
+Description=Hermes team kit: potret pemakaian LLM tiap 15 menit
+
+[Timer]
+OnCalendar=*:0/15
+# Tepat sebelum tengah malam, supaya pemakaian hari itu tidak tercatat di hari berikutnya.
+OnCalendar=*-*-* 23:59:30
+Persistent=true
+AccuracySec=10s
+
+[Install]
+WantedBy=timers.target
