@@ -41,6 +41,7 @@ import contextlib
 import copy
 import getpass
 import hashlib
+import http.client
 import json
 import os
 import re
@@ -51,6 +52,7 @@ import sys
 import tempfile
 import threading
 import time
+import traceback
 import unicodedata
 import urllib.error
 import urllib.parse
@@ -79,7 +81,7 @@ DEFAULT_TEAM_DIR = Path(os.environ.get("HERMES_TEAM_DIR") or "~/.hermes-team").e
 
 PROFILE_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")     # aturan nama profile Hermes
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,40}$")         # nama anggota
-ID_RE = re.compile(r"^\d{15,21}$")                           # Discord snowflake
+ID_RE = re.compile(r"^[0-9]{15,21}\Z")                      # Discord snowflake (hanya digit ASCII)
 ALIAS_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,79}$")
 ENV_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]{1,63}$")
 # Nama yang bentrok dengan target set-model / profile bawaan → tidak boleh jadi nama anggota baru.
@@ -253,6 +255,69 @@ def _profile(name: str, where: str) -> str:
     return name
 
 
+_TRUE_WORDS = {"true", "yes", "y", "on", "1", "ya", "aktif"}
+_FALSE_WORDS = {"false", "no", "n", "off", "0", "tidak", "mati", ""}
+
+
+def _bool(value: Any, where: str, default: bool = False) -> bool:
+    """Boolean dari YAML. `bool("false")` bernilai True di Python, jadi string diurai eksplisit."""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and value in (0, 1):
+        return bool(value)
+    if isinstance(value, str):
+        word = value.strip().lower()
+        if word in _TRUE_WORDS:
+            return True
+        if word in _FALSE_WORDS:
+            return False
+    raise TeamError(f"{where}: '{value}' bukan boolean (pakai true atau false)")
+
+
+def _int(value: Any, where: str, minimum: Optional[int] = None) -> int:
+    """Bilangan bulat dari YAML; salah ketik → TeamError yang menyebut key-nya (bukan traceback)."""
+    number: Optional[int] = None
+    if isinstance(value, bool) or value is None:
+        number = None
+    elif isinstance(value, int):
+        number = value
+    elif isinstance(value, float) and value == int(value):
+        number = int(value)
+    elif isinstance(value, str) and re.fullmatch(r"[+-]?[0-9]+", value.strip()):
+        number = int(value.strip())
+    if number is None:
+        raise TeamError(f"{where}: '{value}' bukan bilangan bulat")
+    if minimum is not None and number < minimum:
+        raise TeamError(f"{where}: minimal {minimum} (sekarang {number})")
+    return number
+
+
+def _number(value: Any, where: str) -> Any:
+    if isinstance(value, bool) or value is None:
+        raise TeamError(f"{where}: '{value}' bukan angka")
+    if isinstance(value, (int, float)):
+        number: Any = value
+    else:
+        try:
+            number = float(str(value).strip())
+        except ValueError:
+            raise TeamError(f"{where}: '{value}' bukan angka")
+        if number == int(number):
+            number = int(number)
+    if number <= 0:
+        raise TeamError(f"{where}: harus lebih dari 0")
+    return number
+
+
+def clean_display_name(text: Any, fallback: str = "") -> str:
+    """Nama tampilan dikendalikan user Discord dan masuk ke SOUL.md/status/topik channel → buang
+    karakter kontrol, rapikan spasi, maks 64 karakter."""
+    cleaned = re.sub(r"[\x00-\x1f\x7f\u2028\u2029]+", " ", str(text or "")).strip()[:64].strip()
+    return cleaned or fallback
+
+
 def atomic_write(path: Path, text: str, mode: int = 0o600) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent))
@@ -282,48 +347,89 @@ def file_lock(path: Path):
                 fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
 
 
-def parse_env_text(text: str) -> dict[str, str]:
-    """Tokenizer .env yang sama dengan Hermes (bare, 'single', "double" dengan \\" dan \\\\)."""
-    out: dict[str, str] = {}
-    for raw in text.splitlines():
-        line = raw.strip()
+def _unquote_double(quoted: str) -> str:
+    parts, i = [], 0
+    while i < len(quoted):
+        escaped = quoted[i] == "\\" and quoted[i + 1:i + 2] in ('"', "\\")
+        parts.append(quoted[i + 1] if escaped else quoted[i])
+        i += 2 if escaped else 1
+    return "".join(parts)
+
+
+def _closing_quote(text: str, quote: str, start: int) -> int:
+    """Indeks tanda kutip penutup di `text` mulai `start` (-1 bila tidak ada). Di dalam "…",
+    \\" dan \\\\ adalah escape."""
+    i = start
+    while i < len(text):
+        if quote == '"' and text[i] == "\\" and text[i + 1:i + 2] in ('"', "\\"):
+            i += 2
+            continue
+        if text[i] == quote:
+            return i
+        i += 1
+    return -1
+
+
+def _env_entries(text: str) -> list[tuple[int, int, str, str]]:
+    """(baris_awal, baris_akhir_eksklusif, nama, nilai) tiap entri .env. Nilai ber-kutip boleh
+    multi-baris (private key); kutip yang tidak pernah ditutup diperlakukan sebagai nilai polos satu baris."""
+    lines = text.splitlines()
+    out: list[tuple[int, int, str, str]] = []
+    i = 0
+    while i < len(lines):
+        start = i
+        line = lines[i].strip()
+        i += 1
         if not line or line.startswith("#"):
             continue
         if line.startswith("export "):
             line = line[len("export "):].lstrip()
         key, sep, value = line.partition("=")
-        if not (sep and key.strip()):
+        key = key.strip()
+        if not (sep and key):
             continue
         value = value.strip()
-        if len(value) >= 2 and value[0] == value[-1] == '"':
-            quoted, parts, i = value[1:-1], [], 0
-            while i < len(quoted):
-                escaped = quoted[i] == "\\" and quoted[i + 1:i + 2] in ('"', "\\")
-                parts.append(quoted[i + 1] if escaped else quoted[i])
-                i += 2 if escaped else 1
-            value = "".join(parts)
-        elif len(value) >= 2 and value[0] == value[-1] == "'":
-            value = value[1:-1]
-        else:
-            value = re.split(r"\s+#", value, maxsplit=1)[0].strip()
-        out[key.strip()] = value
+        if value[:1] in ('"', "'"):
+            quote = value[0]
+            buffer, j, end = value, i, _closing_quote(value, quote, 1)
+            while end < 0 and j < len(lines):
+                buffer += "\n" + lines[j]
+                j += 1
+                end = _closing_quote(buffer, quote, 1)
+            if end >= 0:
+                inner = buffer[1:end]
+                out.append((start, j, key, _unquote_double(inner) if quote == '"' else inner))
+                i = j
+                continue
+        out.append((start, i, key, re.split(r"\s+#", value, maxsplit=1)[0].strip()))
     return out
 
 
+def parse_env_text(text: str) -> dict[str, str]:
+    """Tokenizer .env yang sama dengan Hermes (bare, 'single', "double" dengan \\" dan \\\\),
+    termasuk nilai ber-kutip yang multi-baris."""
+    return {key: value for _start, _end, key, value in _env_entries(text)}
+
+
 def rewrite_env_text(text: str, key: str, value: Optional[str]) -> str:
-    pattern = re.compile(rf"^\s*(?:export\s+)?{re.escape(key)}\s*=")
+    """Ganti (value) atau hapus (None) satu key; entri lama yang multi-baris ikut terbuang utuh."""
+    lines = text.splitlines()
+    spans = [(start, end) for start, end, name, _v in _env_entries(text) if name == key]
+    drop = {n for start, end in spans for n in range(start, end)}
     out, written = [], False
-    for line in text.splitlines():
-        if pattern.match(line):
-            if value is not None and not written:
-                escaped = value.replace("\\", "\\\\").replace('"', '\\"')
-                out.append(f'{key}="{escaped}"')
+    new_line = None
+    if value is not None:
+        escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+        new_line = f'{key}="{escaped}"'
+    for n, line in enumerate(lines):
+        if n in drop:
+            if new_line is not None and not written:
+                out.append(new_line)
                 written = True
             continue
         out.append(line)
-    if value is not None and not written:
-        escaped = value.replace("\\", "\\\\").replace('"', '\\"')
-        out.append(f'{key}="{escaped}"')
+    if new_line is not None and not written:
+        out.append(new_line)
     return ("\n".join(out) + "\n") if out else ""
 
 
@@ -355,15 +461,41 @@ def _read_yaml_file(path: Path, what: str) -> dict:
     return raw
 
 
+SECRET_LIKE_KEYS = {"api_key", "apikey", "key", "token", "secret", "password", "access_token", "auth_token",
+                    "client_secret", "authorization"}
+
+
+def _secret_like_keys(block: Any, trail: str = "") -> list[str]:
+    """Key di blok provider yang kelihatan berisi kredensial (rekursif). `key_env` hanya NAMA env → boleh."""
+    found: list[str] = []
+    if isinstance(block, dict):
+        for key, value in block.items():
+            label = f"{trail}{key}"
+            if re.sub(r"[\s\-]+", "_", str(key).strip().lower()) in SECRET_LIKE_KEYS:
+                found.append(label)
+            found += _secret_like_keys(value, label + ".")
+    elif isinstance(block, list):
+        for item in block:
+            found += _secret_like_keys(item, trail)
+    return found
+
+
 def _load_llm(raw: dict) -> dict:
     llm = raw.get("llm")
     if not llm:
         return {}
+    if not isinstance(llm, dict):
+        raise TeamError("llm: harus mapping")
     providers = {}
     for name, block in (llm.get("providers") or {}).items():
         if not re.match(r"^[a-z0-9][a-z0-9_-]*$", str(name)) or not isinstance(block, dict):
             raise TeamError(f"llm.providers.{name}: nama huruf kecil dan isinya mapping")
         block = dict(block)
+        leaked = _secret_like_keys(block)
+        if leaked:
+            raise TeamError(f"llm.providers.{name}: key '{leaked[0]}' terlihat seperti secret. Jangan tulis API key "
+                            "di team.yaml (blok provider diteruskan ke `hermes config set` lewat argv dan tercatat "
+                            "di log). Taruh di /etc/hermes/.env dan rujuk namanya lewat key_env.")
         if "api" not in block:
             raise TeamError(f"llm.providers.{name}.api wajib diisi (URL OpenAI-compatible)")
         key_env = block.get("key_env")
@@ -395,7 +527,7 @@ def _load_llm(raw: dict) -> dict:
         if alias not in models:
             raise TeamError(f"llm.fallback: '{alias}' tidak ada di llm.models")
     out["fallback"] = fallback
-    out["per_user_keys"] = bool(llm.get("per_user_keys", False))
+    out["per_user_keys"] = _bool(llm.get("per_user_keys"), "llm.per_user_keys", False)
     return out
 
 
@@ -458,11 +590,11 @@ def load_team(team_path: Path, members_path: Optional[Path] = None) -> dict:
     team["category_id"] = _id(raw["category_id"], "category_id") if raw.get("category_id") else ""
     team["channel_prefix"] = str(raw.get("channel_prefix") or "hermes-")
     team["team_skills_dir"] = str(raw.get("team_skills_dir") or "").strip()
-    team["team_skills_in_personal"] = bool(raw.get("team_skills_in_personal", True))
-    team["strict"] = bool(raw.get("strict_personal_routes", False))
-    team["admin_strict"] = bool(raw.get("strict_admin_routes", True))
-    team["lobby_restrict"] = bool(raw.get("lobby_restrict", True))
-    team["allow_browser"] = bool(raw.get("allow_browser", False))
+    team["team_skills_in_personal"] = _bool(raw.get("team_skills_in_personal"), "team_skills_in_personal", True)
+    team["strict"] = _bool(raw.get("strict_personal_routes"), "strict_personal_routes", False)
+    team["admin_strict"] = _bool(raw.get("strict_admin_routes"), "strict_admin_routes", True)
+    team["lobby_restrict"] = _bool(raw.get("lobby_restrict"), "lobby_restrict", True)
+    team["allow_browser"] = _bool(raw.get("allow_browser"), "allow_browser", False)
     prefix = str(raw.get("profile_prefix", "be-"))
     team["prefix"] = prefix
     team["template"] = _profile(str(raw.get("template_profile") or f"{prefix}template"), "template_profile")
@@ -474,10 +606,12 @@ def load_team(team_path: Path, members_path: Optional[Path] = None) -> dict:
             "auto_skills": [str(s) for s in (block.get("auto_skills") or [])],
         }
     sandbox = raw.get("sandbox") or {}
+    if not isinstance(sandbox, dict):
+        raise TeamError("sandbox: harus mapping")
     team["sandbox"] = {
         "image": str(sandbox.get("image") or "").strip(),
-        "cpu": sandbox.get("cpu", 1),
-        "memory_mb": int(sandbox.get("memory_mb", 2048)),
+        "cpu": _number(sandbox.get("cpu", 1), "sandbox.cpu"),
+        "memory_mb": _int(sandbox.get("memory_mb", 2048), "sandbox.memory_mb", 64),
         "network": str(sandbox.get("network") or "").strip(),
         "http_proxy": str(sandbox.get("http_proxy") or "").strip(),
         "no_proxy": str(sandbox.get("no_proxy") or "localhost,127.0.0.1,::1"),
@@ -485,22 +619,37 @@ def load_team(team_path: Path, members_path: Optional[Path] = None) -> dict:
     team["llm"] = _load_llm(raw)
     scale = dict(SCALE_DEFAULTS)
     scale.update({k: v for k, v in (raw.get("scale") or {}).items() if k in SCALE_DEFAULTS})
+    for key, default in SCALE_DEFAULTS.items():
+        if isinstance(default, bool):
+            scale[key] = _bool(scale[key], f"scale.{key}", default)
+        elif isinstance(default, int):
+            scale[key] = _int(scale[key], f"scale.{key}", 0)
     if scale["busy_input_mode"] not in ("queue", "interrupt", "steer"):
         raise TeamError("scale.busy_input_mode harus queue, interrupt, atau steer")
     team["scale"] = scale
-    secrets = dict(SECRETS_DEFAULTS)
+    secrets = copy.deepcopy(SECRETS_DEFAULTS)
     secrets.update({k: v for k, v in (raw.get("secrets") or {}).items() if k in SECRETS_DEFAULTS})
+    for key, default in SECRETS_DEFAULTS.items():
+        if isinstance(default, bool):
+            secrets[key] = _bool(secrets[key], f"secrets.{key}", default)
+        elif isinstance(default, int):
+            secrets[key] = _int(secrets[key], f"secrets.{key}", 1)
+        elif isinstance(default, list):
+            if not isinstance(secrets[key], (list, tuple)):
+                raise TeamError(f"secrets.{key}: harus daftar")
+            secrets[key] = [str(v) for v in secrets[key]]
     team["secrets"] = secrets
     cmds = raw.get("user_allowed_commands")
     team["user_commands"] = [str(c).lstrip("/").lower() for c in cmds] if cmds else list(DEFAULT_USER_COMMANDS)
     team["extra_routes"] = list(raw.get("extra_routes") or [])
     team["onboarding"] = _load_onboarding(raw.get("onboarding"))
     server_admin = dict(SERVER_ADMIN_DEFAULTS)
-    server_admin.update({k: bool(v) for k, v in (raw.get("server_admin") or {}).items() if k in SERVER_ADMIN_DEFAULTS})
+    server_admin.update({k: _bool(v, f"server_admin.{k}", SERVER_ADMIN_DEFAULTS[k])
+                         for k, v in (raw.get("server_admin") or {}).items() if k in SERVER_ADMIN_DEFAULTS})
     team["server_admin"] = server_admin
     # Rute & channel baru diterapkan plugin ke gateway yang sedang jalan (tanpa restart). Kalau itu
     # gagal: idle = restart halus otomatis saat tidak ada sesi aktif; manual = admin mengetik /restart.
-    team["live_reload"] = bool(raw.get("live_reload", True))
+    team["live_reload"] = _bool(raw.get("live_reload"), "live_reload", True)
     team["restart_fallback"] = str(raw.get("restart_fallback") or "idle").strip().lower()
     if team["restart_fallback"] not in ("idle", "manual"):
         raise TeamError("restart_fallback harus idle atau manual")
@@ -544,9 +693,9 @@ def _load_onboarding(raw: Any) -> dict:
         elif key == "trusted_actor_ids":
             conf[key] = [_id(v, f"onboarding.trusted_actor_ids[{i}]") for i, v in enumerate(value or [])]
         elif key == "reconcile_minutes":
-            conf[key] = max(0, int(value or 0))
+            conf[key] = max(0, _int(value or 0, "onboarding.reconcile_minutes"))
         else:
-            conf[key] = bool(value)
+            conf[key] = _bool(value, f"onboarding.{key}", bool(ONBOARDING_DEFAULTS[key]))
     return conf
 
 
@@ -567,7 +716,7 @@ def _load_member(m: Any, i: int, team: dict) -> dict:
         "channel_id": _id(m.get("channel_id"), f"{where}.channel_id"),
         "profile": _profile(f"{team['prefix']}{name}", f"{where}.name"),
         "model": model,
-        "active": bool(m.get("active", True)),
+        "active": _bool(m.get("active"), f"{where}.active", True),
         "forward_env": [str(e) for e in (m.get("forward_env") or [])],
     }
 
@@ -646,6 +795,10 @@ def team_lock(team: dict):
             yield
         finally:
             _TEAM_LOCK.depth = 0
+
+
+def _lock_depth() -> int:
+    return getattr(_TEAM_LOCK, "depth", 0)
 
 
 def reload_team(team: dict) -> dict:
@@ -949,7 +1102,9 @@ def _same(key: str, current: Any, desired: Any) -> bool:
                 return []
             if isinstance(v, str):
                 return [s.strip() for s in v.split(",") if s.strip()]
-            return [str(s) for s in v]
+            if isinstance(v, (list, tuple, set)):
+                return [str(s) for s in v]
+            return [str(v)]   # satu ID tanpa kutip dibaca YAML sebagai int
         return norm(current) == norm(desired)
     if current is None and desired in ([], {}, ""):
         return True
@@ -978,6 +1133,10 @@ def nested_yaml(settings: list[tuple[str, object]], profile: str = "default") ->
 
 
 # --------------------------------------------------------------------------- CLI hermes
+ENV_PLACEHOLDER = ("# Secret milik profile ini saja (mode 0600). Diisi lewat /env-set di Discord atau\n"
+                   "# `hermes_team.py llm-key`. Sengaja kosong saat profile dibuat: tidak mewarisi profile lain.\n")
+
+
 class Hermes:
     """Pembungkus CLI `hermes`. Hanya menjalankan `config set` untuk nilai yang berbeda."""
 
@@ -998,6 +1157,18 @@ class Hermes:
     def exists(self, profile: str) -> bool:
         home = self.home(profile)
         return any((home / f).exists() for f in ("config.yaml", ".env", "SOUL.md", "profile.yaml"))
+
+    def dir_exists(self, profile: str) -> bool:
+        """Folder profile ada (walau kosong/setengah jadi) → namanya dianggap terpakai."""
+        home = self.home(profile)
+        return home.exists() or home.is_symlink()
+
+    def profile_dirs(self) -> set[str]:
+        """Nama semua folder di <root>/profiles (termasuk sisa profile lama yang tidak ada di members.yaml)."""
+        try:
+            return {d.name for d in (self.root / "profiles").iterdir()}
+        except OSError:
+            return set()
 
     def env(self) -> dict:
         env = dict(os.environ)
@@ -1042,13 +1213,13 @@ class Hermes:
 
     def read_env(self, profile: str) -> dict:
         try:
-            return parse_env_text((self.home(profile) / ".env").read_text(encoding="utf-8"))
+            return parse_env_text((self.home(profile) / ".env").read_text(encoding="utf-8", errors="replace"))
         except OSError:
             return {}
 
     def config_set(self, profile: str, settings: Iterable[tuple[str, object]]) -> int:
         cfg, env = self.read_config(profile), self.read_env(profile)
-        changed = 0
+        changed = attempted = 0
         for key, value in settings:
             if key.isupper():
                 same = env.get(key) == cli_value(key, value)
@@ -1056,10 +1227,12 @@ class Hermes:
                 same = _same(key, _get_nested(cfg, key), value)
             if same:
                 continue
-            changed += 1
-            self.changed_keys.setdefault(profile, set()).add(key)
-            self.run(*self.profile_args(profile), "config", "set", key, cli_value(key, value))
-        if changed == 0:
+            attempted += 1
+            # Key yang gagal di-set TIDAK dicatat sebagai berubah (kegagalannya ada di self.failures).
+            if self.run(*self.profile_args(profile), "config", "set", key, cli_value(key, value)):
+                changed += 1
+                self.changed_keys.setdefault(profile, set()).add(key)
+        if attempted == 0:
             self.say(f"  = {profile}: setelan sudah sesuai")
         return changed
 
@@ -1074,10 +1247,13 @@ class Hermes:
         self.say(f"  + tulis {path}" + (" (versi lama → .bak)" if backup else ""))
         if self.dry_run:
             return
+        mode = 0o644
+        if current is not None:
+            with contextlib.suppress(OSError):
+                mode = path.stat().st_mode & 0o777
         if backup:
             shutil.copy2(path, path.with_name(path.name + ".bak"))
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(text, encoding="utf-8")
+        atomic_write(path, text, mode=mode)   # atomik: pembaca tidak pernah melihat file setengah tertulis
 
     def wipe_memory(self, profile: str) -> None:
         """Clone ikut menyalin MEMORY.md/USER.md; profile baru harus mulai kosong."""
@@ -1096,7 +1272,19 @@ class Hermes:
             args.append("--no-alias")
         self.run(*args, fatal=True)
         self.wipe_memory(profile)
+        self.scrub_env(profile)
         return True
+
+    def scrub_env(self, profile: str) -> None:
+        """`hermes profile create --clone-from` ikut menyalin `.env` sumber (hanya kredensial channel yang
+        dibuang). Profile baru tidak boleh mewarisi secret profile lain → kosongkan. HANYA dipanggil
+        tepat setelah profile dibuat; `.env` profile yang sudah ada tidak pernah disentuh."""
+        if profile == "default":
+            return
+        path = self.home(profile) / ".env"
+        self.say(f"  - kosongkan {path} (secret hasil clone tidak diwarisi)")
+        if not self.dry_run:
+            atomic_write(path, ENV_PLACEHOLDER, mode=0o600)
 
     def park(self, profile: str) -> None:
         marker = self.home(profile) / "gateway.parked"
@@ -1126,8 +1314,8 @@ class Hermes:
                 link.symlink_to(target, target_is_directory=True)
         enabled = _get_nested(self.read_config(profile), "plugins.enabled") or []
         if PLUGIN_NAME not in enabled:
-            self.changed_keys.setdefault(profile, set()).add("plugins.enabled")
-            self.run(*self.profile_args(profile), "plugins", "enable", PLUGIN_NAME)
+            if self.run(*self.profile_args(profile), "plugins", "enable", PLUGIN_NAME):
+                self.changed_keys.setdefault(profile, set()).add("plugins.enabled")
 
 
 def resolve_hermes_bin(explicit: Optional[str] = None) -> str:
@@ -1172,7 +1360,10 @@ def ensure_template(team: dict, hermes: Hermes, *, force_soul: bool = False) -> 
     return created
 
 
-def provision_member(team: dict, hermes: Hermes, member: dict, *, force_soul: bool = False) -> bool:
+def provision_member(team: dict, hermes: Hermes, member: dict, *, force_soul: bool = False,
+                     sync_shared: bool = False) -> bool:
+    """`sync_shared`: pasang juga skill ber-scope "all" yang BELUM dimiliki profile ini (anggota yang
+    diaktifkan lagi melewatkan skill yang dibagikan selama ia nonaktif). Profile baru selalu menerimanya."""
     hermes.say(f" {member['profile']}  ({member['display_name']})")
     created = hermes.create(member["profile"], team["template"])
     hermes.write_file(hermes.home(member["profile"]) / "SOUL.md", soul_member(team, member["display_name"]),
@@ -1180,12 +1371,17 @@ def provision_member(team: dict, hermes: Hermes, member: dict, *, force_soul: bo
     hermes.config_set(member["profile"], profile_settings(team, "member", member,
                                                           hermes_bin=hermes.binary, hermes_root=hermes.root))
     hermes.install_plugin(member["profile"])
-    if created:  # anggota baru ikut menerima skill yang pernah dibagikan ke "semua"
+    if created or sync_shared:  # anggota baru / aktif lagi menerima skill yang dibagikan ke "semua"
         for skill, entry in shared_skill_registry(team).get("skills", {}).items():
-            if entry.get("scope") == "all" and entry.get("origin_profile") != member["profile"]:
-                with contextlib.suppress(TeamError, OSError):
-                    status = _copy_shared_skill(team, hermes, skill, entry, member["profile"])
-                    hermes.say(f"  + skill bersama {skill}: {status}")
+            if entry.get("scope") != "all" or entry.get("origin_profile") == member["profile"]:
+                continue
+            if (hermes.home(member["profile"]) / "skills" / SHARED_CATEGORY / skill).exists():
+                continue   # sudah punya (mungkin sudah disesuaikan sendiri) → jangan ditimpa
+            try:
+                status = _copy_shared_skill(team, hermes, skill, entry, member["profile"])
+            except (TeamError, OSError) as exc:
+                status = f"gagal: {exc}"
+            hermes.say(f"  + skill bersama {skill}: {status}")
     return created
 
 
@@ -1240,17 +1436,36 @@ def restart_needed(hermes: Hermes, created: list[str], *, live_reload: bool = Fa
 
 
 def cmd_apply(team: dict, hermes: Hermes, *, only: Optional[list[str]] = None, host_only: bool = False,
-              force_soul: bool = False) -> dict:
-    """Idempoten. Kembalikan ringkasan {created, restart_needed, live_changed, failures}."""
+              force_soul: bool = False, sync_shared: Iterable[str] = ()) -> dict:
+    """Idempoten. Kembalikan ringkasan {created, restart_needed, live_changed, failures}.
+
+    Dipanggil paling luar (CLI `apply`, teamctl): team.yaml + members.yaml dibaca ULANG setelah kunci
+    tim dipegang, supaya tidak bekerja dari salinan sebelum proses lain selesai menulis. Dipanggil dari
+    dalam operasi lain (add_member, onboard, set-active) `team` sudah segar dan dipakai apa adanya."""
     with team_lock(team):
-        return _cmd_apply(team, hermes, only=only, host_only=host_only, force_soul=force_soul)
+        if _lock_depth() == 1:
+            reload_team(team)
+        return _cmd_apply(team, hermes, only=only, host_only=host_only, force_soul=force_soul,
+                          sync_shared=set(sync_shared or ()))
+
+
+def _check_only(team: dict, only: Optional[list[str]]) -> None:
+    """Nama di --only harus anggota aktif; salah ketik tidak boleh jadi apply kosong tanpa pesan."""
+    known = {m["name"]: m for m in team["members"]}
+    unknown = [n for n in (only or []) if n not in known]
+    if unknown:
+        raise TeamError(f"--only: anggota tidak dikenal: {', '.join(unknown)} "
+                        f"(yang ada: {', '.join(sorted(known)) or '-'})")
+    inactive = [n for n in (only or []) if not known[n].get("active", True)]
+    if inactive:
+        raise TeamError(f"--only: anggota nonaktif: {', '.join(inactive)} (aktifkan dulu: set-active <nama> on)")
 
 
 def _cmd_apply(team: dict, hermes: Hermes, *, only: Optional[list[str]], host_only: bool,
-               force_soul: bool) -> dict:
+               force_soul: bool, sync_shared: Iterable[str] = ()) -> dict:
     created: list[str] = []
-    write_roster(team, hermes)
     if not host_only:
+        _check_only(team, only)
         hermes.say(f"\n[1/4] Template {team['template']}")
         if ensure_template(team, hermes, force_soul=force_soul):
             created.append(team["template"])
@@ -1259,7 +1474,8 @@ def _cmd_apply(team: dict, hermes: Hermes, *, only: Optional[list[str]], host_on
         for member in active_members(team):
             if only and member["name"] not in names:
                 continue
-            if provision_member(team, hermes, member, force_soul=force_soul):
+            if provision_member(team, hermes, member, force_soul=force_soul,
+                                sync_shared=member["name"] in sync_shared):
                 created.append(member["profile"])
         if not only:
             hermes.say("\n[3/4] Profile bersama & admin")
@@ -1267,6 +1483,9 @@ def _cmd_apply(team: dict, hermes: Hermes, *, only: Optional[list[str]], host_on
                 provision_role(team, hermes, key, force_soul=force_soul)
     hermes.say("\n[4/4] Host gateway (profile default)")
     provision_host(team, hermes)
+    # Roster ditulis TERAKHIR: plugin team-guard menerapkan rute dari roster.json ke gateway yang sedang
+    # jalan, jadi rute baru tidak boleh terbit sebelum profile tujuannya benar-benar ada.
+    write_roster(team, hermes)
     created_real = [p for p in created if p != team["template"]]
     live_changed = sorted(_changed_host_keys(hermes) & LIVE_KEYS)
     return {"created": created,
@@ -1350,17 +1569,57 @@ def discord_token(hermes_root: Path) -> str:
     return token
 
 
+def private_overwrites(guild_id: str, owner_id: str, bot_id: str) -> list[dict]:
+    """Set izin lengkap channel pribadi: @everyone tidak melihat, pemilik + bot boleh."""
+    return [
+        {"id": str(guild_id), "type": 0, "allow": "0", "deny": str(PERM["VIEW_CHANNEL"])},
+        {"id": str(owner_id), "type": 1, "allow": str(MEMBER_ALLOW), "deny": "0"},
+        {"id": str(bot_id), "type": 1, "allow": str(BOT_ALLOW), "deny": "0"},
+    ]
+
+
+class MemberList(list):
+    """Hasil `DiscordAPI.list_members`. `truncated` True = server punya lebih banyak anggota daripada
+    `limit` yang diminta (daftar ini TIDAK lengkap — jangan dipakai untuk menyimpulkan "tidak ada")."""
+    truncated: bool = False
+
+
 class DiscordAPI:
-    def __init__(self, token: str, base: Optional[str] = None, timeout: float = 20.0):
+    RETRY_STATUSES = (502, 503, 504)
+    IDEMPOTENT = ("GET", "PUT", "DELETE")
+    MAX_WAIT = 60.0          # batas tunggu per percobaan (detik), berapa pun Retry-After dari Discord
+
+    def __init__(self, token: str, base: Optional[str] = None, timeout: float = 20.0,
+                 sleep: Optional[Callable[[float], None]] = None, max_attempts: int = 4):
         self.token = token
         self.base = (base or os.environ.get("TEAMCTL_DISCORD_API") or "https://discord.com/api/v10").rstrip("/")
         self.timeout = timeout
+        self.sleep = sleep or time.sleep     # bisa diganti di uji
+        self.max_attempts = max(1, int(max_attempts))
+        self._bot_id: Optional[str] = None
+
+    def _safe(self, text: Any) -> str:
+        """Teks error tidak boleh memuat token bot (mis. bila ikut tercetak di pesan exception)."""
+        text = str(text)
+        return text.replace(self.token, "«token»") if self.token else text
+
+    @staticmethod
+    def _retry_after(headers: Any, payload: dict) -> float:
+        waits = []
+        for raw in ((headers.get("Retry-After") if headers is not None else None), payload.get("retry_after")):
+            try:
+                waits.append(float(raw))
+            except (TypeError, ValueError):
+                continue
+        waits = [w for w in waits if w == w and w >= 0]   # buang NaN / negatif
+        return max(waits) if waits else 1.0
 
     def request(self, method: str, path: str, body: Any = None, reason: Optional[str] = None,
                 query: Optional[dict] = None) -> Any:
         data = json.dumps(body).encode() if body is not None else None
         url = self.base + path + (("?" + urllib.parse.urlencode(query)) if query else "")
-        for attempt in range(4):
+        last = self.max_attempts - 1
+        for attempt in range(self.max_attempts):
             req = urllib.request.Request(url, data=data, method=method)
             req.add_header("Authorization", f"Bot {self.token}")
             req.add_header("User-Agent", f"DiscordBot (https://github.com/NousResearch/hermes-agent, hermes-team-kit {KIT_VERSION})")
@@ -1370,40 +1629,57 @@ class DiscordAPI:
                 req.add_header("X-Audit-Log-Reason", urllib.parse.quote(reason[:500]))
             try:
                 with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                    status = getattr(resp, "status", 200)
                     raw = resp.read()
-                    return json.loads(raw) if raw else None
+                if not raw or not raw.strip():
+                    return None
+                try:
+                    return json.loads(raw)
+                except ValueError:
+                    raise DiscordHTTPError(method, path, status, None, "balasan bukan JSON yang valid")
             except urllib.error.HTTPError as exc:
-                raw = exc.read()
+                try:
+                    raw = exc.read()
+                except (OSError, http.client.HTTPException):
+                    raw = b""
                 payload: Any = {}
                 with contextlib.suppress(ValueError):
                     payload = json.loads(raw or b"{}")
                 if not isinstance(payload, dict):
                     payload = {}
-                if exc.code == 429 and attempt < 3:
-                    time.sleep(min(float(payload.get("retry_after", 1.0)) + 0.2, 10.0))
+                if exc.code == 429 and attempt < last:
+                    self.sleep(min(self._retry_after(exc.headers, payload) + 0.2, self.MAX_WAIT))
+                    continue
+                if exc.code in self.RETRY_STATUSES and attempt < last:
+                    self.sleep(min(0.5 * (2 ** attempt), 8.0))
                     continue
                 raise DiscordHTTPError(method, path, exc.code, payload.get("code"),
-                                       str(payload.get("message") or exc.reason))
-            except urllib.error.URLError as exc:
-                raise TeamError(f"Discord API tidak terjangkau: {exc.reason}")
-        raise TeamError("Discord API: rate limit terus-menerus")
+                                       self._safe(payload.get("message") or exc.reason))
+            except DiscordHTTPError:
+                raise
+            except (urllib.error.URLError, http.client.HTTPException, OSError) as exc:
+                # URLError, timeout baca (TimeoutError), koneksi putus (ConnectionError), dll. Hanya method
+                # idempoten yang diulang: POST/PATCH yang diulang bisa membuat channel/pesan dobel.
+                if method in self.IDEMPOTENT and attempt < last:
+                    self.sleep(min(0.5 * (2 ** attempt), 8.0))
+                    continue
+                detail = getattr(exc, "reason", None) or exc
+                raise TeamError(self._safe(f"Discord API tidak terjangkau ({method} {path}): "
+                                           f"{type(exc).__name__}: {detail}"))
+        raise TeamError("Discord API: rate limit terus-menerus")   # pragma: no cover (loop selalu return/raise)
 
     def bot_user_id(self) -> str:
-        return str(self.request("GET", "/users/@me")["id"])
+        if self._bot_id is None:
+            self._bot_id = str(self.request("GET", "/users/@me")["id"])
+        return self._bot_id
 
     def guild_member(self, guild_id: str, user_id: str) -> dict:
         return self.request("GET", f"/guilds/{guild_id}/members/{user_id}")
 
     def create_private_channel(self, guild_id: str, name: str, owner_id: str, bot_id: str,
                                category_id: str = "", topic: str = "") -> str:
-        body: dict = {
-            "name": name, "type": 0, "topic": topic[:1024],
-            "permission_overwrites": [
-                {"id": guild_id, "type": 0, "allow": "0", "deny": str(PERM["VIEW_CHANNEL"])},
-                {"id": owner_id, "type": 1, "allow": str(MEMBER_ALLOW), "deny": "0"},
-                {"id": bot_id, "type": 1, "allow": str(BOT_ALLOW), "deny": "0"},
-            ],
-        }
+        body: dict = {"name": name, "type": 0, "topic": topic[:1024],
+                      "permission_overwrites": private_overwrites(guild_id, owner_id, bot_id)}
         if category_id:
             body["parent_id"] = category_id
         channel = self.request("POST", f"/guilds/{guild_id}/channels", body, reason=f"Hermes: channel pribadi {name}")
@@ -1446,17 +1722,23 @@ class DiscordAPI:
     def guild_roles(self, guild_id: str) -> list:
         return self.request("GET", f"/guilds/{guild_id}/roles") or []
 
-    def list_members(self, guild_id: str, limit: int = 1000) -> list:
-        out: list = []
+    def list_members(self, guild_id: str, limit: Optional[int] = None) -> "MemberList":
+        """Semua anggota server (dipaginasi sampai habis). Dengan `limit`, berhenti di situ dan
+        `hasil.truncated` True bila server masih punya anggota lain — tidak pernah terpotong diam-diam."""
+        out = MemberList()
         after = "0"
-        while len(out) < limit:
+        while limit is None or len(out) < limit:
+            want = 1000 if limit is None else min(1000, limit - len(out))
             page = self.request("GET", f"/guilds/{guild_id}/members",
-                                query={"limit": str(min(1000, limit - len(out))), "after": after}) or []
+                                query={"limit": str(want), "after": after}) or []
             out.extend(page)
-            if len(page) < 1000 or not page:
-                break
+            if len(page) < want:
+                return out
             after = str(page[-1]["user"]["id"])
-        return out[:limit]
+        # Tepat `limit` anggota terambil: cek satu lagi supaya pemotongan terlihat oleh pemanggil.
+        probe = self.request("GET", f"/guilds/{guild_id}/members", query={"limit": "1", "after": after}) or []
+        out.truncated = bool(probe)
+        return out
 
     def search_members(self, guild_id: str, query: str, limit: int = 10) -> list:
         return self.request("GET", f"/guilds/{guild_id}/members/search",
@@ -1522,52 +1804,253 @@ def _store_member(team: dict, hermes: Hermes, member: dict, *, replace: bool = F
     team.update(fresh)
 
 
+def _unstore_member(team: dict, hermes: Hermes, member: dict, previous: Optional[dict]) -> None:
+    """Kebalikan `_store_member`: kembalikan entri lama (`previous`) atau buang anggota yang baru ditulis."""
+    with members_lock(Path(team["paths"]["team_file"])):
+        fresh = load_team(Path(team["paths"]["team_file"]), Path(team["paths"]["members_file"]))
+        if previous is not None:
+            fresh["members"] = [previous if m["user_id"] == member["user_id"] else m for m in fresh["members"]]
+        else:
+            fresh["members"] = [m for m in fresh["members"] if m["user_id"] != member["user_id"]]
+        save_members(fresh)
+    team.clear()
+    team.update(fresh)
+
+
 def _discord(hermes: Hermes, api: Optional[DiscordAPI]) -> DiscordAPI:
     return api or DiscordAPI(discord_token(hermes.root))
+
+
+def _taken_names(team: dict, hermes: Hermes) -> set[str]:
+    """Nama yang tidak boleh dipakai anggota BARU: anggota di members.yaml, plus setiap folder profile
+    yang sudah ada (sisa anggota lama yang dihapus dari members.yaml masih menyimpan .env/memory/skill)."""
+    prefix = team["prefix"]
+    taken = {m["name"] for m in team["members"]}
+    profiles = hermes.profile_dirs() | {team["template"], team["shared"]["profile"], team["admin"]["profile"]}
+    taken |= {p[len(prefix):] for p in profiles if p.startswith(prefix) and len(p) > len(prefix)}
+    return taken
+
+
+def _validate_new_member(team: dict, hermes: Hermes, *, name: str, user_id: str, model: str = "",
+                         channel_id: str = "") -> str:
+    """Semua pemeriksaan untuk anggota baru, SEBELUM ada yang dibuat di Discord/Hermes. Sama dengan yang
+    dijalankan `_store_member` (keunikan nama/user/channel/profile) + profile sisa. Kembalikan nama profile."""
+    if model and team["llm"] and model not in team["llm"]["models"]:
+        raise TeamError(f"model '{model}' tidak ada di katalog: {', '.join(team['llm']['models'])}")
+    for m in team["members"]:
+        if m["name"] == name:
+            raise TeamError(f"anggota '{name}' sudah ada" + ("" if m["active"] else " (nonaktif — aktifkan lagi)"))
+        if m["user_id"] == user_id:
+            raise TeamError(f"user {user_id} sudah terdaftar sebagai '{m['name']}'")
+    profile = _profile(f"{team['prefix']}{name}", "name")
+    if profile in (team["template"], team["shared"]["profile"], team["admin"]["profile"]):
+        raise TeamError(f"nama '{name}' menghasilkan profile '{profile}' yang dipakai sistem; pilih nama lain")
+    if hermes.dir_exists(profile):
+        raise TeamError(
+            f"profile '{profile}' sudah ada di {hermes.home(profile)} tetapi bukan milik anggota mana pun di "
+            "members.yaml (sisa anggota lama?). Anggota baru tidak boleh mewarisi .env/memory/skill-nya: hapus "
+            f"(`hermes profile delete {profile}`) atau ganti nama profile lama itu, atau pakai nama anggota lain.")
+    probe = dict(team)
+    probe["members"] = [*team["members"], {"name": name, "user_id": user_id, "profile": profile,
+                                           "channel_id": channel_id or "0" * 18}]
+    _validate_unique(probe)
+    return profile
+
+
+def _channel_conflict(team: dict, channel_id: str, user_id: str) -> str:
+    """Kenapa channel ini tidak boleh jadi channel pribadi user tsb. ('' = boleh)."""
+    if channel_id == team["shared"]["channel_id"]:
+        return "itu channel bersama"
+    if channel_id == team["admin"]["channel_id"]:
+        return "itu channel admin"
+    if channel_id == team["category_id"]:
+        return "itu kategori, bukan channel"
+    for m in team["members"]:
+        if m["channel_id"] == channel_id and m["user_id"] != user_id:
+            return f"itu channel pribadi anggota '{m['name']}'"
+    return ""
+
+
+def _assert_private_channel(team: dict, api: DiscordAPI, channel: dict, user_id: str, notes: list[str],
+                            *, who: str) -> None:
+    """Privasi channel pribadi DIPAKSAKAN, bukan diasumsikan: harus channel teks di server ini, bukan
+    channel bersama/admin/milik anggota lain; set izin lengkap ditegaskan ulang (@everyone tidak melihat,
+    pemilik + bot boleh) dan izin untuk user/role lain dihapus (dicatat di `notes`)."""
+    cid = str(channel.get("id") or "")
+    conflict = _channel_conflict(team, cid, user_id)
+    if conflict:
+        raise TeamError(f"channel {cid} tidak bisa dipakai sebagai channel pribadi {who}: {conflict}")
+    if str(channel.get("guild_id") or "") != team["guild_id"]:
+        raise TeamError(f"channel {cid} bukan milik server Discord tim (guild {team['guild_id']})")
+    if channel.get("type") != 0:
+        raise TeamError(f"channel {cid} bukan channel teks biasa (type {channel.get('type')}); "
+                        "thread, voice, forum, dan kategori tidak bisa jadi channel pribadi")
+    desired = {o["id"]: o for o in private_overwrites(team["guild_id"], user_id, api.bot_user_id())}
+    current = {str(o.get("id")): o for o in (channel.get("permission_overwrites") or []) if isinstance(o, dict)}
+    reason = f"Hermes: channel pribadi {who} (privat)"
+    for target, want in desired.items():
+        have = current.get(target)
+        same = have is not None and str(have.get("allow", "0")) == want["allow"] \
+            and str(have.get("deny", "0")) == want["deny"] and str(have.get("type", want["type"])) in (
+                str(want["type"]), "role" if want["type"] == 0 else "member")
+        if not same:
+            api.set_overwrite(cid, target, want["type"], int(want["allow"]), int(want["deny"]), reason=reason)
+    removed = []
+    for target, have in current.items():
+        if target in desired:
+            continue
+        api.delete_overwrite(cid, target, reason=reason)
+        kind = "role" if str(have.get("type", 0)) in ("0", "role") else "user"
+        removed.append(f"{kind} {target}")
+    if removed:
+        notes.append(f"izin lain di channel <#{cid}> dihapus supaya tetap privat: {', '.join(removed)}")
+
+
+def _find_reusable_channel(team: dict, api: DiscordAPI, name: str, user_id: str) -> Optional[dict]:
+    """Channel #<prefix><nama> di kategori tim yang izinnya memang untuk user ini (sisa percobaan
+    sebelumnya yang gagal di tengah) → dipakai lagi, supaya percobaan ulang tidak membuat channel dobel."""
+    expected = f"{team['channel_prefix']}{name}"
+    allowed = {team["guild_id"], user_id, api.bot_user_id()}
+    for channel in api.guild_channels(team["guild_id"]):
+        if not isinstance(channel, dict) or channel.get("type") != 0 or str(channel.get("name")) != expected:
+            continue
+        if str(channel.get("parent_id") or "") != team["category_id"]:
+            continue
+        if _channel_conflict(team, str(channel.get("id")), user_id):
+            continue
+        overwrites = {str(o.get("id")): o for o in (channel.get("permission_overwrites") or [])}
+        owner = overwrites.get(user_id)
+        try:
+            owner_sees = bool(owner) and bool(int(owner.get("allow", 0)) & PERM["VIEW_CHANNEL"])
+        except (TypeError, ValueError):
+            owner_sees = False
+        if not owner_sees or set(overwrites) - allowed:
+            continue
+        channel.setdefault("guild_id", team["guild_id"])
+        return channel
+    return None
+
+
+def _new_private_channel(team: dict, api: DiscordAPI, *, name: str, user_id: str, display: str,
+                         notes: list[str], emit: Callable[..., None]) -> tuple[str, bool]:
+    """Channel pribadi untuk `name`: pakai lagi yang cocok, kalau tidak ada buat baru. → (id, dibuat_sekarang)."""
+    found = _find_reusable_channel(team, api, name, user_id)
+    if found is not None:
+        _assert_private_channel(team, api, found, user_id, notes, who=name)
+        cid = str(found["id"])
+        notes.append(f"channel <#{cid}> yang sudah ada dipakai lagi (tidak membuat yang baru)")
+        emit("channel", channel_id=cid, created=False, reused=True)
+        return cid, False
+    cid = api.create_private_channel(
+        team["guild_id"], f"{team['channel_prefix']}{name}", user_id, api.bot_user_id(),
+        team["category_id"], f"Hermes pribadi {display}. Hanya {display} dan bot.")
+    emit("channel", channel_id=cid, created=True)
+    return cid, True
+
+
+def _commit_member(team: dict, hermes: Hermes, api: Optional[DiscordAPI], member: dict, *,
+                   previous: Optional[dict] = None, channel_created: bool = False,
+                   sync_shared: bool = False) -> dict:
+    """members.yaml → profile → gateway → roster untuk satu anggota. Kalau gagal di tengah, yang dibuat
+    panggilan INI dibatalkan (entri members.yaml, folder profile baru, channel baru) lalu error diteruskan,
+    supaya percobaan ulang mulai dari keadaan bersih dan tidak ada channel/profil yatim."""
+    had_dir = hermes.dir_exists(member["profile"])
+    stored = False
+    try:
+        _store_member(team, hermes, member, replace=previous is not None)
+        stored = True
+        return cmd_apply(team, hermes, only=[member["name"]],
+                         sync_shared=[member["name"]] if sync_shared else ())
+    except Exception as exc:
+        if hermes.dry_run:
+            raise
+        undone = _rollback_member(team, hermes, api, member, previous=previous, stored=stored,
+                                  remove_dir=not had_dir, channel_created=channel_created)
+        if isinstance(exc, TeamError) and undone:
+            raise TeamError(f"{exc} — dibatalkan: {'; '.join(undone)}") from exc
+        raise
+
+
+def _rollback_member(team: dict, hermes: Hermes, api: Optional[DiscordAPI], member: dict, *,
+                     previous: Optional[dict], stored: bool, remove_dir: bool, channel_created: bool) -> list[str]:
+    undone: list[str] = []
+    if stored:
+        try:
+            _unstore_member(team, hermes, member, previous)
+            undone.append("entri members.yaml dikembalikan")
+        except (TeamError, OSError) as exc:
+            undone.append(f"members.yaml TIDAK bisa dikembalikan ({exc}); periksa entri '{member['name']}'")
+    home = hermes.home(member["profile"])
+    if remove_dir and member["profile"] != "default" and home.parent == hermes.root / "profiles" \
+            and (home.exists() or home.is_symlink()):
+        try:
+            if home.is_symlink():
+                home.unlink()
+            else:
+                shutil.rmtree(home)
+            undone.append(f"profile {member['profile']} yang setengah jadi dihapus")
+        except OSError as exc:
+            undone.append(f"profile {member['profile']} TIDAK bisa dihapus ({exc}); hapus manual")
+    if channel_created:
+        try:
+            _discord(hermes, api).delete_channel(member["channel_id"],
+                                                 reason=f"Hermes: onboarding {member['name']} gagal, dibatalkan")
+            undone.append(f"channel {member['channel_id']} dihapus")
+        except TeamError as exc:
+            undone.append(f"channel {member['channel_id']} TIDAK bisa dihapus ({exc}); hapus manual")
+    for line in undone:
+        hermes.say(f"  ↩ {line}")
+    return undone
 
 
 def add_member(team: dict, hermes: Hermes, *, name: str, user_id: str, display_name: str = "",
                model: str = "", channel_id: str = "", create_channel: bool = True,
                api: Optional[DiscordAPI] = None) -> dict:
-    """Tambah anggota: validasi → (buat channel) → members.yaml → profile → setelan gateway → roster
-    → role @backend (terakhir, supaya onboarding otomatis melihat anggota yang sudah lengkap)."""
+    """Tambah anggota: validasi SEMUA → channel (pakai lagi / buat) → members.yaml → profile → setelan
+    gateway → roster → role @backend (terakhir, supaya onboarding otomatis melihat anggota yang sudah
+    lengkap). Gagal setelah channel dibuat → channel & entri dibatalkan."""
     with team_lock(team):
         reload_team(team)
         name = _check_new_name(team, name)
         user_id = _id(user_id, "discord_user_id")
-        if model and team["llm"] and model not in team["llm"]["models"]:
-            raise TeamError(f"model '{model}' tidak ada di katalog: {', '.join(team['llm']['models'])}")
-        for m in team["members"]:
-            if m["name"] == name:
-                raise TeamError(f"anggota '{name}' sudah ada" + ("" if m["active"] else " (nonaktif — aktifkan lagi)"))
-            if m["user_id"] == user_id:
-                raise TeamError(f"user {user_id} sudah terdaftar sebagai '{m['name']}'")
-        notes: list[str] = []
-        created_channel = False
-        if channel_id:
+        explicit = bool(str(channel_id or "").strip())
+        if explicit:
             channel_id = _id(channel_id, "channel_id")
-        elif create_channel and hermes.dry_run:
-            channel_id = "9" * 18
-            hermes.say(f"  (dry-run) buat channel #{team['channel_prefix']}{name}")
-        elif create_channel:
+            conflict = _channel_conflict(team, channel_id, user_id)
+            if conflict:
+                raise TeamError(f"channel {channel_id} tidak bisa dipakai: {conflict}")
+        elif not create_channel:
+            raise TeamError("isi channel_id atau izinkan pembuatan channel")
+        display = clean_display_name(display_name, name.capitalize())
+        profile = _validate_new_member(team, hermes, name=name, user_id=user_id, model=model,
+                                       channel_id=channel_id if explicit else "")
+        notes: list[str] = []
+        channel_created = False
+        if hermes.dry_run:
+            if not explicit:
+                channel_id = "9" * 18
+                hermes.say(f"  (dry-run) buat channel #{team['channel_prefix']}{name}")
+        else:
             api = _discord(hermes, api)
             try:
                 api.guild_member(team["guild_id"], user_id)
             except TeamError as exc:
                 raise TeamError(f"user {user_id} tidak ditemukan di server Discord ({exc})")
-            channel_id = api.create_private_channel(
-                team["guild_id"], f"{team['channel_prefix']}{name}", user_id, api.bot_user_id(),
-                team["category_id"], f"Hermes pribadi {display_name or name}. Hanya {display_name or name} dan bot.")
-            created_channel = True
-            notes.append(f"channel <#{channel_id}> dibuat")
-        else:
-            raise TeamError("isi channel_id atau izinkan pembuatan channel")
-        member = {"name": name, "display_name": display_name or name.capitalize(), "user_id": user_id,
-                  "channel_id": channel_id, "profile": _profile(f"{team['prefix']}{name}", "name"),
-                  "model": model, "active": True, "forward_env": []}
-        _store_member(team, hermes, member)
-        result = cmd_apply(team, hermes, only=[name])
-        if created_channel:
+            if explicit:
+                channel = api.get_channel(channel_id)
+                if channel is None:
+                    raise TeamError(f"channel {channel_id} tidak ditemukan di Discord")
+                _assert_private_channel(team, api, channel, user_id, notes, who=name)
+            else:
+                channel_id, channel_created = _new_private_channel(
+                    team, api, name=name, user_id=user_id, display=display, notes=notes,
+                    emit=lambda *_a, **_k: None)
+                if channel_created:
+                    notes.append(f"channel <#{channel_id}> dibuat")
+        member = {"name": name, "display_name": display, "user_id": user_id, "channel_id": channel_id,
+                  "profile": profile, "model": model, "active": True, "forward_env": []}
+        result = _commit_member(team, hermes, api, member, channel_created=channel_created)
+        if not explicit and not hermes.dry_run:
             try:
                 _discord(hermes, api).add_role(team["guild_id"], user_id, team["member_role"])
                 notes.append("role anggota diberikan")
@@ -1577,7 +2060,9 @@ def add_member(team: dict, hermes: Hermes, *, name: str, user_id: str, display_n
 
 
 def derive_member_name(username: str, user_id: str, taken: Iterable[str]) -> str:
-    """Nama anggota dari username Discord: huruf kecil ASCII, '.'/spasi → '-', unik, bukan nama sistem."""
+    """Nama anggota dari username Discord: huruf kecil ASCII, '.'/spasi → '-', unik, bukan nama sistem.
+    `taken` = nama yang sudah terpakai; untuk anggota baru pakai `_taken_names` (ikut menghitung folder
+    profile sisa), bukan hanya nama di members.yaml."""
     text = unicodedata.normalize("NFKD", str(username or "")).encode("ascii", "ignore").decode().lower()
     base = re.sub(r"[^a-z0-9_-]+", "-", text)
     base = re.sub(r"[-_]{2,}", "-", base).strip("-_")[:30]
@@ -1591,34 +2076,84 @@ def derive_member_name(username: str, user_id: str, taken: Iterable[str]) -> str
     return name
 
 
-def _ensure_member_channel(team: dict, hermes: Hermes, member: dict, api: Optional[DiscordAPI],
-                           emit: Callable[..., None], notes: list[str]) -> str:
-    """Pastikan channel pribadi anggota ada dan pemiliknya (lagi) punya akses. Kembalikan channel ID."""
+def _ensure_member_channel_ex(team: dict, hermes: Hermes, member: dict, api: Optional[DiscordAPI],
+                              emit: Callable[..., None], notes: list[str]) -> tuple[str, bool]:
+    """Pastikan channel pribadi anggota ada, privat, dan pemiliknya (lagi) punya akses.
+    → (channel ID, True bila channel BARU dibuat di panggilan ini)."""
     if hermes.dry_run:
-        return member["channel_id"]
+        return member["channel_id"], False
     api = _discord(hermes, api)
     channel = api.get_channel(member["channel_id"])
     if channel is None:
-        cid = api.create_private_channel(
-            team["guild_id"], f"{team['channel_prefix']}{member['name']}", member["user_id"], api.bot_user_id(),
-            team["category_id"], f"Hermes pribadi {member['display_name']}. Hanya {member['display_name']} dan bot.")
-        notes.append(f"channel lama sudah tidak ada; channel baru <#{cid}> dibuat")
-        emit("channel", channel_id=cid, created=True)
-        return cid
-    api.set_overwrite(member["channel_id"], member["user_id"], 1, MEMBER_ALLOW,
-                      reason=f"Hermes: akses channel pribadi {member['name']}")
-    api.set_overwrite(member["channel_id"], api.bot_user_id(), 1, BOT_ALLOW, reason="Hermes: akses bot")
+        cid, created = _new_private_channel(team, api, name=member["name"], user_id=member["user_id"],
+                                            display=member["display_name"], notes=notes, emit=emit)
+        if created:
+            notes.append(f"channel lama sudah tidak ada; channel baru <#{cid}> dibuat")
+        return cid, created
+    _assert_private_channel(team, api, channel, member["user_id"], notes, who=member["name"])
     emit("channel", channel_id=member["channel_id"], created=False)
-    return member["channel_id"]
+    return member["channel_id"], False
+
+
+def _ensure_member_channel(team: dict, hermes: Hermes, member: dict, api: Optional[DiscordAPI],
+                           emit: Callable[..., None], notes: list[str]) -> str:
+    """Seperti `_ensure_member_channel_ex`, hanya mengembalikan channel ID. Pemanggil WAJIB menyimpan
+    hasilnya: ID bisa berbeda dari `member['channel_id']` bila channel lama sudah dihapus."""
+    return _ensure_member_channel_ex(team, hermes, member, api, emit, notes)[0]
+
+
+def _member_state_stale(team: dict, hermes: Hermes, member: dict) -> bool:
+    """Rute gateway / roster belum mencerminkan anggota aktif ini (apply sebelumnya gagal di tengah)."""
+    routes = _get_nested(hermes.read_config("default"), "gateway.profile_routes")
+    routed = any(isinstance(r, dict) and str(r.get("chat_id")) == member["channel_id"]
+                 and r.get("profile") == member["profile"] for r in (routes if isinstance(routes, list) else []))
+    if not routed:
+        return True
+    try:
+        roster = json.loads((Path(team["paths"]["state_dir"]) / "roster.json").read_text(encoding="utf-8"))
+        user = (roster.get("users") or {}).get(member["user_id"]) or {}
+    except (OSError, ValueError, AttributeError):
+        return True
+    return user.get("channel_id") != member["channel_id"] or user.get("profile") != member["profile"]
+
+
+def _onboard_existing(team: dict, hermes: Hermes, existing: dict, api: Optional[DiscordAPI],
+                      emit: Callable[..., None], notes: list[str]) -> dict:
+    """Anggota sudah aktif: pastikan channel-nya (ID baru DISIMPAN bila channel lama hilang) dan sembuhkan
+    sendiri profile yang hilang / rute yang basi. Kegagalan dilaporkan di notes + failures, tidak ditelan."""
+    member = dict(existing)
+    failures: list[str] = []
+    cid, created = existing["channel_id"], False
+
+    def changed_only(event: str, **fields: Any) -> None:
+        if fields.get("channel_id") != existing["channel_id"]:
+            emit(event, **fields)
+
+    try:
+        cid, created = _ensure_member_channel_ex(team, hermes, member, api, changed_only, notes)
+    except TeamError as exc:
+        notes.append(f"channel pribadi belum bisa dipastikan: {exc}")
+        failures.append(f"channel {existing['channel_id']}: {exc}")
+    result: dict = {"created": [], "restart_needed": False, "live_changed": [], "failures": []}
+    if cid != existing["channel_id"]:
+        member["channel_id"] = cid
+        result = _commit_member(team, hermes, api, member, previous=existing, channel_created=created)
+    elif not hermes.exists(member["profile"]) or _member_state_stale(team, hermes, member):
+        notes.append("profile/rute anggota belum lengkap → diterapkan ulang")
+        result = cmd_apply(team, hermes, only=[member["name"]])
+    return {"status": "exists", "member": member, "notes": notes, **result,
+            "failures": failures + list(result.get("failures", []))}
 
 
 def onboard_member(team: dict, hermes: Hermes, *, user_id: str, username: str = "", display_name: str = "",
                    name: str = "", model: str = "", api: Optional[DiscordAPI] = None,
                    emit: Optional[Callable[..., None]] = None) -> dict:
     """Jadikan user Discord anggota aktif. Idempoten:
-    - sudah aktif      → status "exists" (akses channel dipastikan, tidak ada yang dibuat)
+    - sudah aktif      → status "exists" (channel dipastikan; channel pengganti disimpan; profile/rute yang
+                         belum lengkap diterapkan ulang)
     - pernah nonaktif  → status "reactivated" (channel lama dipakai lagi / dibuat ulang bila sudah dihapus)
     - baru             → status "created" (channel privat + profile + rute)
+    Semua validasi dijalankan sebelum channel dibuat; gagal di tengah → yang dibuat panggilan ini dibatalkan.
     Profile, memory, skill, .env, dan sandbox Docker tiap anggota selalu milik profile be-<nama> sendiri."""
     emit = emit or (lambda *_a, **_k: None)
     user_id = _id(user_id, "discord_user_id")
@@ -1629,44 +2164,42 @@ def onboard_member(team: dict, hermes: Hermes, *, user_id: str, username: str = 
         notes: list[str] = []
         existing = next((m for m in team["members"] if m["user_id"] == user_id), None)
         if existing and existing.get("active", True):
-            with contextlib.suppress(TeamError):
-                _ensure_member_channel(team, hermes, existing, api, lambda *_a, **_k: None, notes)
-            return {"status": "exists", "member": existing, "notes": notes, "created": [],
-                    "restart_needed": False, "live_changed": [], "failures": []}
+            return _onboard_existing(team, hermes, existing, api, emit, notes)
         if existing:
             member = dict(existing)
-            member["channel_id"] = _ensure_member_channel(team, hermes, member, api, emit, notes)
+            cid, created = _ensure_member_channel_ex(team, hermes, member, api, emit, notes)
+            member["channel_id"] = cid
             member["active"] = True
             if model:
                 member["model"] = model
-            _store_member(team, hermes, member, replace=True)
-            result = cmd_apply(team, hermes, only=[member["name"]])
+            result = _commit_member(team, hermes, api, member, previous=existing, channel_created=created,
+                                    sync_shared=True)
             return {"status": "reactivated", "member": member, "notes": notes, **result}
-        taken = {m["name"] for m in team["members"]}
-        name = _check_new_name(team, name) if name else derive_member_name(username or display_name, user_id, taken)
-        if name in taken:
-            raise TeamError(f"nama '{name}' sudah dipakai anggota lain")
-        # Nama tampilan dikendalikan user Discord dan masuk ke SOUL.md/status → buang karakter kontrol.
-        display = re.sub(r"[\x00-\x1f\x7f  ]+", " ", display_name or username or name).strip()[:64] or name
+        if name:
+            name = _check_new_name(team, name)
+        else:
+            # Folder profile yang sudah ada dihitung terpakai: anggota baru tidak pernah menumpang profile lama.
+            name = derive_member_name(username or display_name, user_id, _taken_names(team, hermes))
+        display = clean_display_name(display_name or username or name, name)
+        profile = _validate_new_member(team, hermes, name=name, user_id=user_id, model=model)
+        channel_created = False
         if hermes.dry_run:
             channel_id = "9" * 18
             hermes.say(f"  (dry-run) buat channel #{team['channel_prefix']}{name}")
+            emit("channel", channel_id=channel_id, created=True)
         else:
             api = _discord(hermes, api)
             try:
                 api.guild_member(team["guild_id"], user_id)
             except TeamError as exc:
                 raise TeamError(f"user {user_id} tidak ditemukan di server Discord ({exc})")
-            channel_id = api.create_private_channel(
-                team["guild_id"], f"{team['channel_prefix']}{name}", user_id, api.bot_user_id(),
-                team["category_id"], f"Hermes pribadi {display}. Hanya {display} dan bot.")
-            notes.append(f"channel <#{channel_id}> dibuat")
-        emit("channel", channel_id=channel_id, created=True)
+            channel_id, channel_created = _new_private_channel(
+                team, api, name=name, user_id=user_id, display=display, notes=notes, emit=emit)
+            if channel_created:
+                notes.append(f"channel <#{channel_id}> dibuat")
         member = {"name": name, "display_name": display, "user_id": user_id, "channel_id": channel_id,
-                  "profile": _profile(f"{team['prefix']}{name}", "name"), "model": model, "active": True,
-                  "forward_env": []}
-        _store_member(team, hermes, member)
-        result = cmd_apply(team, hermes, only=[name])
+                  "profile": profile, "model": model, "active": True, "forward_env": []}
+        result = _commit_member(team, hermes, api, member, channel_created=channel_created)
         return {"status": "created", "member": member, "notes": notes, **result}
 
 
@@ -1755,16 +2288,21 @@ def set_member_active(team: dict, hermes: Hermes, name: str, active: bool) -> di
                 save_members(fresh)
         team.clear()
         team.update(fresh)
-        result = cmd_apply(team, hermes, only=[name] if active else [], host_only=not active)
+        result = cmd_apply(team, hermes, only=[name] if active else [], host_only=not active,
+                           sync_shared=[name] if active else ())
         notes: list[str] = []
         if not hermes.dry_run and (active or team["onboarding"]["hide_channel_on_offboard"]):
             # Samakan izin channel pribadi dengan status: aktif → pemilik melihat lagi; nonaktif → dicabut.
             try:
                 api = _discord(hermes, None)
                 if active:
-                    api.set_overwrite(member["channel_id"], member["user_id"], 1, MEMBER_ALLOW,
-                                      reason=f"Hermes: {name} aktif lagi")
-                    notes.append("akses ke channel pribadinya dipulihkan")
+                    channel = api.get_channel(member["channel_id"])
+                    if channel is None:
+                        notes.append(f"channel pribadinya ({member['channel_id']}) sudah tidak ada — jalankan "
+                                     f"`onboard --user-id {member['user_id']}` untuk membuat yang baru")
+                    else:
+                        _assert_private_channel(team, api, channel, member["user_id"], notes, who=name)
+                        notes.append("akses ke channel pribadinya dipulihkan")
                 else:
                     api.delete_overwrite(member["channel_id"], member["user_id"], reason=f"Hermes: {name} dinonaktifkan")
                     notes.append("akses ke channel pribadinya dicabut (channel & isinya disimpan)")
@@ -1856,13 +2394,26 @@ _LEAK_PATTERNS = [
 ]
 
 
-def _profile_secret_values(hermes: Hermes, profile: str) -> dict[str, str]:
+def _profile_secret_values(hermes: Hermes, profile: str, min_length: int = 6) -> dict[str, str]:
+    """SEMUA nilai di `.env` pemilik yang cukup panjang untuk dicocokkan (≥ secrets.min_length), apa pun
+    namanya — /env-set menerima nama bebas (mis. `STRIPE`, `DB_URL`), jadi menyaring berdasarkan nama
+    meloloskan secret. Nama yang terdaftar di indeks team-guard ikut walau lebih pendek dari min_length."""
     env = hermes.read_env(profile)
     index_path = hermes.home(profile) / "team-guard" / "secrets.json"
-    keys: dict = {}
-    with contextlib.suppress(OSError, ValueError):
-        keys = json.loads(index_path.read_text(encoding="utf-8")).get("keys", {})
-    return {k: v for k, v in env.items() if v and len(v) >= 6 and (k in keys or SECRET_NAME_RE.search(k))}
+    registered: set = set()
+    try:   # indeks rusak / bukan mapping → diabaikan, pemindaian tetap jalan dari .env
+        data = json.loads(index_path.read_text(encoding="utf-8", errors="replace"))
+        keys = data.get("keys") if isinstance(data, dict) else None
+        if isinstance(keys, (dict, list)):
+            registered = {str(k) for k in keys}
+    except (OSError, ValueError):
+        pass
+    try:
+        floor = max(1, int(min_length))
+    except (TypeError, ValueError):
+        floor = 6
+    return {k: v for k, v in env.items()
+            if v and (len(v) >= floor or (k in registered and len(v) >= min(floor, 6)))}
 
 
 def secret_variants(value: str) -> set[str]:
@@ -1877,9 +2428,13 @@ def secret_variants(value: str) -> set[str]:
 
 
 def scan_skill(hermes: Hermes, source_profile: str, skill_dir: Path, max_bytes: int = 2_000_000,
-               skipped_symlinks: Iterable[str] = ()) -> dict:
+               skipped_symlinks: Iterable[str] = (), *, allow_unscanned: bool = False,
+               min_length: int = 6) -> dict:
     """Periksa skill sebelum dibagikan: ukuran, symlink, nilai secret pemilik (dan bentuk encode-nya),
-    pola kredensial, plus pemindai keamanan Hermes (tools.skills_guard) bila tersedia."""
+    pola kredensial, plus pemindai keamanan Hermes (tools.skills_guard).
+
+    Fail-closed: hanya verdict "safe" yang lolos. "caution"/"dangerous" → ditolak. Pemindai tidak ada /
+    timeout / error ("unknown") → ditolak, kecuali admin sengaja memberi `allow_unscanned=True`."""
     files, total, problems = [], 0, [f"symlink tidak diizinkan: {p}" for p in skipped_symlinks]
     for path in sorted(skill_dir.rglob("*")):
         rel = str(path.relative_to(skill_dir))
@@ -1895,7 +2450,7 @@ def scan_skill(hermes: Hermes, source_profile: str, skill_dir: Path, max_bytes: 
     if len(files) > 300:
         problems.append(f"terlalu banyak file ({len(files)})")
     needles = {name: {v.encode("utf-8") for v in secret_variants(value)}
-               for name, value in _profile_secret_values(hermes, source_profile).items()}
+               for name, value in _profile_secret_values(hermes, source_profile, min_length).items()}
     leaked_names, pattern_hits = set(), set()
     for item in files:
         try:
@@ -1913,8 +2468,17 @@ def scan_skill(hermes: Hermes, source_profile: str, skill_dir: Path, max_bytes: 
     if pattern_hits:
         problems.append("berisi pola kredensial di: " + ", ".join(sorted(pattern_hits)))
     guard = _hermes_skill_guard(hermes, skill_dir)
-    if guard.get("verdict") == "dangerous":
-        problems.append("pemindai Hermes: dangerous — " + "; ".join(guard.get("findings", [])[:5]))
+    verdict = guard["verdict"]
+    detail = "; ".join(guard["findings"][:5]) or "tanpa rincian"
+    if verdict in ("dangerous", "caution"):
+        problems.append(f"pemindai Hermes: {verdict} — {detail}")
+    elif verdict != "safe":
+        if allow_unscanned:
+            guard["unscanned_allowed"] = True
+        else:
+            problems.append(f"pemindai keamanan Hermes tidak memberi hasil ({detail}); skill tidak dibagikan tanpa "
+                            "dipindai. Perbaiki instalasi Hermes (`hermes doctor`), atau admin boleh melewatinya "
+                            "secara sadar dengan --allow-unscanned")
     return {"files": files, "bytes": total, "problems": problems, "guard": guard, "hash": _tree_hash(skill_dir)}
 
 
@@ -1956,26 +2520,51 @@ def _hermes_python(hermes_bin: str) -> Optional[str]:
     return parts[0] if "python" in Path(parts[0]).name else None
 
 
+GUARD_VERDICTS = ("safe", "caution", "dangerous")
+
+
 def _hermes_skill_guard(hermes: Hermes, skill_dir: Path) -> dict:
-    """Jalankan tools.skills_guard milik Hermes (pemindai yang sama dengan Skills Hub)."""
+    """Jalankan tools.skills_guard milik Hermes (pemindai yang sama dengan Skills Hub).
+    Selalu mengembalikan {"verdict": safe|caution|dangerous|unknown, "findings": [str, ...]}."""
+    def unknown(why: str) -> dict:
+        return {"verdict": "unknown", "findings": [why]}
+
     python = _hermes_python(hermes.binary)
     if not python:
-        return {"verdict": "unknown", "findings": ["pemindai Hermes tidak ditemukan"]}
+        return unknown("pemindai Hermes tidak ditemukan")
     code = ("import json,sys\nfrom pathlib import Path\nfrom tools.skills_guard import scan_skill\n"
             "r=scan_skill(Path(sys.argv[1]),source='agent-created')\n"
             "print(json.dumps({'verdict':r.verdict,'findings':[f'{f.severity}:{f.file}:{f.line} {f.description}' "
             "for f in r.findings][:20]}))")
+    # Direktori kerja kosong + PYTHONSAFEPATH: dengan `python -c`, direktori saat ini masuk sys.path, jadi
+    # `tools/` atau `json.py` di folder tempat perintah dijalankan bisa menggantikan pemindai aslinya.
+    env = hermes.env()
+    env["PYTHONSAFEPATH"] = "1"
     try:
-        proc = subprocess.run([python, "-c", code, str(skill_dir)], text=True, capture_output=True,
-                              timeout=120, env=hermes.env(), stdin=subprocess.DEVNULL)
+        workdir = tempfile.mkdtemp(prefix="hermes-team-scan.")
+    except OSError as exc:
+        return unknown(f"{type(exc).__name__}: {exc}")
+    try:
+        proc = subprocess.run([python, "-c", code, str(Path(skill_dir).resolve())], text=True, capture_output=True,
+                              timeout=120, env=env, stdin=subprocess.DEVNULL, cwd=workdir)
     except (OSError, subprocess.TimeoutExpired) as exc:
-        return {"verdict": "unknown", "findings": [type(exc).__name__]}
+        return unknown(type(exc).__name__)
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
     lines = proc.stdout.strip().splitlines()
     if proc.returncode == 0 and lines:
+        data: Any = None
         with contextlib.suppress(ValueError):
-            return json.loads(lines[-1])
+            data = json.loads(lines[-1])
+        if isinstance(data, dict):
+            verdict = str(data.get("verdict") or "").strip().lower()
+            findings = data.get("findings")
+            findings = [str(f) for f in findings] if isinstance(findings, list) else []
+            if verdict in GUARD_VERDICTS:
+                return {"verdict": verdict, "findings": findings}
+            return unknown(f"verdict tidak dikenal: {verdict or '-'}")
     err = (proc.stderr or "").strip().splitlines()
-    return {"verdict": "unknown", "findings": [err[-1] if err else f"exit {proc.returncode}"]}
+    return unknown(err[-1][:300] if err else f"exit {proc.returncode}")
 
 
 def _copy_shared_skill(team: dict, hermes: Hermes, skill: str, entry: dict, profile: str,
@@ -2020,14 +2609,20 @@ def _install_skill_copy(hermes: Hermes, source: Path, skill: str, entry: dict, p
 
 def share_skill(team: dict, hermes: Hermes, skill: str, from_member: str, to: Iterable[str],
                 overwrite: bool = False, staged: Optional[tuple[Path, Path, list[str]]] = None,
-                scan: Optional[dict] = None) -> dict:
+                scan: Optional[dict] = None, allow_unscanned: bool = False) -> dict:
     with team_lock(team):
-        return _share_skill(team, hermes, skill, from_member, to, overwrite, staged, scan)
+        if _lock_depth() == 1:
+            reload_team(team)   # daftar anggota/tujuan dibaca ulang setelah kunci dipegang
+        return _share_skill(team, hermes, skill, from_member, to, overwrite, staged, scan, allow_unscanned)
+
+
+# Nama di state/shared-skills/ yang bukan skill: arsip skill memakai nama foldernya sebagai kunci.
+RESERVED_SKILL_NAMES = {"registry.json", ".staging", ".team-shared.json"}
 
 
 def _share_skill(team: dict, hermes: Hermes, skill: str, from_member: str, to: Iterable[str],
                  overwrite: bool = False, staged: Optional[tuple[Path, Path, list[str]]] = None,
-                 scan: Optional[dict] = None) -> dict:
+                 scan: Optional[dict] = None, allow_unscanned: bool = False) -> dict:
     """Bagikan skill. `staged`/`scan` dari pemanggil (teamctl) memastikan yang dipasang = yang dipindai
     dan dikonfirmasi admin; tanpa itu, staging & pemindaian dilakukan di sini."""
     owner = next((m for m in team["members"] if m["name"] == from_member), None)
@@ -2037,7 +2632,20 @@ def _share_skill(team: dict, hermes: Hermes, skill: str, from_member: str, to: I
     workdir, skill_dir, skipped = staged or stage_skill(team, hermes, owner, skill)
     try:
         skill_name = skill_dir.name
-        report = scan or scan_skill(hermes, owner["profile"], skill_dir, skipped_symlinks=skipped)
+        if skill_name.lower() in RESERVED_SKILL_NAMES or skill_name.startswith("."):
+            raise TeamError(f"skill bernama '{skill_name}' tidak bisa dibagikan (nama itu dipakai arsip skill "
+                            "bersama); ganti nama folder skill-nya dulu")
+        archive = Path(team["paths"]["state_dir"]) / "shared-skills" / skill_name
+        previous = shared_skill_registry(team)["skills"].get(skill_name) or {}
+        other_origin = bool(previous) and previous.get("origin_profile") != owner["profile"]
+        if (other_origin or (not previous and archive.exists())) and not overwrite:
+            origin = previous.get("origin_member") or previous.get("origin_profile") or "asal tidak tercatat"
+            raise TeamError(f"sudah ada skill bersama bernama '{skill_name}' dari {origin}; arsip tidak ditimpa "
+                            "oleh skill milik orang lain. Ganti nama skill-nya, atau pakai overwrite untuk "
+                            "menggantikan kiriman lama itu")
+        report = scan or scan_skill(hermes, owner["profile"], skill_dir, skipped_symlinks=skipped,
+                                    allow_unscanned=allow_unscanned,
+                                    min_length=team["secrets"].get("min_length", 6))
         if report["problems"]:
             raise TeamError("skill tidak dibagikan: " + " | ".join(report["problems"]))
         if report.get("hash") and report["hash"] != _tree_hash(skill_dir):
@@ -2062,7 +2670,10 @@ def _share_skill(team: dict, hermes: Hermes, skill: str, from_member: str, to: I
             raise TeamError("tidak ada tujuan")
         entry = {"origin_member": owner["name"], "origin_profile": owner["profile"], "shared_at": now_iso(),
                  "hash": _tree_hash(skill_dir), "scope": "all" if scope_all else "some"}
-        archive = Path(team["paths"]["state_dir"]) / "shared-skills" / skill_name
+        if other_origin:
+            # overwrite: tarik dulu kiriman lama (salinan di penerima + arsip) supaya tidak ada salinan yatim
+            # dari pemilik lama yang tertinggal dengan nama yang sama.
+            _unshare_skill(team, hermes, skill_name, ("all",))
         if not hermes.dry_run:
             archive.parent.mkdir(parents=True, exist_ok=True)
             tmp = Path(tempfile.mkdtemp(prefix=f".{skill_name}.", dir=str(archive.parent)))
@@ -2096,6 +2707,8 @@ def _share_skill(team: dict, hermes: Hermes, skill: str, from_member: str, to: I
 
 def unshare_skill(team: dict, hermes: Hermes, skill: str, targets: Iterable[str] = ("all",)) -> dict:
     with team_lock(team):
+        if _lock_depth() == 1:
+            reload_team(team)
         return _unshare_skill(team, hermes, skill, targets)
 
 
@@ -2191,7 +2804,36 @@ def _common_args() -> argparse.ArgumentParser:
     return common
 
 
+def _debug_enabled() -> bool:
+    return os.environ.get("HERMES_TEAM_DEBUG", "").strip().lower() not in ("", "0", "false", "no", "off")
+
+
 def main(argv: Optional[list[str]] = None) -> None:
+    """Titik masuk CLI. Exception tak terduga dirapikan di sini: satu baris error + exit code ≠ 0
+    (dan event `error` bila --events); traceback hanya dengan HERMES_TEAM_DEBUG=1."""
+    args = _parse_args(argv)
+    events = bool(getattr(args, "events", False))
+    try:
+        _run(args, events)
+    except TeamError as exc:
+        _fail(f"gagal: {exc}", events, code=1)
+    except KeyboardInterrupt:
+        _fail("dibatalkan", events, code=130)
+    except Exception as exc:  # noqa: BLE001 — batas proses: jangan pernah menumpahkan traceback ke plugin/admin
+        if _debug_enabled():
+            traceback.print_exc()
+        _fail(f"gagal (kesalahan tak terduga): {type(exc).__name__}: {exc}. "
+              "Set HERMES_TEAM_DEBUG=1 untuk traceback.", events, code=2)
+
+
+def _fail(message: str, events: bool, code: int) -> None:
+    if events:
+        print(json.dumps({"event": "error", "message": message}, ensure_ascii=False), flush=True)
+        sys.exit(code)
+    sys.exit(message)   # pesan ke stderr, exit 1
+
+
+def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     common = _common_args()
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -2233,20 +2875,25 @@ def main(argv: Optional[list[str]] = None) -> None:
     p.add_argument("--from", dest="from_member", required=True)
     p.add_argument("--to", required=True, help="nama dipisah koma, atau all, atau shared")
     p.add_argument("--overwrite", action="store_true")
+    p.add_argument("--allow-unscanned", action="store_true",
+                   help="tetap bagikan walau pemindai keamanan Hermes tidak bisa dijalankan (keputusan admin)")
     p = sub.add_parser("unshare-skill", parents=[common], help="tarik skill yang dibagikan")
     p.add_argument("skill")
     p.add_argument("--from-members", default="all", help="nama dipisah koma, atau all")
     p = sub.add_parser("llm-key", parents=[common], help="simpan API key LLM khusus satu profile")
     p.add_argument("profile", help="nama anggota, shared, admin, atau default")
-    args = parser.parse_args(argv)
+    p.add_argument("--stdin", action="store_true",
+                   help="baca key dari stdin (satu baris), untuk dipakai dari skrip/pipe")
+    return parser.parse_args(argv)
 
+
+def _run(args: argparse.Namespace, events: bool) -> None:
     team_file = Path(args.config).expanduser() if args.config else default_team_file()
     try:
         team = load_team(team_file, Path(args.members).expanduser() if args.members else None)
     except TeamError as exc:
-        sys.exit(f"konfigurasi: {exc}")
+        _fail(f"konfigurasi: {exc}", events, code=1)
     hermes_bin = resolve_hermes_bin(args.hermes_bin)
-    events = bool(getattr(args, "events", False))
     hermes = Hermes(hermes_bin, Path(args.hermes_root), dry_run=args.dry_run, quiet=events)
 
     if args.command == "check":
@@ -2297,13 +2944,14 @@ def main(argv: Optional[list[str]] = None) -> None:
             result = set_member_active(team, hermes, args.name, args.state == "on")
             _print_apply_tail(team, hermes, result)
         elif args.command == "share-skill":
-            result = share_skill(team, hermes, args.skill, args.from_member, args.to.split(","), args.overwrite)
+            result = share_skill(team, hermes, args.skill, args.from_member, args.to.split(","), args.overwrite,
+                                 allow_unscanned=args.allow_unscanned)
             print(json.dumps(result, indent=2, ensure_ascii=False))
         elif args.command == "unshare-skill":
             print(json.dumps(unshare_skill(team, hermes, args.skill, args.from_members.split(",")), indent=2,
                              ensure_ascii=False))
         elif args.command == "llm-key":
-            _cmd_llm_key(team, hermes, args.profile)
+            _cmd_llm_key(team, hermes, args.profile, use_stdin=args.stdin)
     except TeamError as exc:
         sys.exit(f"gagal: {exc}")
     if hermes.failures:
@@ -2346,7 +2994,8 @@ def _cmd_membership(team: dict, hermes: Hermes, args: argparse.Namespace, events
         sys.exit(1)
 
 
-def _cmd_llm_key(team: dict, hermes: Hermes, who: str) -> None:
+def _llm_key_target(team: dict, who: str) -> tuple[str, str]:
+    """(profile, nama env key) untuk `llm-key <who>`."""
     if not team["llm"]:
         raise TeamError("team.yaml belum punya bagian llm")
     if who in ("shared", "admin"):
@@ -2362,12 +3011,32 @@ def _cmd_llm_key(team: dict, hermes: Hermes, who: str) -> None:
     key_env = (team["llm"]["providers"].get(provider.removeprefix("custom:")) or {}).get("key_env")
     if not key_env:
         raise TeamError(f"provider {provider} tidak punya key_env di team.yaml")
-    value = getpass.getpass(f"{key_env} untuk profile {profile} (tidak ditampilkan): ").strip()
+    return profile, str(key_env)
+
+
+def _cmd_llm_key(team: dict, hermes: Hermes, who: str, *, use_stdin: bool = False) -> None:
+    profile, key_env = _llm_key_target(team, who)
+    if use_stdin:
+        value = sys.stdin.readline().strip()
+    elif not sys.stdin or not sys.stdin.isatty():
+        # Tanpa TTY getpass jatuh ke input biasa (bisa menggemakan key / menggantung di cron).
+        raise TeamError("stdin bukan terminal: jalankan interaktif, atau kirim key lewat pipe dengan --stdin")
+    else:
+        value = getpass.getpass(f"{key_env} untuk profile {profile} (tidak ditampilkan): ").strip()
     if not value:
         raise TeamError("kosong, dibatalkan")
-    path = hermes.home(profile) / ".env"
-    text = path.read_text(encoding="utf-8") if path.exists() else ""
-    atomic_write(path, rewrite_env_text(text, key_env, value), mode=0o600)
+    if "\n" in value or "\r" in value or "\x00" in value:
+        raise TeamError("key tidak boleh berisi baris baru")
+    # Baca-ubah-tulis .env di bawah kunci tim; tim dibaca ulang supaya profile tujuannya masih benar.
+    with team_lock(team):
+        reload_team(team)
+        profile, key_env = _llm_key_target(team, who)
+        path = hermes.home(profile) / ".env"
+        if hermes.dry_run:
+            print(f"(dry-run) {key_env} akan disimpan di {path}")
+            return
+        text = path.read_text(encoding="utf-8") if path.exists() else ""
+        atomic_write(path, rewrite_env_text(text, key_env, value), mode=0o600)
     print(f"✓ {key_env} disimpan di {path}. Ingat: nilai di /etc/hermes/.env (kalau ada) selalu menang.")
 
 

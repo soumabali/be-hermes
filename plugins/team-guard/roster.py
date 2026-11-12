@@ -1,0 +1,158 @@
+"""Pembaca roster.json — satu-satunya masukan konfigurasi plugin (ditulis hermes_team.py).
+
+Murni Python: tidak mengimpor Hermes maupun discord.py.
+"""
+from __future__ import annotations
+
+import json
+import os
+import threading
+from pathlib import Path
+from typing import Any, Optional
+
+SETTINGS_DEFAULTS: dict[str, Any] = {
+    "rate_per_minute": 6, "burst": 4, "max_active": 8, "queue_max_wait": 180,
+    "max_keys": 40, "min_length": 6, "scrub_chat": True, "delete_secret_messages": True,
+    "block_env_dump": True, "hint": True, "allow_names": [], "deny_names": [],
+}
+ONBOARDING_DEFAULTS: dict[str, Any] = {
+    "enabled": True, "give_entry_role": True, "remove_entry_role": True, "verify_actor": True,
+    "trusted_actor_ids": [], "offboard_on_role_remove": True, "hide_channel_on_offboard": True,
+    "entry_role_on_offboard": True, "reconcile_minutes": 10, "admin_notices": True,
+    "welcome_message": "", "welcome_back_message": "",
+}
+
+
+def default_state_dir() -> Path:
+    base = os.environ.get("HERMES_TEAM_DIR") or "~/.hermes-team"
+    return Path(base).expanduser() / "state"
+
+
+class Roster:
+    """Tampilan baca-saja atas isi roster.json, dengan nilai bawaan untuk field yang hilang."""
+
+    def __init__(self, data: Optional[dict] = None):
+        self.data: dict = data if isinstance(data, dict) else {}
+        d = self.data
+        self.team_name: str = str(d.get("team_name") or "tim")
+        self.guild_id: str = str(d.get("guild_id") or "")
+        self.admins: set[str] = {str(a) for a in d.get("admins") or []}
+        roles = d.get("roles") or {}
+        self.member_role: str = str(roles.get("member") or "")
+        self.admin_role: str = str(roles.get("admin") or "")
+        self.entry_role: str = str(roles.get("entry") or "")
+        self.shared_channel: str = str(d.get("shared_channel") or "")
+        self.admin_channel: str = str(d.get("admin_channel") or "")
+        self.channels: dict[str, dict] = {str(k): dict(v) for k, v in (d.get("channels") or {}).items()}
+        self.users: dict[str, dict] = {str(k): dict(v) for k, v in (d.get("users") or {}).items()}
+        self.inactive_users: dict[str, dict] = {str(k): dict(v)
+                                                for k, v in (d.get("inactive_users") or {}).items()}
+        self.reserved_env: list[str] = [str(n) for n in d.get("reserved_env") or []]
+        self.settings: dict[str, Any] = {**SETTINGS_DEFAULTS, **(d.get("settings") or {})}
+        self.onboarding: dict[str, Any] = {**ONBOARDING_DEFAULTS, **(d.get("onboarding") or {})}
+        gw = d.get("gateway") or {}
+        self.profile_routes: list[dict] = [dict(r) for r in gw.get("profile_routes") or [] if isinstance(r, dict)]
+        self.allowed_channels: list[str] = [str(c) for c in gw.get("allowed_channels") or []]
+        self.free_response_channels: list[str] = [str(c) for c in gw.get("free_response_channels") or []]
+        self.live_reload: bool = bool(d.get("live_reload", True))
+        self.restart_fallback: str = str(d.get("restart_fallback") or "idle")
+        self.kit: dict[str, str] = {str(k): str(v) for k, v in (d.get("kit") or {}).items()}
+        self.hermes_root: Path = Path(str(d.get("hermes_root") or "~/.hermes")).expanduser()
+        self.hermes_bin: str = str(d.get("hermes_bin") or "hermes")
+
+    def __bool__(self) -> bool:
+        return bool(self.data)
+
+    # ------------------------------------------------------------------ orang & channel
+    def is_admin(self, user_id: Any) -> bool:
+        return str(user_id) in self.admins
+
+    def channel_entry(self, *channel_ids: Any) -> Optional[tuple[str, dict]]:
+        """Entri channel terdaftar untuk salah satu ID (channel, parent thread, thread)."""
+        for cid in channel_ids:
+            key = str(cid) if cid else ""
+            if key and key in self.channels:
+                return key, self.channels[key]
+        return None
+
+    def user_status(self, user_id: Any) -> str:
+        uid = str(user_id)
+        if uid in self.admins:
+            return "admin"
+        if uid in self.users:
+            return "active"
+        if uid in self.inactive_users:
+            return "inactive"
+        return "unknown"
+
+    # ------------------------------------------------------------------ profile
+    def profile_home(self, profile: str) -> Path:
+        return self.hermes_root if profile in ("", "default") else self.hermes_root / "profiles" / profile
+
+    def profile_of_home(self, home: Any) -> str:
+        return profile_name_of_home(home, self.hermes_root)
+
+    def profile_kind(self, profile: str) -> str:
+        if profile == "default":
+            return "host"
+        for entry in self.channels.values():
+            if entry.get("profile") == profile:
+                return {"personal": "member"}.get(str(entry.get("kind")), str(entry.get("kind") or "other"))
+        return "other"
+
+    def profiles(self) -> set[str]:
+        return {str(e.get("profile")) for e in self.channels.values() if e.get("profile")}
+
+
+def profile_name_of_home(home: Any, hermes_root: Any = None) -> str:
+    """Nama profile dari HERMES_HOME: akar → "default", <akar>/profiles/<nama> → nama."""
+    path = Path(str(home)).expanduser()
+    if hermes_root is not None:
+        try:
+            if path.resolve() == Path(str(hermes_root)).expanduser().resolve():
+                return "default"
+        except OSError:
+            pass
+    if path.parent.name == "profiles":
+        return path.name
+    return "default"
+
+
+class RosterCache:
+    """Memuat ulang roster.json saat mtime/ukuran berubah; mempertahankan versi terakhir yang sah."""
+
+    def __init__(self, path: Path):
+        self.path = Path(path)
+        self._lock = threading.Lock()
+        self._stamp: Optional[tuple[int, int]] = None
+        self._roster = Roster()
+        self.error: str = ""
+
+    def stamp(self) -> Optional[tuple[int, int]]:
+        try:
+            st = self.path.stat()
+        except OSError:
+            return None
+        return (st.st_mtime_ns, st.st_size)
+
+    def changed(self) -> bool:
+        return self.stamp() != self._stamp
+
+    def get(self, force: bool = False) -> Roster:
+        stamp = self.stamp()
+        with self._lock:
+            if not force and stamp == self._stamp:
+                return self._roster
+            if stamp is None:
+                self._stamp, self._roster, self.error = None, Roster(), "roster.json belum ada"
+                return self._roster
+            try:
+                data = json.loads(self.path.read_text(encoding="utf-8"))
+                if not isinstance(data, dict):
+                    raise ValueError("isi roster bukan objek JSON")
+            except (OSError, ValueError) as exc:
+                # File sedang ditulis ulang / rusak: pakai versi terakhir, coba lagi di pemanggilan berikut.
+                self.error = f"roster.json tidak terbaca: {exc}"
+                return self._roster
+            self._stamp, self._roster, self.error = stamp, Roster(data), ""
+            return self._roster

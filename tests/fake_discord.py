@@ -1,6 +1,12 @@
 """Server Discord REST tiruan (stateful) untuk uji kit. Hanya endpoint yang dipakai kit.
 
-Dipakai test_teamctl.py dan test_onboarding.py. Tidak pernah menghubungi Discord sungguhan.
+Dipakai test_kit_units.py, test_teamctl.py, dan test_onboarding.py. Tidak pernah menghubungi Discord
+sungguhan.
+
+Gangguan untuk uji ketahanan klien (dipakai sekali per entri, berurutan):
+    state.fault("GET", "/users/@me", status=429, body={"retry_after": 0.3}, headers={"Retry-After": "2"})
+    state.fault("POST", "/guilds/", status=503, times=2)
+    state.fault("GET", "/guilds/", status=200, raw=b"<html>bukan json</html>")
 """
 import itertools
 import json
@@ -29,7 +35,29 @@ class State:
         self.members = {}
         self.messages = {}
         self.forbid = set()     # (method, path-prefix) yang dijawab 403
+        self.faults = []        # gangguan sekali pakai, lihat fault()
         self._seed()
+
+    def fault(self, method, prefix, status=500, body=None, headers=None, raw=None, times=1):
+        """Jawab `times` request berikutnya yang cocok (method + awalan path) dengan status/body ini."""
+        with self.lock:
+            for _ in range(times):
+                self.faults.append({"method": method, "prefix": prefix, "status": status, "body": body,
+                                    "headers": dict(headers or {}), "raw": raw})
+
+    def add_member(self, uid, username, roles=()):
+        with self.lock:
+            self.members[str(uid)] = {
+                "user": {"id": str(uid), "username": username, "global_name": username.title(), "bot": False},
+                "roles": list(roles), "nick": None, "joined_at": "2026-01-01T00:00:00+00:00",
+                "communication_disabled_until": None}
+
+    def add_channel(self, cid, name, ctype=0, parent=CAT_HERMES, overwrites=(), guild_id=GUILD):
+        with self.lock:
+            self.channels[str(cid)] = {
+                "id": str(cid), "name": name, "type": ctype, "parent_id": parent, "position": len(self.channels),
+                "guild_id": guild_id, "topic": None, "permission_overwrites": [dict(o) for o in overwrites]}
+            return self.channels[str(cid)]
 
     def _seed(self):
         for rid, name, perms, pos, managed in (
@@ -82,11 +110,14 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
 
-    def _send(self, code, body=None):
-        raw = json.dumps(body).encode() if body is not None else b""
+    def _send(self, code, body=None, headers=None, raw=None):
+        if raw is None:
+            raw = json.dumps(body).encode() if body is not None else b""
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(raw)))
+        for key, value in (headers or {}).items():
+            self.send_header(key, str(value))
         self.end_headers()
         if raw:
             self.wfile.write(raw)
@@ -109,6 +140,13 @@ class Handler(BaseHTTPRequestHandler):
             for method, prefix in st.forbid:
                 if method == self.command and path.startswith(prefix):
                     return self._err(403, "Missing Permissions", 50013)
+            for fault in st.faults:
+                if fault["method"] == self.command and path.startswith(fault["prefix"]):
+                    st.faults.remove(fault)
+                    body = fault["body"]
+                    if body is None and fault["raw"] is None and fault["status"] >= 400:
+                        body = {"message": f"gangguan tiruan {fault['status']}", "code": 0}
+                    return self._send(fault["status"], body, fault["headers"], fault["raw"])
             return self._route(self.command, path.strip("/").split("/"), body, query)
 
     def _route(self, m, p, body, q):

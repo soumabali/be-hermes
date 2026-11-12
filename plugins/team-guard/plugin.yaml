@@ -1,0 +1,28 @@
+# Manifest plugin Hermes (skema plugin.yaml v2, lihat hermes_cli/plugins_manifest.py).
+manifest_version: 2
+name: team-guard
+version: "3.1.0"
+description: "Kit tim Hermes: onboarding otomatis Discord (@entry/@backend), live reload rute & channel tanpa restart, /env-set aman + penyamaran secret berlapis, guard dump environment, rate limit & antrean sesi."
+author: "Hermes Team Kit"
+license: "MIT"
+tags: [team, discord, onboarding, secrets, rate-limit]
+kind: standalone
+# Hanya in-process: plugin memakai register_platform_handler (client discord.py) dan
+# pre_gateway_dispatch (runner gateway) — keduanya tidak tersedia di plugins.isolation: host.
+provides_hooks:
+  - pre_gateway_dispatch
+  - pre_tool_call
+  - transform_terminal_output
+  - transform_tool_result
+  - transform_llm_output
+  - pre_llm_call
+  - on_session_start
+  - on_session_end
+config_schema:
+  state_dir:
+    type: str
+    description: "Folder state kit (roster.json, onboarding.json). Diisi otomatis oleh hermes_team.py apply."
+  hold_stream:
+    type: bool
+    default: false
+    description: "true = jawaban AI ditahan sampai selesai disamarkan (streaming dimatikan untuk profile ini)."
