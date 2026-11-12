@@ -4,18 +4,463 @@ Satu instalasi Hermes, satu bot Discord, satu gateway (mode multiplex), dan **sa
 orang**. Tiap channel dirutekan ke profile-nya, jadi memory, skill, SOUL.md, config, model,
 secret (`.env`), sesi, dan sandbox Docker tiap orang terpisah.
 
-```
-user baru masuk server ──► role @entry (otomatis)
-admin memberi @backend  ──► #hermes-<username> privat + profile be-<username> + rute + sambutan @mention
-@backend dicabut / keluar ─► dinonaktifkan (profile, memory, secret, isi channel disimpan)
+> **Status:** 944 uji lulus memakai Discord tiruan dan stub API plugin. Kit **belum pernah
+> dijalankan** terhadap Hermes, Discord, atau Docker sungguhan. Ikuti panduan ini di server uji
+> dulu, dan jalankan `tests/selftest.sh` (Langkah 9) sebelum dipakai tim.
 
-#hermes-be1   (privat: BE1 + bot)    → profile be-be1      model td-normal, secret & sandbox BE1
-#hermes-budi  (privat: Budi + bot)   → profile be-budi     model td-simple
-#hermes-shared (semua @backend)      → profile team-shared skill & konteks tim, sesi per orang
-#hermes-admin  (hanya user admin)    → profile team-admin  + tool admin & kelola server (teamctl)
-channel lain / DM                    → diabaikan / ditolak
-thread di channel mana pun           → ikut profile channel induknya, sesi terpisah
+## Gambaran sistem
+
+```mermaid
+flowchart LR
+    subgraph Discord["Server Discord"]
+        A["#hermes-andi<br/>privat: Andi + bot"]
+        B["#hermes-budi<br/>privat: Budi + bot"]
+        S["#hermes-shared<br/>semua @backend"]
+        AD["#hermes-admin<br/>hanya admin"]
+        X["channel lain / DM"]
+    end
+    subgraph Server["Server Linux (user hermes)"]
+        GW["Gateway Hermes<br/>1 bot, 1 proses, multiplex"]
+        PG["plugin team-guard<br/>onboarding, secret, antrean"]
+        subgraph Profiles["Profile (~/.hermes/profiles)"]
+            PA["be-andi<br/>memory, skill, .env"]
+            PB["be-budi<br/>memory, skill, .env"]
+            PS["team-shared"]
+            PAD["team-admin<br/>+ tool teamctl"]
+        end
+        subgraph Sandbox["Sandbox Docker"]
+            CA["container andi<br/>/workspace"]
+            CB["container budi<br/>/workspace"]
+        end
+    end
+    LLM["Endpoint LLM<br/>td-normal, td-simple"]
+
+    A --> GW
+    B --> GW
+    S --> GW
+    AD --> GW
+    X -. "diabaikan / ditolak" .-> GW
+    GW --- PG
+    GW -- "rute channel" --> PA
+    GW --> PB
+    GW --> PS
+    GW --> PAD
+    PA --> CA
+    PB --> CB
+    Profiles -- "panggilan model" --> LLM
 ```
+
+Ringkasnya:
+
+| Di Discord | Dilayani oleh | Isinya |
+|---|---|---|
+| `#hermes-<nama>` (privat: orangnya + bot) | profile `be-<nama>` | model, memory, skill, secret, sandbox milik orang itu |
+| `#hermes-shared` (semua `@backend`) | profile `team-shared` | skill dan konteks tim; sesi per orang |
+| `#hermes-admin` (hanya admin) | profile `team-admin` | tool admin dan kelola server (`teamctl`) |
+| channel lain, DM | — | diabaikan / ditolak |
+| thread di channel mana pun | profile channel induknya | sesi terpisah per thread |
+
+Siklus anggota:
+
+```mermaid
+stateDiagram-v2
+    [*] --> Entry: masuk server, bot memberi role entry
+    Entry --> Aktif: admin memberi role backend
+    Aktif --> Nonaktif: role backend dicabut atau keluar server
+    Nonaktif --> Aktif: role backend diberikan lagi
+    Nonaktif --> [*]: dihapus manual
+    note right of Aktif: channel privat, profile, rute, sambutan
+    note right of Nonaktif: rute dicabut, profile diparkir, data disimpan
+```
+
+---
+
+# Panduan instalasi dari nol
+
+Ikuti berurutan. Perkiraan waktu: 1–2 jam untuk pertama kali.
+
+```mermaid
+flowchart TD
+    L1["1. Siapkan server<br/>Linux, Docker, user hermes"] --> L2["2. Siapkan server Discord<br/>role, kategori, channel"]
+    L2 --> L3["3. Buat bot Discord<br/>intent, token, undang"]
+    L3 --> L4["4. Pasang Hermes<br/>+ sambungkan bot"]
+    L4 --> L5["5. Pasang kit<br/>/opt/hermes-team"]
+    L5 --> L6["6. Isi team.yaml<br/>dan members.yaml"]
+    L6 --> L7["7. API key LLM<br/>/etc/hermes/.env"]
+    L7 --> L8["8. Opsional: image sandbox,<br/>egress proxy"]
+    L8 --> L9["9. Provisioning<br/>check, apply, managed, selftest"]
+    L9 --> L10["10. Jalankan gateway<br/>sebagai layanan"]
+    L10 --> L11["11. Uji end-to-end<br/>di Discord"]
+```
+
+Yang perlu disiapkan sebelum mulai:
+
+- Server Linux (Ubuntu 22.04+ atau Debian 12+) dengan akses `sudo`. Perkiraan awal (belum diukur) 8 vCPU / 32 GB RAM
+  untuk 20 orang; cara menghitung dan mengukurnya ada di [docs/RENCANA-SKALA.md](docs/RENCANA-SKALA.md).
+- Server Discord tempat kamu punya izin **Manage Server**.
+- Endpoint LLM yang kompatibel OpenAI (URL dasar + API key) untuk model `td-normal` / `td-simple`.
+
+## Langkah 1 — Siapkan server
+
+```bash
+# Docker (lewati bila sudah ada)
+curl -fsSL https://get.docker.com | sudo sh
+
+# User khusus, bukan root
+sudo adduser --disabled-password --gecos "" hermes
+sudo usermod -aG docker hermes
+
+# Dependensi kit
+sudo apt update && sudo apt install -y git python3 python3-yaml
+```
+
+Catatan: anggota grup `docker` setara root di mesin itu. Karena itu user `hermes` hanya dipakai
+untuk Hermes, dan agent sendiri bekerja di dalam sandbox, bukan sebagai user ini.
+
+Periksa:
+
+```bash
+sudo -u hermes docker run --rm hello-world
+```
+
+## Langkah 2 — Siapkan server Discord
+
+Kerjakan di aplikasi Discord, sebagai pemilik atau admin server.
+
+1. **Buat tiga role** (Server Settings → Roles), tanpa izin khusus:
+   - `entry` — otomatis untuk user baru;
+   - `backend` — anggota tim (memberi role ini memicu onboarding);
+   - `hermes-admin` — admin tim.
+2. **Buat kategori** bernama `Hermes`.
+3. **Buat dua channel teks** di kategori itu:
+   - `#hermes-shared` — privat; izinkan role `backend` melihat dan menulis;
+   - `#hermes-admin` — privat; izinkan hanya role `hermes-admin`.
+
+   Channel pribadi (`#hermes-<nama>`) **tidak** dibuat manual; kit membuatnya saat onboarding.
+4. **Aktifkan Developer Mode**: User Settings → Advanced → Developer Mode.
+5. **Salin ID** dengan klik kanan → *Copy ID*, dan simpan untuk Langkah 6:
+
+   | ID | Klik kanan pada | Dipakai di `team.yaml` |
+   |---|---|---|
+   | Server | nama server | `guild_id` |
+   | Role backend | role di daftar role | `roles.member` |
+   | Role hermes-admin | role | `roles.admin` |
+   | Role entry | role | `roles.entry` |
+   | Kategori Hermes | kategori | `category_id` |
+   | #hermes-shared | channel | `shared.channel_id` |
+   | #hermes-admin | channel | `admin.channel_id` |
+   | User tiap admin | nama user | `admins` |
+
+Discord membatasi 50 channel per kategori. Untuk tim lebih dari ±45 orang, siapkan kategori kedua
+dan ganti `category_id` saat yang pertama penuh.
+
+## Langkah 3 — Buat bot Discord
+
+Buka <https://discord.com/developers/applications>.
+
+1. **New Application** → beri nama (mis. `Hermes Backend`).
+2. Tab **Installation**: set *Install Link* ke **None**, lalu simpan. (Tanpa ini, mematikan
+   *Public Bot* di langkah berikut gagal dengan pesan "Private application cannot have a default
+   authorization link".)
+3. Tab **Bot**:
+   - **Public Bot: mati** (hanya kamu yang bisa mengundang bot);
+   - **Presence Intent: mati**;
+   - **Server Members Intent: hidup** — wajib untuk event join dan perubahan role;
+   - **Message Content Intent: hidup** — wajib agar bot bisa membaca pesan;
+   - **Reset Token** → salin tokennya. Token hanya tampil sekali. **Jangan** tempel di chat, tiket,
+     atau repo; kamu akan memasukkannya langsung ke server di Langkah 4.
+4. Tab **OAuth2 → URL Generator**:
+   - Scopes: `bot` dan `applications.commands`;
+   - Bot Permissions — centang persis ini:
+
+     | Izin | Untuk apa |
+     |---|---|
+     | View Channels, Send Messages, Send Messages in Threads, Read Message History, Embed Links, Attach Files, Add Reactions, Create Public Threads, Use Slash Commands | percakapan dan thread |
+     | **Manage Roles** | memberi/mencabut `entry` dan `backend` |
+     | **Manage Channels** | membuat channel pribadi |
+     | **View Audit Log** | memastikan `backend` diberikan oleh admin |
+     | **Manage Messages**, **Manage Threads** | menghapus pesan berisi secret; mengelola thread |
+     | Moderate Members, Kick Members | hanya bila tool moderasi dipakai (`server_admin.allow_moderation`) |
+
+     **Jangan** centang Administrator. Redirect URL dan Client Secret tidak dipakai.
+5. Buka URL yang dihasilkan, pilih servermu, **Authorize**.
+6. Kembali ke Discord → Server Settings → Roles: **seret role bot ke atas** `entry` dan `backend`.
+   Discord hanya mengizinkan bot mengatur role yang posisinya di bawah role bot.
+
+```mermaid
+flowchart LR
+    R1["role bot"] --> R2["hermes-admin"] --> R3["backend"] --> R4["entry"] --> R5["@everyone"]
+```
+
+Urutan di atas (kiri = paling tinggi) adalah susunan yang aman: role bot di atas `backend` dan `entry`.
+
+## Langkah 4 — Pasang Hermes dan sambungkan bot
+
+Masuk sebagai user `hermes` (`sudo -iu hermes`).
+
+```bash
+curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
+exec $SHELL -l           # muat ulang PATH
+hermes --version
+```
+
+Hermes terbaru berjalan di Python 3.14; installer menyiapkannya sendiri.
+
+Sambungkan bot:
+
+```bash
+hermes gateway setup     # pilih Discord, tempel token bot dari Langkah 3
+```
+
+Token tersimpan di `~/.hermes/.env` sebagai `DISCORD_BOT_TOKEN`. Pastikan modenya ketat:
+
+```bash
+chmod 600 ~/.hermes/.env
+hermes doctor
+```
+
+Jangan menjalankan gateway dulu; konfigurasi tim belum diterapkan.
+
+## Langkah 5 — Pasang kit
+
+Kode kit dimiliki root supaya tidak bisa diubah user `hermes` maupun agent. Data tim milik `hermes`.
+
+```bash
+# sebagai user dengan sudo
+sudo git clone https://github.com/soumabali/be-hermes.git /opt/hermes-team
+sudo chown -R root:root /opt/hermes-team
+sudo chmod -R a+rX,go-w /opt/hermes-team
+```
+
+Pakai branch atau tag yang sudah kamu tinjau (`git -C /opt/hermes-team checkout <ref>`).
+
+```bash
+# sebagai user hermes
+mkdir -p ~/.hermes-team && chmod 700 ~/.hermes-team
+cp /opt/hermes-team/team.example.yaml    ~/.hermes-team/team.yaml
+cp /opt/hermes-team/members.example.yaml ~/.hermes-team/members.yaml
+```
+
+## Langkah 6 — Isi `team.yaml` dan `members.yaml`
+
+Buka `~/.hermes-team/team.yaml` dan isi dengan ID dari Langkah 2. Tulis semua ID **dalam tanda kutip**.
+
+```yaml
+team_name: Backend
+guild_id: "…"                       # ID server
+roles:
+  member: "…"                       # role backend
+  admin: "…"                        # role hermes-admin
+  entry: "…"                        # role entry
+admins: ["…"]                       # user ID admin (boleh lebih dari satu)
+category_id: "…"                    # kategori Hermes
+shared: { profile: team-shared, channel_id: "…" }
+admin:  { profile: team-admin,  channel_id: "…" }
+
+llm:
+  providers:
+    td:
+      api: https://llm.example.internal/v1    # URL dasar endpoint LLM-mu
+      key_env: TD_API_KEY                     # NAMA variabel, bukan key-nya
+  models:
+    td-normal: { provider: "custom:td", model: td-normal }
+    td-simple: { provider: "custom:td", model: td-simple }
+  default_model: td-simple
+```
+
+Setelan lain (sandbox, skala, secret, onboarding, thread) sudah punya nilai bawaan yang wajar dan
+dijelaskan di komentar berkas itu.
+
+`members.yaml`:
+- **Mulai kosong** (`members: []`) bila semua orang akan masuk lewat onboarding otomatis (beri role
+  `backend` di Langkah 11). Ini cara yang disarankan.
+- Atau isi anggota yang channel pribadinya sudah ada (lihat contoh di berkasnya).
+
+Validasi sebelum lanjut:
+
+```bash
+python3 /opt/hermes-team/hermes_team.py check
+```
+
+Perintah ini mencetak peta channel → profile → model dan menolak ID yang salah bentuk.
+
+## Langkah 7 — API key LLM
+
+Key disimpan di `.env` *managed*: milik root, berlaku untuk semua profile, dan tidak bisa ditimpa
+anggota lewat `/env-set`.
+
+```bash
+sudo install -d -m 0755 /etc/hermes
+sudo install -m 0640 -o root -g hermes /dev/null /etc/hermes/.env
+sudoedit /etc/hermes/.env          # isi satu baris:  TD_API_KEY=xxxxx
+```
+
+Nama variabelnya harus sama dengan `key_env` di `team.yaml`.
+
+Dua hal yang sering salah:
+- **Jangan** menaruh `DISCORD_BOT_TOKEN` di `/etc/hermes/.env`; berkas itu terbaca semua profile.
+  Token bot hanya di `~/.hermes/.env`.
+- Profile baru mulai dengan `.env` kosong; key di `~/.hermes/.env` **tidak** diwarisi anggota.
+
+Mau kuota per orang di gateway LLM? Set `llm.per_user_keys: true`, kosongkan `TD_API_KEY` dari
+`/etc/hermes/.env`, lalu isi per profile: `python3 /opt/hermes-team/hermes_team.py llm-key <nama>`.
+
+## Langkah 8 — Opsional: image sandbox dan pembatasan jaringan
+
+Boleh dilewati untuk percobaan pertama.
+
+**Image sandbox tim** (toolchain siap pakai: PHP, Go, Java, Node, Python, klien DB, `gh`):
+
+```bash
+docker build -t hermes-team-sandbox:2026.11 /opt/hermes-team/docker/sandbox
+```
+
+lalu di `team.yaml`: `sandbox: { image: "hermes-team-sandbox:2026.11" }`.
+
+**Membatasi internet sandbox** dengan proxy bawaan Hermes (sandbox hanya memegang token proxy,
+key asli tetap di host):
+
+```bash
+hermes egress install && hermes egress setup && hermes egress start
+```
+
+**Skill tim read-only**: repo git di `/srv/hermes-team/skills` milik root, `git pull` lewat cron
+root, lalu isi `team_skills_dir` di `team.yaml`. Untuk mendistribusikan profile template antar
+server, Hermes punya *profile distributions* (`hermes profile install <repo>`, `hermes profile
+update <nama>`); distribusi tidak pernah membawa `.env`, memory, atau sesi.
+
+## Langkah 9 — Provisioning
+
+Sebagai user `hermes`:
+
+```bash
+H=/opt/hermes-team/hermes_team.py
+cd ~/.hermes-team
+
+python3 $H apply --dry-run        # lihat apa yang akan dilakukan, tanpa mengubah apa pun
+python3 $H apply                  # pertama kali: beberapa menit
+```
+
+`apply` membuat profile template, shared, admin, dan anggota; menulis rute gateway; memasang plugin
+`team-guard`. Aman diulang: hanya nilai yang berbeda yang ditulis.
+
+Pasang kebijakan *managed* (dipin untuk semua profile, tidak bisa diubah anggota):
+
+```bash
+python3 $H managed > /tmp/hermes-managed.yaml
+sudo install -D -m 0644 -o root -g root /tmp/hermes-managed.yaml /etc/hermes/config.yaml
+```
+
+Jalankan uji kit terhadap Hermes di server ini. Uji ini memakai HOME sementara dan Discord tiruan,
+jadi tidak menyentuh server Discord maupun `~/.hermes`:
+
+```bash
+# sekali: pasang pytest ke Python milik Hermes (selftest.sh memberi tahu perintah persisnya bila belum ada)
+bash /opt/hermes-team/tests/selftest.sh
+```
+
+Perhatikan baris awalnya. "Hermes terdeteksi" berarti uji integrasi (resolver rute, loader plugin,
+daftar toolset) ikut jalan. Bila tertulis uji integrasi **dilewati**, kecocokan kit dengan versi
+Hermes-mu belum terbukti.
+
+Terakhir, periksa konsistensi:
+
+```bash
+python3 /opt/hermes-team/kit_doctor.py --discord
+```
+
+## Langkah 10 — Jalankan gateway
+
+```bash
+sudo loginctl enable-linger hermes   # layanan user tetap hidup tanpa login
+hermes gateway install               # sekali: unit systemd (restart otomatis pada kode keluar 75)
+hermes doctor
+hermes gateway start
+hermes gateway status
+```
+
+Log: `hermes logs -f` (cari `team-guard`).
+
+Yang seharusnya terlihat: bot online di Discord, dan di log ada baris plugin `team-guard` dimuat
+tanpa galat.
+
+## Langkah 11 — Uji end-to-end di Discord
+
+Pakai akun uji (bukan admin).
+
+```mermaid
+sequenceDiagram
+    actor U as Akun uji
+    actor A as Admin
+    participant D as Discord
+    participant G as Gateway + team-guard
+    participant K as hermes_team.py
+
+    U->>D: masuk server
+    D->>G: member join
+    G->>D: beri role entry
+    A->>D: beri role backend ke akun uji
+    D->>G: role berubah
+    G->>D: baca audit log (siapa pemberinya?)
+    alt pemberi tepercaya
+        G->>K: onboard (subprocess)
+        K->>D: buat channel privat hermes-nama
+        K->>K: buat profile, tulis rute, roster
+        G->>G: terapkan rute ke gateway yang jalan
+        G->>D: pesan sambutan (mention akun uji)
+        G->>D: cabut role entry, kabari channel admin
+    else pemberi tidak dikenal
+        G->>D: tahan, kabari channel admin
+    end
+    U->>D: tulis pesan di channel pribadinya
+    D->>G: pesan
+    G->>D: thread baru + jawaban AI
+```
+
+Daftar periksa:
+
+| # | Lakukan | Hasil yang benar |
+|---|---|---|
+| 1 | Akun uji masuk server | Dapat role `entry`; bot tidak melayaninya |
+| 2 | Admin memberi `backend` | ±1 menit: `#hermes-<nama>` muncul dengan sambutan yang me-mention akun uji; `entry` hilang; `#hermes-admin` menampilkan ✅. Tanpa `/restart` |
+| 3 | Akun uji menulis di channelnya (tanpa mention) | Bot membuka **thread baru** dan menjawab di sana; `/status` menyebut profile `be-<nama>` |
+| 4 | Tulis pesan kedua di channel utama | Thread kedua dengan konteks terpisah |
+| 5 | `/env-set` di channelnya | Form pribadi; `/env-list` menampilkan nama saja |
+| 6 | Minta "jalankan `printenv`" | Diblokir |
+| 7 | Orang non-admin (punya Manage Roles) memberi `backend` ke orang lain | Ditahan, admin dikabari; "lanjutkan onboarding @x" di `#hermes-admin` melanjutkan |
+| 8 | Admin mencabut `backend` | Akun uji kehilangan akses channelnya, dapat `entry` lagi |
+| 9 | Admin memberi `backend` lagi | Disambut "Halo lagi", channel dan memory lama |
+| 10 | Di `#hermes-admin`: "buat channel #uji privat untuk @backend", lalu "hapus #uji" | Dua kali tombol konfirmasi |
+| 11 | Di `#hermes-admin`: "baca #hermes-<nama>" | Ditolak |
+
+Bila semua lolos, mulai beri role `backend` ke anggota tim.
+
+## Bila ada yang tidak jalan
+
+| Gejala | Penyebab paling mungkin | Perbaikan |
+|---|---|---|
+| Gateway gagal start: `PrivilegedIntentsRequired` | Intent belum dihidupkan | Langkah 3: hidupkan Server Members dan Message Content Intent |
+| Bot online tetapi diam | Channel belum terdaftar, atau penulis tidak punya role `backend`/`hermes-admin` | `hermes_team.py check`, lalu `apply`; periksa role user |
+| Role `entry` tidak diberikan / onboarding gagal dengan 403 | Role bot di bawah `entry`/`backend`, atau izin Manage Roles tidak ada | Langkah 3 butir 6; undang ulang dengan izin yang benar |
+| Semua onboarding "ditahan" | Bot tidak punya **View Audit Log** | Tambah izin itu, atau set `onboarding.verify_actor: false` (siapa pun yang bisa memberi role dipercaya) |
+| Channel pribadi tidak dibuat | Tidak ada Manage Channels di kategori, atau kategori sudah 50 channel | Periksa izin kategori; buat kategori baru dan ganti `category_id` |
+| Sambutan tidak muncul, admin diminta `/restart` | Live reload gagal diverifikasi (biasanya setelah update Hermes) | Jalankan `/restart` sekali, lalu `bash tests/selftest.sh` dan laporkan uji yang gagal |
+| `apply` menolak key di `llm.providers` | API key ditulis di `team.yaml` | Pindahkan ke `/etc/hermes/.env`, pakai `key_env` |
+| AI menjawab "tidak ada kredensial" | `TD_API_KEY` tidak terbaca | Nama variabel = `key_env`; berkas `/etc/hermes/.env` grup `hermes`, mode 0640 |
+| Perintah terminal gagal di sandbox | User `hermes` bukan anggota grup `docker`, atau image belum ada | `id hermes`; `docker images` |
+
+Setelah perbaikan apa pun: `python3 /opt/hermes-team/kit_doctor.py --discord`.
+
+## Upgrade dari v3.0
+
+Salin kit baru ke `/opt/hermes-team`, tambahkan blok `threads` dari `team.example.yaml` ke
+`team.yaml`-mu, jalankan `apply`, pasang ulang `/etc/hermes/config.yaml` (`managed`), lalu `/restart`
+**sekali**. Baca §12b untuk perubahan perilaku. SOUL.md yang sudah ada tidak ditimpa kecuali
+`--force-soul`.
+
+---
+
+# Referensi
 
 ## Yang baru di v3
 
@@ -45,114 +490,6 @@ model terkunci untuk anggota, penyamaran secret berlapis, dan mekanisme skala 20
 | `docker/sandbox/` | Dockerfile image sandbox tim (PHP, Go, Java, Node, Python, klien DB, `gh`). |
 | `.github/workflows/ci.yml` | CI: uji unit + uji integrasi terhadap Hermes yang dipin dan `main` (mingguan). |
 | `tests/` | `selftest.sh` menguji seluruh kit memakai Python milik Hermes di server ini (HOME sementara, Discord tiruan). Uji integrasi (resolver rute, loader plugin) dilewati bila Hermes tidak bisa di-import. |
-
-## 0. Prasyarat
-
-- Server Linux dengan Docker. User Linux khusus, misal `hermes` (bukan root), anggota grup `docker`.
-- Hermes terpasang di user itu (Hermes terbaru hanya mendukung Python 3.14; installer mengurusnya), platform Discord sudah disetel. Catat versi yang kamu uji (`hermes update --check`) dan naikkan hanya setelah CI hijau:
-  ```bash
-  curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
-  hermes update
-  hermes gateway setup        # pilih Discord, tempel token bot
-  ```
-- `python3` dengan PyYAML (`sudo apt install python3-yaml`).
-- Endpoint LLM OpenAI-compatible untuk model `td-normal` / `td-simple` dan API key-nya.
-
-## 1. Discord
-
-1. Satu aplikasi bot di Developer Portal, **Message Content Intent** dan **Server Members Intent**
-   aktif (yang kedua wajib untuk event join/role). Link undangan memuat scope `bot` dan
-   `applications.commands`.
-2. Role: `@entry` (user baru), `@backend` (anggota tim), `@hermes-admin`. Di
-   **Server Settings → Roles**, seret role bot **di atas** `@entry` dan `@backend` — Discord hanya
-   mengizinkan bot memberi/mencabut role yang posisinya di bawah role bot.
-3. Kategori **Hermes** berisi `#hermes-shared` (dilihat `@backend`) dan `#hermes-admin` (hanya
-   `@hermes-admin`). Channel pribadi dibuat otomatis di kategori ini. Discord membatasi 50 channel
-   per kategori; bila penuh, buat kategori baru dan ganti `category_id` di team.yaml.
-4. Izin role bot (tingkat server):
-
-   | Izin | Dipakai untuk |
-   |---|---|
-   | View Channels, Send Messages, Send Messages in Threads, Read Message History, Embed Links, Attach Files, Add Reactions, Create Public Threads | percakapan biasa |
-   | **Manage Roles** | memberi `@entry`, `@backend`; tool role |
-   | **Manage Channels** | membuat channel pribadi; tool channel & izin |
-   | **View Audit Log** | memastikan `@backend` diberikan oleh admin (`onboarding.verify_actor`) |
-   | **Manage Messages**, **Manage Threads** | menghapus pesan berisi secret, thread |
-   | Moderate Members, Kick Members | hanya bila memakai tool moderasi (`server_admin.allow_moderation`) |
-
-   Jangan beri bot **Administrator**: izin di atas sudah cukup dan jauh lebih sempit.
-5. Developer Mode → salin ID server, kategori, channel, role, dan user.
-6. Opsional: kalau server memakai *Membership Screening / Rules*, role entry diberikan setelah user
-   menyetujui aturan.
-
-## 2. Pasang kit
-
-Kode kit dimiliki root (tidak bisa diubah user `hermes` maupun agent); data tim milik `hermes`.
-
-```bash
-sudo mkdir -p /opt/hermes-team
-sudo cp -r hermes-team-kit/. /opt/hermes-team/
-sudo chown -R root:root /opt/hermes-team && sudo chmod -R a+rX,go-w /opt/hermes-team
-
-# sebagai user hermes
-mkdir -p ~/.hermes-team && chmod 700 ~/.hermes-team
-cp /opt/hermes-team/team.example.yaml    ~/.hermes-team/team.yaml
-cp /opt/hermes-team/members.example.yaml ~/.hermes-team/members.yaml
-# isi semua ID (termasuk roles.entry), URL endpoint LLM, dan anggota yang sudah ada
-```
-
-Skill tim read-only (opsional): repo git di `/srv/hermes-team/skills` milik root, `git pull` lewat
-cron root. Isi `team_skills_dir` di team.yaml.
-
-Alternatif bawaan Hermes untuk mendistribusikan **profile template** (SOUL, skill, setelan dasar) ke
-server lain atau memperbarui anggota sekaligus: *profile distributions* — `hermes profile install
-github.com/org/be-template --name be-template` lalu `hermes profile update be-template`. Distribusi tidak
-pernah membawa `.env`, memory, atau sesi, jadi aman untuk repo git tim. Pakai itu untuk template; skill
-buatan anggota tetap dibagikan lewat `share-skill` (dipindai dulu) atau repo skill tim di atas.
-
-## 3. API key LLM
-
-Key disimpan di `.env` managed: milik root, berlaku untuk semua profile, selalu menang atas `.env`
-profile, dan namanya ditolak oleh `/env-set`.
-
-```bash
-sudo install -d -m 0755 /etc/hermes
-sudo install -m 0640 -o root -g hermes /dev/null /etc/hermes/.env
-sudoedit /etc/hermes/.env          # TD_API_KEY=xxxxx   (nama = key_env di team.yaml)
-```
-
-Jangan taruh `DISCORD_BOT_TOKEN` di `/etc/hermes/.env` (file itu terbaca semua profile). Token bot
-hanya di `~/.hermes/.env` milik profile host.
-
-Mau kuota per orang di gateway LLM? Set `llm.per_user_keys: true`, jangan taruh `TD_API_KEY` di
-`/etc/hermes/.env`, lalu isi per profile: `python3 /opt/hermes-team/hermes_team.py llm-key be1`.
-
-## 4. Provisioning
-
-```bash
-cd ~/.hermes-team
-python3 /opt/hermes-team/hermes_team.py check          # validasi + peta channel → profile → model
-python3 /opt/hermes-team/hermes_team.py apply --dry-run
-python3 /opt/hermes-team/hermes_team.py apply          # pertama kali: beberapa menit
-
-python3 /opt/hermes-team/hermes_team.py managed > /tmp/hermes-managed.yaml
-sudo install -D -m 0644 -o root -g root /tmp/hermes-managed.yaml /etc/hermes/config.yaml
-
-sudo loginctl enable-linger hermes
-hermes gateway install            # sekali (systemd: restart otomatis bila keluar dengan kode 75)
-hermes doctor && hermes gateway restart && hermes gateway status
-```
-
-`apply` hanya menjalankan `hermes config set` untuk nilai yang berbeda, jadi aman diulang. SOUL.md
-yang sudah ada tidak ditimpa kecuali `--force-soul`. Sebelum production jalankan
-`bash /opt/hermes-team/tests/selftest.sh` (memakai HOME sementara dan Discord tiruan).
-
-**Upgrade dari v2:** salin kit baru ke `/opt/hermes-team`, tambahkan `roles.entry`, blok
-`onboarding`, `live_reload`, `restart_fallback`, dan `server_admin` dari `team.example.yaml` ke
-team.yaml-mu, jalankan `apply`, lalu `/restart` **sekali** (plugin v3 dan tool baru dimuat saat
-start). Setelah itu penambahan anggota tidak butuh restart lagi. SOUL.md yang sudah ada tidak
-ditimpa; untuk memakai teks SOUL admin v3 (daftar tool baru), hapus
-`~/.hermes/profiles/team-admin/SOUL.md` sebelum `apply`.
 
 ## 5. Onboarding otomatis
 
@@ -367,6 +704,15 @@ Batas yang perlu diketahui tim:
 
 ## 9. Konteks & memory tidak campur aduk
 
+```mermaid
+flowchart TD
+    CH["Channel pribadi hermes-andi"] -- "pesan baru 1" --> T1["Thread A = sesi A<br/>konteks sendiri"]
+    CH -- "pesan baru 2" --> T2["Thread B = sesi B<br/>konteks sendiri"]
+    T1 -- "balasan di thread A" --> T1
+    T1 --> P["Profile be-andi<br/>memory, skill, secret, /workspace<br/>(sama untuk semua thread)"]
+    T2 --> P
+```
+
 - Satu profile per orang: memory (`MEMORY.md`, `USER.md`), skill, dan riwayat sesi sendiri. Profile
   baru dari onboarding selalu mulai dengan memory kosong.
 - #hermes-shared: tiap orang sesi sendiri per thread (`group_sessions_per_user`). Memory & skill
@@ -381,6 +727,23 @@ Batas yang perlu diketahui tim:
   Batas Discord: ±1000 thread aktif per server dan thread otomatis diarsipkan — bukan masalah untuk 20 orang.
 
 ## 10. Skala 20 orang
+
+Mekanisme di bawah ini adalah yang **ada sekarang**. Celah yang sudah diketahui (sesi paralel per
+orang, cron/`/goal`/subagent di luar pembatas, anggaran token, RAM sandbox) dan urutan perbaikannya
+ada di **[docs/RENCANA-SKALA.md](docs/RENCANA-SKALA.md)**.
+
+```mermaid
+flowchart TD
+    M["Pesan anggota"] --> ADM{"Admin atau<br/>perintah slash?"}
+    ADM -- ya --> RUN["Diproses"]
+    ADM -- tidak --> RL{"Token bucket<br/>per orang"}
+    RL -- "tunggu lebih dari 45 dtk" --> NO1["Ditolak sopan"]
+    RL -- lolos --> Q{"Slot sesi<br/>tersedia?"}
+    Q -- ya --> RUN
+    Q -- tidak --> W["Antre FIFO<br/>dengan posisi"]
+    W -- "slot kosong" --> RUN
+    W -- "lebih dari 3 menit" --> NO2["Ditolak sopan"]
+```
 
 | Masalah | Mekanisme | Setelan (`team.yaml` → `scale`) |
 |---|---|---|
@@ -397,16 +760,7 @@ Patokan: `max_concurrent_sessions` ≤ jumlah request paralel yang sanggup dilay
 
 ## 11. Uji di Discord
 
-- Akun uji masuk server → dapat `@entry`, tidak dilayani bot.
-- Admin memberi `@backend` → dalam ±1 menit muncul `#hermes-<username>` dengan sambutan yang
-  me-mention akun uji; `@entry` hilang; #hermes-admin menampilkan ✅. Tanpa `/restart`.
-- Akun uji menulis di channelnya (tanpa mention) → `/status` menyebut profile `be-<username>`.
-- `/env-set` → form; `/env-list` → nama saja; "jalankan `printenv`" → diblokir.
-- Non-admin dengan izin Manage Roles memberi `@backend` → ditahan, admin dikabari; "lanjutkan
-  onboarding @x" → berjalan.
-- Cabut `@backend` → akun uji kehilangan akses channelnya, dapat `@entry` lagi; beri lagi → "Halo lagi".
-- Di #hermes-admin: "buat channel #uji privat untuk @backend", lalu "hapus #uji" → dua kali tombol
-  konfirmasi. "Baca #hermes-<username>" → ditolak.
+Lihat daftar periksa di [Langkah 11](#langkah-11--uji-end-to-end-di-discord).
 
 ## 12. Operasional
 
