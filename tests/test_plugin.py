@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import inspect
 import json
 import logging
 import os
@@ -18,7 +19,6 @@ import sys
 import threading
 import types
 import urllib.parse
-from pathlib import Path
 
 import pytest
 
@@ -1574,7 +1574,7 @@ class TestRegisterWiring:
 
     def test_dispatch_hook_is_async_and_allows_normal_messages(self, env):
         ctx = env.register("default")
-        assert asyncio.iscoroutinefunction(ctx.hooks["pre_gateway_dispatch"][0])
+        assert inspect.iscoroutinefunction(ctx.hooks["pre_gateway_dispatch"][0])
         assert run(ctx.afire("pre_gateway_dispatch", event=event(S.U_BUDI, S.CH_BUDI), gateway=env.runner,
                              session_store=None)) == []
 

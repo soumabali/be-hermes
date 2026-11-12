@@ -1304,6 +1304,14 @@ class Hermes:
             marker.parent.mkdir(parents=True, exist_ok=True)
             marker.touch()
 
+    def unpark(self, profile: str) -> None:
+        marker = self.home(profile) / "gateway.parked"
+        if not marker.exists():
+            return
+        self.say(f"  - lepas parkir {profile} ({marker.name})")
+        if not self.dry_run:
+            marker.unlink()
+
     def install_plugin(self, profile: str) -> None:
         """Symlink plugin team-guard ke <home>/plugins lalu aktifkan (sekali)."""
         link = self.home(profile) / "plugins" / PLUGIN_NAME
@@ -1404,6 +1412,19 @@ def provision_role(team: dict, hermes: Hermes, key: str, *, force_soul: bool = F
     hermes.install_plugin(profile)
 
 
+def sync_parking(team: dict, hermes: Hermes) -> None:
+    """Parkir resmi Hermes (`gateway.parked`) mengikuti members.yaml: anggota nonaktif diparkir — adapter dan
+    cron job profile-nya berhenti, tetapi profile, memory, dan sesinya utuh — dan anggota aktif dilepas.
+    Tanpa ini cron job milik anggota yang sudah keluar tetap berjalan memakai kuota LLM tim."""
+    for member in team["members"]:
+        if not hermes.home(member["profile"]).is_dir():
+            continue
+        if member.get("active", True):
+            hermes.unpark(member["profile"])
+        else:
+            hermes.park(member["profile"])
+
+
 def provision_host(team: dict, hermes: Hermes) -> int:
     if team["lobby_restrict"]:
         hermes.write_file(hermes.home("default") / "SOUL.md", SOUL_LOBBY, force=True)
@@ -1492,6 +1513,7 @@ def _cmd_apply(team: dict, hermes: Hermes, *, only: Optional[list[str]], host_on
                 provision_role(team, hermes, key, force_soul=force_soul)
     hermes.say("\n[4/4] Host gateway (profile default)")
     provision_host(team, hermes)
+    sync_parking(team, hermes)
     # Roster ditulis TERAKHIR: plugin team-guard menerapkan rute dari roster.json ke gateway yang sedang
     # jalan, jadi rute baru tidak boleh terbit sebelum profile tujuannya benar-benar ada.
     write_roster(team, hermes)

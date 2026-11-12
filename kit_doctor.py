@@ -118,8 +118,8 @@ def check_local(team: dict, root: Path, rep: Report, ht: Any) -> None:
             rep.add(ERROR, "rute", f"anggota nonaktif {m['name']} masih punya rute", "jalankan: hermes_team.py apply")
         home = _home(root, m["profile"])
         if home.is_dir() and not (home / "gateway.parked").exists():
-            rep.add(INFO, "parkir", f"{m['profile']} nonaktif tetapi belum diparkir",
-                    f"hermes -p {m['profile']} gateway stop (opsional; tanpa rute ia tak menerima pesan)")
+            rep.add(WARN, "parkir", f"{m['profile']} nonaktif tetapi belum diparkir (cron job-nya masih bisa jalan)",
+                    "jalankan: hermes_team.py apply (memarkir otomatis)")
     # berkas
     for name in sorted(known - {team["template"]} | {"default"}):
         home = _home(root, name)

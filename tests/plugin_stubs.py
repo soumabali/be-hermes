@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import importlib
 import importlib.util
+import inspect
 import json
 import os
 import re
@@ -565,7 +566,7 @@ class FakeBot:
         return self.channel(channel_id)
 
     def add_listener(self, func: Callable, name: Optional[str] = None) -> None:
-        if not asyncio.iscoroutinefunction(func):
+        if not inspect.iscoroutinefunction(func):
             raise TypeError("Listeners must be coroutines")
         self.listeners.setdefault(name or func.__name__, []).append(func)
 

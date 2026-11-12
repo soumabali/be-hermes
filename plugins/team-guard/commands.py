@@ -1,4 +1,4 @@
-"""/env-set (modal), /env-list, /env-unset — guard command Discord, balasan ephemeral.
+"""/env-set (modal), /env-list, /env-unset — guild command Discord, balasan ephemeral.
 
 Kenapa bukan `ctx.register_command`? Perintah plugin Hermes menerima argumennya sebagai TEKS chat
 (`fn(raw_args)`): nilai secret akan lewat transcript, hook, dan log. Modal Discord + balasan ephemeral

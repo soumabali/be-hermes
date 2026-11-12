@@ -32,8 +32,9 @@ class ProfileHooks:
 
         - agent.redact.register_vault_redaction_value: nilai PERSIS, ter-scope per HERMES_HOME, hanya di
           memori, dan disaring di `redact_sensitive_text` (jalur menuju model, termasuk input kompresi).
-          Kontraknya cocok, tetapi ini fungsi internal (bukan API ctx) dan dibatasi 64 nilai per profile,
-          jadi dipakai sebagai lapisan tambahan saja; lapisan utama tetap hook plugin ini.
+          Kontraknya cocok, tetapi ini fungsi internal (bukan API ctx) dan registrinya dibatasi 64 nilai per
+          profile yang DIBAGI dengan vault browser Hermes — jadi kita hanya menambah (tidak pernah
+          mengosongkan), paling banyak 32 nilai, sebagai lapisan tambahan; lapisan utama tetap hook plugin.
         - ctx.register_redaction_patterns TIDAK dipakai untuk nilai tersimpan: registrinya global satu
           proses (secret profile A akan ikut disamarkan — dan terkonfirmasi ada — di profile B), tidak bisa
           dicabut saat /env-unset, dan hasilnya topeng parsial, bukan «secret:NAMA». Hanya pola vendor
@@ -44,15 +45,12 @@ class ProfileHooks:
           (tools/environments/local.py), sedangkan kit memakai sandbox Docker (terminal.env_passthrough).
         """
         try:
-            from agent import redact as upstream  # type: ignore[import-not-found]
-            register = upstream.register_vault_redaction_value
-            clear = upstream.clear_vault_redaction_values
+            from agent.redact import register_vault_redaction_value  # type: ignore[import-not-found]
         except Exception:
             return
         try:
-            clear()
-            for value in list(values.values())[:60]:
-                register(value)
+            for value in list(values.values())[:32]:
+                register_vault_redaction_value(value)
         except Exception as exc:
             log_once("vault-redaction", "pendaftaran nilai ke redaktor Hermes gagal (%s)", exc)
 

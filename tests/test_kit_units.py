@@ -1597,3 +1597,41 @@ class TestLlmKey:
         with pytest.raises(SystemExit) as exit_info:
             ht.main(cli(kit, "llm-key", "siapa", "--stdin"))
         assert "tidak dikenal" in str(exit_info.value.code)
+
+
+# =========================================================================== parkir resmi (gateway.parked)
+class TestParking:
+    def test_offboard_parks_profile_and_reactivation_unparks(self, kit, discord):
+        team = kit.team()
+        ht.cmd_apply(team, kit.hermes())
+        ht.onboard_member(team, kit.hermes(), user_id=BUDI_UID)
+        assert not (kit.home("be-budi") / "gateway.parked").exists()
+        ht.offboard_member(team, kit.hermes(), user_id=BUDI_UID)
+        assert (kit.home("be-budi") / "gateway.parked").exists()          # cron & adapter berhenti
+        assert (kit.home("be-budi") / ".env").exists()                    # data utuh
+        ht.onboard_member(team, kit.hermes(), user_id=BUDI_UID)
+        assert not (kit.home("be-budi") / "gateway.parked").exists()
+
+    def test_apply_heals_markers_to_match_members_yaml(self, kit, discord):
+        team = kit.team()
+        ht.cmd_apply(team, kit.hermes())
+        (kit.home("be-be1") / "gateway.parked").touch()                   # aktif tetapi terparkir
+        kit.write_members([BE1, {**BUDI, "active": False}])
+        team = kit.team()
+        ht.cmd_apply(team, kit.hermes())
+        assert not (kit.home("be-be1") / "gateway.parked").exists()
+        assert (kit.home("be-budi") / "gateway.parked").exists()
+
+    def test_dry_run_does_not_touch_markers(self, kit, discord):
+        team = kit.team()
+        ht.cmd_apply(team, kit.hermes())
+        kit.write_members([BE1, {**BUDI, "active": False}])
+        team = kit.team()
+        ht.cmd_apply(team, ht.Hermes(str(kit.bin), kit.root, dry_run=True, quiet=True))
+        assert not (kit.home("be-budi") / "gateway.parked").exists()
+
+    def test_missing_profile_dir_is_skipped(self, kit, discord):
+        kit.write_members([BE1, {**BUDI, "active": False}])
+        team = kit.team()
+        ht.sync_parking(team, kit.hermes())          # be-budi belum pernah dibuat: tidak membuat folder
+        assert not kit.home("be-budi").exists()
