@@ -368,7 +368,8 @@ def main(argv: Optional[list] = None, *, api_factory: Optional[Callable[[str], A
                 out("usage_post: tidak ada laporan yang jatuh tempo")
             return 0
 
-        with run_lock(state_file) as locked:
+        # dry-run tidak menyentuh folder state sama sekali (tanpa berkas kunci)
+        with (contextlib.nullcontext(True) if args.dry_run else run_lock(state_file)) as locked:
             if not locked:
                 out("usage_post: jalan lain sedang mengirim; dilewati")
                 return 0

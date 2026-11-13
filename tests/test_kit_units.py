@@ -1991,3 +1991,307 @@ class TestOnboardBatch:
         for name in ("dodi-pratama", "eka", "citra"):
             assert channels_named(discord, f"hermes-{name}") == []
             assert not kit.home(f"be-{name}").exists() and routes_for(kit, f"be-{name}") == []
+
+
+# =========================================================================== sandbox per anggota (RENCANA-SKALA #6)
+SCOPED = {"terminal.container_cpu", "terminal.container_memory",
+          "compression.threshold_tokens", "compression.proactive_prune_tokens"}
+
+
+def scoped(kit, profile):
+    cfg = kit.config(profile)
+    return (cfg["terminal"]["container_cpu"], cfg["terminal"]["container_memory"],
+            cfg["compression"]["threshold_tokens"], cfg["compression"]["proactive_prune_tokens"])
+
+
+class TestSandboxPerMember:
+    BUDI_BIG = {**BUDI, "sandbox": {"memory_mb": 4096, "cpu": 2}}
+
+    def test_default_memory_is_1024_and_managed_no_longer_pins_limits(self, kit):
+        team = kit.team()
+        assert team["sandbox"]["memory_mb"] == 1024 and team["sandbox"]["cpu"] == 1
+        policy = ht.managed_config(team)
+        assert not {"container_cpu", "container_memory"} & set(policy["terminal"])
+        assert not {"threshold_tokens", "proactive_prune_tokens"} & set(policy["compression"])
+        assert set(ht.PROFILE_SCOPED_KEYS) == SCOPED
+        # sisanya tetap dipin
+        assert policy["terminal"]["backend"] == "docker" and policy["terminal"]["docker_volumes"] == []
+        assert policy["compression"]["idle_compact_after_seconds"] == 3600
+
+    def test_every_profile_kind_gets_its_own_limits(self, kit):
+        kit.write_team(sandbox={"cpu": 1.5, "memory_mb": 2048})
+        kit.write_members([BE1, self.BUDI_BIG])
+        ht.cmd_apply(kit.team(), kit.hermes())
+        assert scoped(kit, "be-budi")[:2] == (2, 4096)                        # pengecualian anggota
+        for profile in ("be-be1", "be-template", "team-shared", "team-admin", "default"):
+            assert scoped(kit, profile)[:2] == (1.5, 2048), profile           # bawaan tim
+        assert all(isinstance(scoped(kit, p)[1], int) for p in ("be-budi", "be-be1", "default"))
+
+    def test_partial_override_falls_back_per_key(self, kit):
+        kit.write_members([BE1, {**BUDI, "sandbox": {"memory_mb": 512}}])
+        team = kit.team()
+        budi = team["members"][1]
+        assert budi["sandbox"] == {"memory_mb": 512} and ht.sandbox_limits(team, budi) == (1, 512)
+        assert ht.sandbox_limits(team, team["members"][0]) == (1, 1024) and team["members"][0]["sandbox"] == {}
+        settings = dict(ht.profile_settings(team, "member", budi))
+        assert settings["terminal.container_memory"] == 512 and settings["terminal.container_cpu"] == 1
+        # template tidak pernah mewarisi pengecualian orang
+        assert dict(ht.profile_settings(team, "template", budi))["terminal.container_memory"] == 1024
+
+    def test_override_survives_save_load_round_trip(self, kit):
+        kit.write_members([BE1, {**BUDI, "sandbox": {"memory_mb": "4096", "cpu": 0.5}}])
+        team = kit.team()
+        ht.save_members(team)
+        rows = kit.members_yaml()
+        assert rows[1]["sandbox"] == {"memory_mb": 4096, "cpu": 0.5} and "sandbox" not in rows[0]
+        assert kit.team()["members"][1]["sandbox"] == {"memory_mb": 4096, "cpu": 0.5}
+
+    @pytest.mark.parametrize("block, key", [
+        ({"memory_mb": 128}, "members[1].sandbox.memory_mb"), ({"memory_mb": 70000}, "members[1].sandbox.memory_mb"),
+        ({"memory_mb": "banyak"}, "members[1].sandbox.memory_mb"), ({"cpu": 0.1}, "members[1].sandbox.cpu"),
+        ({"cpu": 128}, "members[1].sandbox.cpu"), ({"cpu": "dua"}, "members[1].sandbox.cpu"),
+        ({"disk_mb": 10}, "members[1].sandbox.disk_mb"), ("4096", "members[1].sandbox"),
+    ])
+    def test_invalid_override_names_the_key(self, kit, block, key):
+        kit.write_members([BE1, {**BUDI, "sandbox": block}])
+        with pytest.raises(ht.TeamError) as err:
+            kit.team()
+        assert key in str(err.value)
+
+    def test_second_apply_issues_zero_config_set_with_overrides(self, kit):
+        kit.write_team(llm={"models": {**ht_llm()["models"], "td-normal": {
+            "provider": "custom:td", "model": "td-normal",
+            "compression_threshold_tokens": 120000, "proactive_prune_tokens": 90000}}})
+        kit.write_members([BE1, {**BUDI, "sandbox": {"memory_mb": 4096, "cpu": 0.5}}])
+        team = kit.team()
+        ht.cmd_apply(team, kit.hermes())
+        assert scoped(kit, "be-budi")[:2] == (0.5, 4096)
+        kit.clear_log()
+        second = ht.cmd_apply(team, kit.hermes())
+        assert kit.calls() == [] and second["failures"] == [] and second["restart_needed"] is False
+
+    def test_set_sandbox_updates_members_yaml_and_reapplies(self, kit):
+        team = kit.team()
+        ht.cmd_apply(team, kit.hermes())
+        kit.clear_log()
+        result = ht.set_sandbox(team, kit.hermes(), "budi", memory_mb="4096", cpu="2")
+        assert (result["memory_mb"], result["cpu"], result["applied"]) == (4096, 2, True)
+        assert result["override"] == {"memory_mb": 4096, "cpu": 2} and result["failures"] == []
+        assert result["worst_case_mb"] == 1024 + 4096 + 2 * 1024
+        assert sorted(kit.config_sets()) == [("be-budi", "terminal.container_cpu", "2"),
+                                             ("be-budi", "terminal.container_memory", "4096")]
+        assert kit.members_yaml()[1]["sandbox"] == {"memory_mb": 4096, "cpu": 2}
+        assert team["members"][1]["sandbox"] == {"memory_mb": 4096, "cpu": 2}       # `team` pemanggil ikut segar
+        assert scoped(kit, "be-be1")[:2] == (1, 1024)                               # orang lain tidak tersentuh
+        kit.clear_log()
+        ht.cmd_apply(team, kit.hermes())
+        assert kit.calls() == []                                                    # apply sesudahnya: tidak ada yang berubah
+        # hanya satu key → key lain dipertahankan; --reset mengembalikan bawaan tim
+        ht.set_sandbox(team, kit.hermes(), "budi", cpu=1)                           # sama dengan bawaan → tidak disimpan
+        assert kit.members_yaml()[1]["sandbox"] == {"memory_mb": 4096}
+        result = ht.set_sandbox(team, kit.hermes(), "budi", reset=True)
+        assert result["override"] == {} and "sandbox" not in kit.members_yaml()[1]
+        assert scoped(kit, "be-budi")[:2] == (1, 1024)
+
+    def test_set_sandbox_rejects_bad_input_without_touching_anything(self, kit):
+        team = kit.team()
+        ht.cmd_apply(team, kit.hermes())
+        kit.clear_log()
+        before = kit.members_file.read_text()
+        for kwargs, needle in (({"memory_mb": 100}, "memory_mb"), ({"cpu": "0"}, "cpu"), ({"cpu": 65}, "cpu"),
+                               ({}, "--reset")):
+            with pytest.raises(ht.TeamError, match=needle):
+                ht.set_sandbox(team, kit.hermes(), "budi", **kwargs)
+        with pytest.raises(ht.TeamError, match="tidak-ada"):
+            ht.set_sandbox(team, kit.hermes(), "tidak-ada", memory_mb=2048)
+        assert kit.calls() == [] and kit.members_file.read_text() == before
+
+    def test_set_sandbox_for_inactive_member_is_stored_but_not_applied(self, kit):
+        kit.write_members([BE1, {**BUDI, "active": False}])
+        team = kit.team()
+        ht.cmd_apply(team, kit.hermes())
+        kit.clear_log()
+        result = ht.set_sandbox(team, kit.hermes(), "budi", memory_mb=8192)
+        assert result["applied"] is False and kit.config_sets() == []
+        assert kit.members_yaml()[1]["sandbox"] == {"memory_mb": 8192} and kit.members_yaml()[1]["active"] is False
+        assert result["worst_case_mb"] == 3 * 1024                                  # nonaktif tidak dihitung
+
+    def test_cli_set_sandbox(self, kit, capsys):
+        ht.cmd_apply(kit.team(), kit.hermes())
+        ht.main(cli(kit, "set-sandbox", "budi", "--memory-mb", "2048", "--cpu", "0.5"))
+        out = capsys.readouterr().out
+        assert "Sandbox budi (be-budi): 2048 MB, 0.5 CPU (pengecualian)" in out
+        assert scoped(kit, "be-budi")[:2] == (0.5, 2048)
+        ht.main(cli(kit, "set-sandbox", "budi", "--reset"))
+        assert "1024 MB, 1 CPU (bawaan tim)" in capsys.readouterr().out
+        with pytest.raises(SystemExit) as exit_info:
+            ht.main(cli(kit, "set-sandbox", "budi", "--memory-mb", "12"))
+        assert "set-sandbox.memory_mb" in str(exit_info.value)
+
+    def test_check_shows_overrides_and_worst_case_total(self, kit, capsys, monkeypatch, tmp_path):
+        meminfo = tmp_path / "meminfo"
+        meminfo.write_text("MemTotal:       16384000 kB\nMemFree:  1 kB\n")
+        monkeypatch.setattr(ht, "MEMINFO_PATH", meminfo)
+        kit.write_members([BE1, self.BUDI_BIG, {**CITRA_ROW, "active": False, "sandbox": {"memory_mb": 8192}}])
+        team = kit.team()
+        assert ht.host_memory_mb() == 16000 and ht.sandbox_worst_case_mb(team) == 1024 + 4096 + 2048
+        assert ht.sandbox_warnings(team) == []
+        ht.main(cli(kit, "check"))
+        out = capsys.readouterr().out
+        assert "plafon RAM terburuk 7168 MB (2 anggota aktif + shared + admin) dari RAM server 16000 MB" in out
+        assert "budi: 4096 MB, 2 CPU (pengecualian)" in out and "be1:" not in out
+        assert "citra: 8192 MB, 1 CPU (pengecualian)  [NONAKTIF, tidak dihitung]" in out
+        assert "MELEBIHI" not in out and "melebihi RAM server" not in out
+
+    def test_warning_when_worst_case_exceeds_host_ram_and_meminfo_may_be_absent(self, kit, capsys, monkeypatch,
+                                                                              tmp_path):
+        meminfo = tmp_path / "meminfo"
+        meminfo.write_text("MemTotal:        4096000 kB\n")
+        monkeypatch.setattr(ht, "MEMINFO_PATH", meminfo)
+        kit.write_members([BE1, self.BUDI_BIG])
+        ht.main(cli(kit, "check"))
+        out = capsys.readouterr().out
+        assert "MELEBIHI" in out and "Plafon RAM sandbox terburuk 7168 MB melebihi RAM server 4000 MB" in out
+        assert out.rstrip().endswith("Konfigurasi valid.")                           # peringatan, bukan kegagalan
+        monkeypatch.setattr(ht, "MEMINFO_PATH", tmp_path / "tidak-ada")
+        assert ht.host_memory_mb() is None and ht.sandbox_warnings(kit.team()) == []
+        ht.main(cli(kit, "check"))
+        out = capsys.readouterr().out
+        assert "plafon RAM terburuk 7168 MB" in out and "RAM server" not in out
+        meminfo.write_text("isi aneh\n")
+        monkeypatch.setattr(ht, "MEMINFO_PATH", meminfo)
+        assert ht.host_memory_mb() is None
+
+    def test_keys_still_pinned_by_an_old_managed_file_are_skipped_with_a_warning(self, kit, capsys):
+        (kit.managed_dir / "config.yaml").write_text(yaml.safe_dump({
+            "terminal": {"backend": "docker", "container_memory": 2048, "container_cpu": 1},
+            "compression": {"threshold_tokens": 64000, "idle_compact_after_seconds": 3600}}))
+        hermes = kit.hermes()
+        result = ht.cmd_apply(kit.team(), hermes)
+        assert result["failures"] == []
+        assert hermes.managed_blocked == SCOPED - {"compression.proactive_prune_tokens"}
+        written = {k for _p, k, _v in kit.config_sets()}
+        assert written & SCOPED == {"compression.proactive_prune_tokens"}
+        assert "pasang ulang" in ht.managed_blocked_warning(hermes)[0].lower()
+        ht.main(cli(kit, "apply"))
+        assert "masih mem-pin" in capsys.readouterr().out
+        # setelah managed baru terpasang, apply berikutnya menulis nilainya
+        (kit.managed_dir / "config.yaml").write_text(ht.managed_yaml(kit.team()))
+        hermes = kit.hermes()
+        ht.cmd_apply(kit.team(), hermes)
+        assert hermes.managed_blocked == set() and scoped(kit, "be-budi") == (1, 1024, 64000, 48000)
+
+
+# =========================================================================== ambang kompresi per model (#9)
+class TestCompressionPerModel:
+    @staticmethod
+    def models(**normal):
+        return {"models": {"td-simple": {"provider": "custom:td", "model": "td-simple"},
+                           "td-normal": {"provider": "custom:td", "model": "td-normal", **normal}}}
+
+    def test_each_profile_follows_its_model_and_falls_back_to_scale(self, kit):
+        kit.write_team(llm=self.models(compression_threshold_tokens=120000, proactive_prune_tokens="90000"),
+                       scale={"compression_threshold_tokens": 50000, "proactive_prune_tokens": 30000})
+        team = kit.team()
+        assert team["llm"]["models"]["td-normal"]["proactive_prune_tokens"] == 90000
+        assert ht.compression_limits(team, "td-normal") == (120000, 90000)
+        assert ht.compression_limits(team, "td-simple") == (50000, 30000) == ht.compression_limits(team)
+        ht.cmd_apply(team, kit.hermes())
+        assert scoped(kit, "be-be1")[2:] == (120000, 90000)                    # be1 → td-normal
+        assert scoped(kit, "team-admin")[2:] == (120000, 90000)                # admin_model: td-normal
+        for profile in ("be-budi", "be-template", "team-shared", "default"):   # td-simple → scale
+            assert scoped(kit, profile)[2:] == (50000, 30000), profile
+
+    def test_without_llm_block_scale_defaults_apply_everywhere(self, kit):
+        kit.write_team(llm=None)
+        team = kit.team()
+        ht.cmd_apply(team, kit.hermes())
+        for profile in ("be-be1", "be-budi", "be-template", "team-shared", "team-admin", "default"):
+            assert scoped(kit, profile) == (1, 1024, 64000, 48000), profile
+
+    def test_set_model_reapplies_thresholds(self, kit):
+        kit.write_team(llm=self.models(compression_threshold_tokens=120000, proactive_prune_tokens=90000))
+        team = kit.team()
+        ht.cmd_apply(team, kit.hermes())
+        assert scoped(kit, "be-budi")[2:] == (64000, 48000)
+        kit.clear_log()
+        ht.set_model(team, kit.hermes(), "budi", "td-normal")
+        assert scoped(kit, "be-budi")[2:] == (120000, 90000)
+        assert {k for _p, k, _v in kit.config_sets()} >= {"compression.threshold_tokens",
+                                                          "compression.proactive_prune_tokens", "model.default"}
+        kit.clear_log()
+        ht.cmd_apply(team, kit.hermes())
+        assert kit.calls() == []
+        ht.set_model(team, kit.hermes(), "be1", "td-simple")                    # kembali ke bawaan scale
+        assert scoped(kit, "be-be1")[2:] == (64000, 48000)
+        ht.set_model(team, kit.hermes(), "lobby", "td-normal")
+        assert scoped(kit, "default")[2:] == (120000, 90000)
+        ht.set_model(team, kit.hermes(), "shared", "td-normal")
+        assert scoped(kit, "team-shared")[2:] == (120000, 90000)
+
+    @pytest.mark.parametrize("normal, needle", [
+        ({"compression_threshold_tokens": 0}, "llm.models.td-normal.compression_threshold_tokens"),
+        ({"compression_threshold_tokens": "besar"}, "llm.models.td-normal.compression_threshold_tokens"),
+        ({"proactive_prune_tokens": -5}, "llm.models.td-normal.proactive_prune_tokens"),
+        ({"compression_threshold_tokens": 80000, "proactive_prune_tokens": 80000},
+         "llm.models.td-normal.proactive_prune_tokens"),
+        ({"compression_threshold_tokens": 40000}, "llm.models.td-normal.compression_threshold_tokens"),   # prune scale 48000
+        ({"proactive_prune_tokens": 70000}, "llm.models.td-normal.proactive_prune_tokens"),                # threshold scale 64000
+    ])
+    def test_invalid_values_name_the_key(self, kit, normal, needle):
+        kit.write_team(llm=self.models(**normal))
+        with pytest.raises(ht.TeamError) as err:
+            kit.team()
+        assert needle in str(err.value)
+
+    def test_single_threshold_is_fine_when_the_pair_stays_ordered(self, kit):
+        kit.write_team(llm=self.models(compression_threshold_tokens=200000))
+        assert ht.compression_limits(kit.team(), "td-normal") == (200000, 48000)
+        kit.write_team(llm=self.models(proactive_prune_tokens=20000), scale={"proactive_prune_tokens": 0})
+        assert ht.compression_limits(kit.team(), "td-normal") == (64000, 20000)
+        assert ht.compression_limits(kit.team(), "td-simple") == (64000, 0)
+
+
+# =========================================================================== laporan pemakaian terjadwal (kontrak)
+class TestUsageReportConfig:
+    def test_defaults(self, kit):
+        usage = kit.team()["usage"]
+        assert usage == {"timezone": "", "report_channel_id": "", "reports": {"daily": "", "weekly": "", "monthly": ""}}
+
+    def test_valid_values_are_normalised(self, kit):
+        kit.write_team(usage={"timezone": "Asia/Makassar", "report_channel_id": 400000000000000002,
+                              "reports": {"daily": "8:00", "weekly": "23:59", "monthly": False}})
+        usage = kit.team()["usage"]
+        assert usage["report_channel_id"] == "400000000000000002" and usage["timezone"] == "Asia/Makassar"
+        assert usage["reports"] == {"daily": "08:00", "weekly": "23:59", "monthly": ""}
+        kit.write_team(usage={"report_channel_id": fd.CH_ADMIN, "reports": None})      # channel admin boleh
+        assert kit.team()["usage"]["reports"] == {"daily": "", "weekly": "", "monthly": ""}
+
+    @pytest.mark.parametrize("usage, needle", [
+        ({"report_channel_id": "bukan-id"}, "usage.report_channel_id"),
+        ({"report_channel_id": BE1_CH}, "usage.report_channel_id"),
+        ({"reports": ["08:00"]}, "usage.reports"),
+        ({"reports": {"hourly": "08:00"}}, "usage.reports.hourly"),
+        ({"reports": {"daily": "24:00"}}, "usage.reports.daily"),
+        ({"reports": {"weekly": "08:60"}}, "usage.reports.weekly"),
+        ({"reports": {"monthly": "jam delapan"}}, "usage.reports.monthly"),
+        ({"reports": {"daily": 630}}, "usage.reports.daily"),          # YAML: 10:30 tanpa kutip → 630
+        ({"reports": {"daily": True}}, "usage.reports.daily"),
+    ])
+    def test_invalid_values_name_the_key(self, kit, usage, needle):
+        kit.write_team(usage=usage)
+        with pytest.raises(ht.TeamError) as err:
+            kit.team()
+        assert needle in str(err.value)
+
+    def test_private_channel_message_names_the_member(self, kit):
+        kit.write_team(usage={"report_channel_id": BE1_CH})
+        with pytest.raises(ht.TeamError, match="channel pribadi anggota 'be1'"):
+            kit.team()
+
+    def test_example_files_load(self, kit, tmp_path):
+        from pathlib import Path
+        root = Path(ht.__file__).resolve().parent
+        team = ht.load_team(root / "team.example.yaml", root / "members.example.yaml")
+        assert team["sandbox"]["memory_mb"] == 1024
+        assert team["usage"]["reports"] == {"daily": "", "weekly": "", "monthly": ""}

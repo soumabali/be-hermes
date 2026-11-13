@@ -17,7 +17,6 @@
 # Supaya timer user tetap jalan tanpa login: sudo loginctl enable-linger hermes
 [Unit]
 Description=Hermes team kit: kirim laporan pemakaian LLM terjadwal ke Discord
-After=network-online.target
 
 [Service]
 Type=oneshot

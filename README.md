@@ -532,9 +532,9 @@ Satu-satunya bagian yang dipasang terpisah adalah timer pemakaian (§10b); `kit_
 | `kit_doctor.py` | `doctor`: membandingkan members.yaml ↔ profile di disk ↔ rute gateway ↔ channel Discord (`--discord`) ↔ buku besar pemakaian; hanya membaca. |
 | `usage_ledger.py` | Buku besar pemakaian: token & request per orang per hari/minggu/bulan, tahan terhadap pembersihan sesi (§10b). |
 | `skills/team-usage-report/` | Skill admin untuk laporan pemakaian (dipanggil manual atau oleh cron). Terbaca otomatis oleh profile `team-admin` setelah `apply`. |
-| `systemd/` | Timer user untuk memotret pemakaian tiap 15 menit. |
+| `systemd/` | Timer user: potret pemakaian, laporan terjadwal, dan pelapor sandbox menganggur. |
 | `usage_report.py` | Laporan sekali-jalan langsung dari `state.db` (tanpa buku besar). |
-| `tools/` | `probe_llm.py` (ukur kapasitas endpoint LLM), `sandbox_idle.py` (laporkan/hentikan sandbox menganggur). |
+| `tools/` | `probe_llm.py` (ukur kapasitas endpoint LLM), `usage_post.py` (laporan pemakaian terjadwal ke channel), `metrics_export.py` (metrik untuk Prometheus), `sandbox_idle.py` (laporkan/hentikan sandbox menganggur). |
 | `tests/loadtest/` | Simulasi 20 pengguna dan server LLM tiruan untuk uji beban. |
 | `docs/RENCANA-SKALA.md` | Rencana skala beserta status tiap butir. |
 | `docker/sandbox/` | Dockerfile image sandbox tim (PHP, Go, Java, Node, Python, klien DB, `gh`). |
@@ -840,6 +840,11 @@ variabel lingkungan, dan tidak pernah mencetaknya.
 panjang dan lama antrean, jumlah penolakan per jenis, 429 per menit, batas efektif. Admin dikabari
 bila antrean lebih dari 5 selama 2 menit atau ada penolakan karena antrean penuh.
 
+Untuk Prometheus: `tools/metrics_export.py --output <berkas .prom>` mengubah `metrics.json` menjadi format
+textfile collector node_exporter (`hermes_team_active_sessions`, `hermes_team_queue_length`,
+`hermes_team_refused_total{reason=…}`, dst.). Jalankan sebagai user `hermes` tiap menit lewat cron;
+berkas keluarannya hanya berisi angka dan ID user.
+
 Menambah jatah token seseorang untuk hari ini: di `#hermes-admin` tulis "tambah kuota budi 2 juta
 token" (tool `set_usage_budget_extra`, dengan tombol konfirmasi). Tambahan hangus saat hari berganti.
 
@@ -884,8 +889,8 @@ flowchart LR
     L --> R1["CLI: usage_ledger.py report"]
     L --> R2["Tool teamctl: usage_report<br/>hanya-baca"]
     R2 --> SK["Skill team-usage-report"]
-    SK --> CR["Cron job profile admin"]
-    CR --> CH["Channel laporan"]
+    L --> UP["tools/usage_post.py<br/>timer, tanpa LLM"]
+    UP --> CH["Channel laporan"]
 ```
 
 **Yang dicatat:** request ke model (`api_call_count`), token masuk, token keluar, token cache dan
@@ -932,17 +937,42 @@ Di `#hermes-admin` cukup tulis biasa, misalnya "pemakaian token minggu lalu" ata
 ini". Hermes memanggil tool `usage_report` (tanpa tombol konfirmasi, karena hanya membaca) lewat skill
 `team-usage-report`, yang melarang AI mengubah atau mengarang angka.
 
-**Laporan terjadwal lewat cron.** Skill-nya sudah siap dipanggil cron: di `#hermes-admin` minta
-"buat cron tiap Senin 09.00: jalankan skill team-usage-report untuk minggu lalu". Dua hal yang
-harus diputuskan sebelum itu dipakai:
+**Laporan terjadwal ke channel.** `tools/usage_post.py` mengirim laporan harian, mingguan, dan bulanan
+ke satu channel Discord. Angkanya diambil langsung dari buku besar, **tanpa memanggil model**, jadi tidak
+memakai token dan tidak mungkin salah kutip. Atur di `team.yaml`:
 
-- **Channel tujuan.** Dengan `strict_admin_routes: true` (bawaan), hasil cron profile `team-admin`
-  tidak bisa dikirim ke `#hermes-admin` (lihat §13). Pilihannya: set `strict_admin_routes: false` dan
-  andalkan izin channel Discord, atau siapkan channel laporan tersendiri dengan rutenya. Yang kedua
-  belum dibuat di kit.
-- **Tanpa LLM.** Hermes punya cron mode skrip (keluaran skrip dikirim apa adanya, tanpa memanggil
-  model). Untuk laporan angka, itu lebih murah dan tidak mungkin salah kutip; skill tetap berguna
-  untuk pertanyaan bebas.
+```yaml
+usage:
+  timezone: "Asia/Makassar"
+  report_channel_id: "…"          # channel teks di server ini; kosong = fitur mati
+  reports:
+    daily: "08:00"                # laporan KEMARIN, tiap hari
+    weekly: "08:30"               # laporan MINGGU LALU, tiap Senin
+    monthly: "09:00"              # laporan BULAN LALU, tiap tanggal 1
+```
+
+Tulis jamnya dalam tanda kutip. Buat channelnya sendiri di Discord (mis. `#hermes-usage`, hanya terlihat
+admin) dan pastikan bot boleh menulis di sana; channel itu **tidak** dirutekan ke profile mana pun, jadi
+tidak ada yang bisa mengajak AI bicara di sana. Lalu pasang timernya:
+
+```bash
+cp /opt/hermes-team/systemd/hermes-usage-report.* ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now hermes-usage-report.timer
+
+python3 /opt/hermes-team/tools/usage_post.py --list        # jadwal, jatuh tempo berikutnya, terakhir terkirim
+python3 /opt/hermes-team/tools/usage_post.py --dry-run     # lihat isi tanpa mengirim
+python3 /opt/hermes-team/tools/usage_post.py --force daily # kirim sekarang
+```
+
+Tiap laporan dikirim tepat sekali per periode; bila server mati pada jamnya, laporan disusulkan saat
+menyala (hanya periode terakhir). Saat pertama diaktifkan, periode terakhir tiap jenis langsung dikirim.
+Pesan tidak me-mention siapa pun.
+
+Skill `team-usage-report` tetap dipakai untuk pertanyaan bebas di `#hermes-admin`. Laporan terjadwal
+sengaja tidak memakai cron Hermes: dengan `strict_admin_routes: true`, hasil cron profile `team-admin`
+tidak bisa dikirim ke `#hermes-admin` (§13), dan membuka rute ke profile admin dari channel lain akan
+melemahkan pagar admin.
 
 Ketelitian: pemakaian dicatat pada hari saat dipotret, jadi selisih di sekitar tengah malam bisa
 bergeser paling lama selang timer (15 menit; timer juga berjalan pukul 23.59.30).
@@ -1013,7 +1043,7 @@ Yang perlu diketahui admin saat naik dari v3.0:
   (reply) tidak membuka thread baru, dan thread diarsipkan otomatis oleh Discord (bisa dibuka lagi).
   Jumlah thread yang berjalan bersamaan per orang dibatasi `scale.user_max_concurrent`.
 - **Pencatatan pemakaian**: batas hari bisa bergeser paling lama selang timer. Anggaran token (§10) memakai
-  data ini dan mati secara bawaan (`daily_token_budget: 0`). Laporan terjadwal ke channel lewat cron belum dibuat (§10b).
+  data ini dan mati secara bawaan (`daily_token_budget: 0`).
 
 - Live reload memakai struktur internal gateway Hermes (dicek dengan resolver rute Hermes sendiri
   setiap kali). Bila update Hermes mengubahnya, kit jatuh ke restart halus (atau `/restart` manual)
