@@ -32,7 +32,7 @@ class ProfileHooks:
     def _publish_upstream(self, values: Mapping[str, str]) -> None:
         """Daftarkan nilai ke mekanisme bawaan Hermes bila ada (dipanggil di scope profile ini).
 
-        - agent.redact.register_vault_redaction_value: nilai PERSIS, ter-scope per HERMES_HOME, hanya di
+        - agent.redact.register_vault_redaction_value (lewat upstream.HermesGateway): nilai PERSIS, ter-scope per HERMES_HOME, hanya di
           memori, dan disaring di `redact_sensitive_text` (jalur menuju model, termasuk input kompresi).
           Kontraknya cocok, tetapi ini fungsi internal (bukan API ctx) dan registrinya dibatasi 64 nilai per
           profile yang DIBAGI dengan vault browser Hermes — jadi kita hanya menambah (tidak pernah
@@ -46,15 +46,7 @@ class ProfileHooks:
         - ctx.register_session_env TIDAK dipakai: hanya mencapai backend terminal lokal
           (tools/environments/local.py), sedangkan kit memakai sandbox Docker (terminal.env_passthrough).
         """
-        try:
-            from agent.redact import register_vault_redaction_value  # type: ignore[import-not-found]
-        except Exception:
-            return
-        try:
-            for value in list(values.values())[:32]:
-                register_vault_redaction_value(value)
-        except Exception as exc:
-            log_once("vault-redaction", "pendaftaran nilai ke redaktor Hermes gagal (%s)", exc)
+        self.rt.upstream.register_vault_values(values.values(), limit=32)
 
     def _allow_passthrough(self) -> None:
         """Izinkan nama secret diteruskan ke sandbox tanpa menunggu cache config (API publik Hermes;
@@ -62,11 +54,7 @@ class ProfileHooks:
         names = self.store.names()
         if not names:
             return
-        try:
-            from tools.env_passthrough import register_env_passthrough  # type: ignore[import-not-found]
-            register_env_passthrough(names)
-        except Exception:
-            pass
+        self.rt.upstream.register_env_passthrough(names)
 
     # ------------------------------------------------------------------ transform
     def on_terminal_output(self, output: Any = None, **_kw: Any) -> Optional[str]:

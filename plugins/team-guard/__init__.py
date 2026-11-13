@@ -14,7 +14,6 @@ Konfigurasi: hanya `<state_dir>/roster.json` (ditulis hermes_team.py) dan
 """
 from __future__ import annotations
 
-import os
 from pathlib import Path
 from typing import Any, Callable
 
@@ -26,6 +25,7 @@ from .redact import UPSTREAM_PATTERNS
 from .roster import default_state_dir, profile_name_of_home
 from .runtime import runtime_for
 from .secrets import SecretStore
+from .upstream import HermesGateway, note_ctx
 
 __version__ = shared.VERSION
 
@@ -34,11 +34,7 @@ PROMPT_SECTION_ID = "team-guard.secrets"
 
 def _hermes_home() -> Path:
     """HERMES_HOME profile yang sedang memuat plugin (loader mengikatnya selama register())."""
-    try:
-        from hermes_constants import get_hermes_home  # type: ignore[import-not-found]
-        return Path(get_hermes_home())
-    except Exception:
-        return Path(os.environ.get("HERMES_HOME") or "~/.hermes").expanduser()
+    return HermesGateway().hermes_home()
 
 
 def _state_dir(ctx: Any) -> Path:
@@ -62,10 +58,12 @@ def _try(what: str, fn: Callable[[], Any]) -> bool:
     """Satu pendaftaran; API yang tidak ada di versi Hermes ini → satu baris log, plugin tetap jalan."""
     try:
         fn()
+        note_ctx(what, True)
         return True
     except Exception as exc:
         shared.log_once(f"register-{what}", "%s tidak tersedia di versi Hermes ini (%s: %s)", what,
                         type(exc).__name__, exc)
+        note_ctx(what, False, f"{type(exc).__name__}: {exc}")
         return False
 
 
@@ -147,4 +145,6 @@ def register(ctx: Any) -> None:
         detached, rt.detached = rt.detached, None
         if detached is not None and detached[2] is not None and detached[2].is_running():
             detached[2].call_soon_threadsafe(factory, detached[0], detached[1])
+    # Fitur mana yang aktif di Hermes ini: <state_dir>/capabilities.json (dibaca kit_doctor / admin).
+    rt.upstream.write_capabilities(rt.state_dir, rt.wall)
     shared.log.info("team-guard %s dimuat untuk profile %s (%s)", __version__, profile, kind)

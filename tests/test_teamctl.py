@@ -1575,3 +1575,209 @@ def test_budget_tools_are_mutating_and_listed(tc):
     schema = next(t for t in tm.TOOLS if t["name"] == "set_usage_budget_extra")["inputSchema"]
     assert schema["properties"]["extra_tokens"] == {**schema["properties"]["extra_tokens"],
                                                     "minimum": 1, "maximum": 1_000_000_000}
+
+
+# =========================================================================== 20. registri tool (paket teamctl/)
+import hashlib  # noqa: E402
+
+from teamctl.confirm import Plan  # noqa: E402
+from teamctl.registry import Registry  # noqa: E402
+
+# Daftar tool + skemanya DIKUNCI: perubahan tidak sengaja (nama, urutan, deskripsi, skema, anotasi) membuat uji
+# ini gagal. Mengubah tool dengan sengaja → perbarui NAMA dan HASH di sini bersamaan.
+PINNED_TOOL_NAMES = [
+    "team_status", "usage_report", "list_models", "add_member", "set_model", "set_member_active",
+    "list_member_skills", "share_skill", "unshare_skill", "set_usage_budget_extra", "clear_usage_budget_extra",
+    "onboarding_status", "onboard_member",
+    "discord_overview", "discord_list_members", "discord_read_messages", "discord_create_channel",
+    "discord_edit_channel", "discord_delete_channel", "discord_set_channel_permissions", "discord_create_role",
+    "discord_edit_role", "discord_delete_role", "discord_assign_role", "discord_remove_role",
+    "discord_moderate_member", "discord_send_message"]
+PINNED_TOOLS_SHA256 = "8f00ade5c922653d4b9e43864d28737afe251a23a81e561d74a8c1ed15d3de0a"
+
+
+def test_tool_names_and_schema_hash_are_pinned():
+    assert [t["name"] for t in tm.ALL_TOOLS] == PINNED_TOOL_NAMES
+    assert tm.ALL_TOOLS == tm.TOOLS + tm.DISCORD_TOOLS and len(tm.TOOLS) == 13 and len(tm.DISCORD_TOOLS) == 14
+    digest = hashlib.sha256(json.dumps(tm.ALL_TOOLS, sort_keys=False, ensure_ascii=False).encode()).hexdigest()
+    assert digest == PINNED_TOOLS_SHA256, "skema/deskripsi/urutan tool berubah — disengaja? perbarui hash di uji ini"
+
+
+def test_tools_list_over_the_wire_matches_registry_and_hides_discord_group_when_disabled(tc):
+    w = tc.wire()
+    assert w.request("tools/list")["result"]["tools"] == tm.ALL_TOOLS
+    tc.patch_team(server_admin={"enabled": False})
+    assert w.request("tools/list")["result"]["tools"] == tm.TOOLS
+    assert w.eof()
+
+
+def test_every_registered_tool_is_described_strict_and_annotated_from_mutating():
+    assert len(tm.REGISTRY) == 27 and tm.REGISTRY.groups() == ["team", "discord"]
+    for spec in tm.REGISTRY.specs():
+        listed = spec.listing
+        assert spec.description.strip() and listed["description"] == spec.description
+        assert spec.schema["type"] == "object" and spec.schema["additionalProperties"] is False
+        assert ("readOnlyHint" in (listed.get("annotations") or {})) is (not spec.mutating)
+        assert (spec.group == "discord") == spec.name.startswith("discord_")
+    assert {s.name for s in tm.REGISTRY.specs() if s.mutating} == set(PINNED_TOOL_NAMES) - {
+        "team_status", "usage_report", "list_models", "list_member_skills", "onboarding_status", "discord_overview",
+        "discord_list_members", "discord_read_messages"}
+
+
+def _sample_args(schema):
+    """Argumen minimal yang lolos validasi skema (hanya yang wajib)."""
+    out = {}
+    for key in schema.get("required") or []:
+        spec = schema["properties"][key]
+        out[key] = ("x" if "enum" not in spec else spec["enum"][0]) if spec["type"] == "string" else \
+            spec.get("minimum", 1) if spec["type"] == "integer" else True if spec["type"] == "boolean" else []
+    return out
+
+
+def test_mutating_tools_always_go_through_guarded_and_read_tools_never_do(tc, monkeypatch):
+    seen = []
+    monkeypatch.setattr(tm.TeamCtl, "_guarded", lambda self, event, plan: seen.append((event, plan)) or "dijaga")
+    ctl = tc.ctl()
+    for spec in tm.REGISTRY.specs():
+        seen.clear()
+        if spec.mutating:      # handler hanya menyusun rencana; kerangka yang menjalankannya lewat _guarded
+            args = _sample_args(spec.schema)
+            assert ctl.run_tool(spec, args) == "dijaga"
+            assert len(seen) == 1 and seen[0][0] == spec.event_for(args) and callable(seen[0][1]), spec.name
+        else:                  # tool baca tidak menyusun Plan / memanggil _guarded
+            assert not spec.mutating and "_guarded" not in spec.handler.__code__.co_names, spec.name
+    assert ctl.previews == []
+
+
+def test_framework_rejects_wrong_handler_shapes(tc):
+    reg = Registry()
+
+    @reg.tool("bad_read", description="x", schema={"type": "object", "properties": {}, "additionalProperties": False})
+    def bad_read(ctl, args):
+        return 42
+
+    @reg.tool("bad_write", description="x", mutating=True, event="bad-write",
+              schema={"type": "object", "properties": {}, "additionalProperties": False})
+    def bad_write(ctl, args):
+        return "langsung dijalankan tanpa konfirmasi"
+
+    ctl = tc.ctl()
+    with pytest.raises(TypeError, match="harus mengembalikan str"):
+        ctl.run_tool(reg.get("bad_read"), {})
+    with pytest.raises(TypeError, match="harus mengembalikan fungsi plan"):
+        ctl.run_tool(reg.get("bad_write"), {})
+    assert ctl.previews == []
+
+
+def test_registration_refuses_tools_that_could_skip_or_double_confirmation():
+    reg = Registry()
+    schema = {"type": "object", "properties": {}, "additionalProperties": False}
+
+    def forgot_mutating(ctl, args):        # menyusun aksi tapi tidak ditandai mutating → akan lolos tanpa konfirmasi
+        return ctl._guarded("x", lambda: Plan({}, "p", lambda: "ok"))
+
+    def plan_but_read_only(ctl, args):
+        def plan():
+            return Plan({}, "p", lambda: "ok")
+        return plan
+
+    def confirms_itself(ctl, args):        # konfirmasi ganda / menyalahi kerangka
+        ok, _ = ctl.confirm("boleh?")
+        return lambda: "x"
+
+    with pytest.raises(ValueError, match="_guarded"):
+        reg.tool("t1", "d", schema)(forgot_mutating)
+    with pytest.raises(ValueError, match="mutating=True"):
+        reg.tool("t2", "d", schema)(plan_but_read_only)
+    with pytest.raises(ValueError, match="confirm"):
+        reg.tool("t3", "d", schema, mutating=True, event="t3")(confirms_itself)
+    with pytest.raises(ValueError, match="event"):
+        reg.tool("t4", "d", schema, mutating=True)(lambda ctl, args: (lambda: "x"))
+    with pytest.raises(ValueError, match="additionalProperties"):
+        reg.tool("t5", "d", {"type": "object", "properties": {}})(lambda ctl, args: "x")
+    with pytest.raises(ValueError, match="deskripsi"):
+        reg.tool("t6", " ", schema)(lambda ctl, args: "x")
+    with pytest.raises(ValueError, match="event/destructive"):
+        reg.tool("t7", "d", schema, event="e")(lambda ctl, args: "x")
+    reg.tool("ok", "d", schema)(lambda ctl, args: "x")
+    with pytest.raises(ValueError, match="sudah terdaftar"):
+        reg.tool("ok", "d", schema)(lambda ctl, args: "x")
+    assert len(reg) == 1
+
+
+def _local_registry(ran):
+    """Registri uji dengan dua tool buatan (satu baca, satu ubah) — contoh persis dari panduan registry.py."""
+    reg = Registry()
+
+    @reg.tool("ping_team", description="Balas pong.",
+              schema={"type": "object", "properties": {"echo": {"type": "string"}}, "additionalProperties": False})
+    def ping_team(ctl, args: dict) -> str:
+        return "pong " + args.get("echo", "")
+
+    @reg.tool("set_motto", description="Ganti motto tim. Butuh konfirmasi.", mutating=True, event="set-motto",
+              schema={"type": "object", "properties": {"motto": {"type": "string"}}, "required": ["motto"],
+                      "additionalProperties": False})
+    def set_motto(ctl, args: dict):
+        def plan() -> Plan:
+            team = ctl.team()
+            return Plan(team, f"Ganti motto menjadi {args['motto']!r}.", lambda: ran.append(args["motto"]) or "Motto diganti.",
+                        motto=args["motto"])
+        return plan
+
+    return reg
+
+
+def test_throwaway_tool_registered_with_decorator_works_over_stdio_jsonrpc(tc):
+    ran = []
+    w = tc.wire(registry=_local_registry(ran))
+    listed = {t["name"]: t for t in w.request("tools/list")["result"]["tools"]}
+    assert list(listed) == ["ping_team", "set_motto"]                      # tidak bocor tool registri kit
+    assert listed["ping_team"]["annotations"] == {"readOnlyHint": True} and "annotations" not in listed["set_motto"]
+    # tool baca: langsung jalan, tanpa konfirmasi
+    mid = w.call("ping_team", echo="halo")
+    assert w.text(mid) == ("pong halo", False)
+    w.nothing(lambda m: m.get("method") == "elicitation/create")
+    # tool ubah: pratinjau tampil, admin menolak → tidak dijalankan
+    mid = w.call("set_motto", motto="maju")
+    el = w.elicitation()
+    assert "Ganti motto menjadi 'maju'." in el["params"]["message"]
+    w.answer(el, "decline")
+    assert w.text(mid) == ("Tidak dijalankan: ditolak admin.", False) and ran == []
+    assert tc.audit()[-1]["event"] == "set-motto-refused"
+    # disetujui → dijalankan dan diaudit
+    mid = w.call("set_motto", motto="maju")
+    w.answer(w.elicitation())
+    assert w.text(mid) == ("Motto diganti.", False) and ran == ["maju"]
+    entry = tc.audit()[-1]
+    assert (entry["event"], entry["outcome"], entry["motto"]) == ("set-motto", "ok", "maju")
+    # argumen tidak sah ditolak skema sebelum rencana apa pun disusun
+    mid = w.call("set_motto", nope=1)
+    assert w.text(mid)[1] is True
+    w.nothing(lambda m: m.get("method") == "elicitation/create")
+    assert w.eof()
+
+
+def test_group_gate_hook_hides_tools_by_config_and_unknown_state_shows_them(tc):
+    reg = Registry()
+    reg.declare_group("beta", gate=lambda team: team["server_admin"]["enabled"])
+    schema = {"type": "object", "properties": {}, "additionalProperties": False}
+    reg.tool("always", "d", schema, order=1)(lambda ctl, args: "a")
+    reg.tool("gated", "d", schema, group="beta")(lambda ctl, args: "g")
+    w = tc.wire(registry=reg)
+    assert [t["name"] for t in w.request("tools/list")["result"]["tools"]] == ["always", "gated"]
+    tc.patch_team(server_admin={"enabled": False})
+    assert [t["name"] for t in w.request("tools/list")["result"]["tools"]] == ["always"]
+    mid = w.call("gated")
+    assert "tool tidak dikenal" in w.text(mid)[0]
+    assert reg.group_enabled(None, "beta") is True and reg.group_enabled({}, "beta") is True   # keadaan tak diketahui
+    assert w.eof()
+
+
+def test_facade_still_exports_legacy_names_and_version_comes_from_kit_base():
+    import kit_base
+    for name in ("TeamCtl", "TOOLS", "ALL_TOOLS", "DISCORD_TOOLS", "ToolError", "Server", "validate_args", "Plan", "_clean",
+                 "_q", "_name", "_clean_message", "_data_block", "_count", "_tokens", "_epoch", "_age_text", "main",
+                 "MAX_PENDING_ACTIONS", "INSTRUCTIONS", "HANDSHAKE_VERSIONS", "SERVER_VERSION", "_Call"):
+        assert hasattr(tm, name), name
+    assert tm.SERVER_VERSION == kit_base.KIT_VERSION
+    assert callable(tm.TeamCtl.tool_discord_send_message)       # nama lama tool_<nama> tetap ada (kompatibilitas)

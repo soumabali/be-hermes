@@ -1,27 +1,21 @@
 """Live reload: terapkan rute & daftar channel dari roster.json ke gateway yang sedang jalan,
 verifikasi dengan resolver Hermes sendiri, dan jatuh ke restart halus / manual bila gagal.
 
-Yang disentuh di Hermes (semuanya dibungkus getattr/try; perubahan upstream → jalur fallback):
-  gateway/config.py       GatewayConfig.profile_routes   (dibaca per pesan oleh
-                          gateway/session_ingress_context.py dan GatewayRunner._profile_name_for_source)
-  gateway/profile_routing.py  parse_profile_routes, match_profile_route
-  plugins/platforms/discord/adapter.py  DiscordAdapter._gate_env_snapshot, .config.extra,
-                          ._get_allowed_channels(), ._discord_free_response_channels()
-  gateway/control_socket.py   rescan_gateway_profiles     (profile baru dilayani tanpa restart)
-  gateway/run.py              _multiplex_profile_homes, GatewayRunner._running_agent_count
-  gateway/run_shutdown.py     GatewayRunner.request_restart (keluar dengan kode 75 → supervisor)
+Semua sentuhan ke internal Hermes ada di `upstream.HermesGateway` (satu lapisan adaptor); modul ini hanya
+memanggil metodenya, jadi perubahan upstream → pesan galat yang sama seperti dulu → jalur fallback.
 """
 from __future__ import annotations
 
 import asyncio
-import os
 import time
 from typing import Any, Awaitable, Callable, Iterable, Optional
 
 from .shared import log, log_once
+from .upstream import ENV_ALLOWED, ENV_FREE, HermesGateway, UpstreamMissing  # noqa: F401
 
-ENV_ALLOWED = "DISCORD_ALLOWED_CHANNELS"
-ENV_FREE = "DISCORD_FREE_RESPONSE_CHANNELS"
+# Nama lama (uji integrasi & tiruan uji memakainya): lapisan adaptor kini ada di upstream.py.
+Upstream = HermesGateway
+
 BOOT_GRACE = 180.0            # gagal verifikasi secepat ini setelah start → restart tidak akan menolong
 RESTART_COOLDOWN = 900.0      # jarak minimal antar restart otomatis
 IDLE_MAX_WAIT = 600.0
@@ -47,34 +41,6 @@ def expected_routes(roster: Any) -> list[tuple[str, str, Optional[str]]]:
     return out
 
 
-class Upstream:
-    """Akses ke internal Hermes, diimpor malas. Uji memakai tiruan dengan antarmuka yang sama."""
-
-    def parse_profile_routes(self, raw: list) -> list:
-        from gateway.profile_routing import parse_profile_routes  # type: ignore[import-not-found]
-        return parse_profile_routes(raw)
-
-    def match_profile_route(self, routes: list, **kwargs: Any) -> Any:
-        from gateway.profile_routing import match_profile_route  # type: ignore[import-not-found]
-        return match_profile_route(routes, "discord", **kwargs)
-
-    def rescan(self, home: Any) -> Optional[dict]:
-        """Blocking (soket kontrol) — panggil dari thread, bukan dari event loop."""
-        from pathlib import Path
-        from gateway.control_socket import rescan_gateway_profiles  # type: ignore[import-not-found]
-        return rescan_gateway_profiles(Path(str(home)))
-
-    def served_profiles(self, config: Any) -> Optional[set]:
-        from gateway.run import _multiplex_profile_homes  # type: ignore[import-not-found]
-        return {name for name, _home in _multiplex_profile_homes(config)}
-
-    def restart(self, runner: Any) -> None:
-        from gateway.restart import (  # type: ignore[import-not-found]
-            is_container_restart_context, is_gateway_supervisor_process)
-        via_service = bool(is_gateway_supervisor_process() or is_container_restart_context())
-        runner.request_restart(detached=not via_service, via_service=via_service)
-
-
 class LiveReloader:
     def __init__(self, rt: Any, *, get_runner: Callable[[], Any], get_adapter: Callable[[], Any],
                  notify: Callable[[str], Awaitable[Any]], upstream: Any = None,
@@ -82,7 +48,7 @@ class LiveReloader:
                  spawn: Optional[Callable[[Any], Any]] = None):
         self.rt = rt
         self.get_runner, self.get_adapter, self.notify = get_runner, get_adapter, notify
-        self.upstream = upstream or Upstream()
+        self.upstream = upstream or HermesGateway()
         self.clock, self.sleep = clock, sleep
         self.spawn = spawn or (lambda coro: asyncio.get_running_loop().create_task(coro))
         self._lock: Optional[asyncio.Lock] = None
@@ -92,8 +58,7 @@ class LiveReloader:
 
     # ------------------------------------------------------------------ terapkan
     def apply_routes(self, runner: Any, roster: Any) -> tuple[bool, str]:
-        config = getattr(runner, "config", None)
-        if config is None or not hasattr(config, "profile_routes"):
+        if not self.upstream.has_profile_routes(runner):
             return False, "GatewayRunner.config.profile_routes tidak ditemukan"
         try:
             parsed = list(self.upstream.parse_profile_routes(roster.profile_routes))
@@ -102,32 +67,16 @@ class LiveReloader:
         if len(parsed) != len(roster.profile_routes):
             return False, f"{len(roster.profile_routes) - len(parsed)} rute ditolak parse_profile_routes"
         try:
-            current = config.profile_routes
-            if isinstance(current, list):
-                current[:] = parsed       # di tempat: pemegang referensi lama ikut melihat rute baru
-            else:
-                config.profile_routes = parsed
-        except Exception as exc:
-            return False, f"profile_routes tidak bisa ditulis ({type(exc).__name__}: {exc})"
+            self.upstream.write_profile_routes(runner, parsed)   # di tempat: pemegang referensi lama ikut melihatnya
+        except UpstreamMissing as exc:
+            return False, str(exc)
         return True, f"{len(parsed)} rute"
 
     def apply_gates(self, adapter: Any, roster: Any) -> tuple[bool, str]:
-        """Gerbang channel bisa hidup di dua tempat (DiscordAdapter._gate_raw): snapshot env per-adapter
-        (menang untuk allowed_channels) dan PlatformConfig.extra (menang untuk free_response_channels).
-        Keduanya ditulis; os.environ hanya diperbarui bila key-nya memang sudah ada di sana."""
-        allowed, free = csv(roster.allowed_channels), csv(roster.free_response_channels)
-        touched = []
-        snapshot = getattr(adapter, "_gate_env_snapshot", None)
-        if isinstance(snapshot, dict):
-            snapshot[ENV_ALLOWED], snapshot[ENV_FREE] = allowed, free
-            touched.append("snapshot")
-        extra = getattr(getattr(adapter, "config", None), "extra", None)
-        if isinstance(extra, dict):
-            extra["allowed_channels"], extra["free_response_channels"] = allowed, free
-            touched.append("extra")
-        for key, value in ((ENV_ALLOWED, allowed), (ENV_FREE, free)):
-            if key in os.environ:
-                os.environ[key] = value
+        """Gerbang channel bisa hidup di dua tempat (snapshot env per-adapter dan PlatformConfig.extra);
+        `HermesGateway.write_channel_gates` menulis keduanya."""
+        touched = self.upstream.write_channel_gates(adapter, csv(roster.allowed_channels),
+                                                    csv(roster.free_response_channels))
         if not touched:
             return False, "adapter Discord tidak punya _gate_env_snapshot maupun config.extra"
         return True, "+".join(touched)
@@ -135,9 +84,9 @@ class LiveReloader:
     # ------------------------------------------------------------------ verifikasi
     def verify(self, runner: Any, adapter: Any, roster: Any) -> tuple[bool, str]:
         try:
-            routes = runner.config.profile_routes
-        except Exception:
-            return False, "GatewayRunner.config.profile_routes tidak ditemukan"
+            routes = self.upstream.read_profile_routes(runner)
+        except UpstreamMissing as exc:
+            return False, str(exc)
         for cid, profile, user in expected_routes(roster):
             try:
                 match = self.upstream.match_profile_route(routes, guild_id=roster.guild_id, chat_id=cid, user_id=user)
@@ -156,16 +105,12 @@ class LiveReloader:
                 return False, f"match_profile_route gagal ({type(exc).__name__}: {exc})"
             if match is not None:
                 return False, f"channel anggota nonaktif {cid} masih dirutekan ke {getattr(match, 'profile', '?')}"
-        for label, getter, want in (("allowed_channels", "_get_allowed_channels", roster.allowed_channels),
-                                    ("free_response_channels", "_discord_free_response_channels",
-                                     roster.free_response_channels)):
-            fn = getattr(adapter, getter, None)
-            if not callable(fn):
-                return False, f"DiscordAdapter.{getter} tidak ditemukan"
+        for label, which, want in (("allowed_channels", "allowed", roster.allowed_channels),
+                                   ("free_response_channels", "free", roster.free_response_channels)):
             try:
-                got_set = {str(x) for x in fn()}
-            except Exception as exc:
-                return False, f"DiscordAdapter.{getter} gagal ({type(exc).__name__}: {exc})"
+                got_set = self.upstream.read_channel_gate(adapter, which)
+            except UpstreamMissing as exc:
+                return False, str(exc)
             if got_set != {str(x) for x in want}:
                 missing = sorted({str(x) for x in want} - got_set)
                 return False, (f"{label} adapter belum sesuai" + (f" (kurang {', '.join(missing[:3])})" if missing
@@ -264,8 +209,8 @@ class LiveReloader:
 
     async def _restart_when_idle(self, runner: Any) -> None:
         deadline = self.clock() + IDLE_MAX_WAIT
-        count = getattr(runner, "_running_agent_count", None)
-        if not callable(count) or not callable(getattr(runner, "request_restart", None)):
+        count = self.upstream.running_agent_count_fn(runner)
+        if count is None or not self.upstream.restart_capable(runner):
             log_once("restart-api", "GatewayRunner._running_agent_count/request_restart tidak ada; restart manual")
             await self.notify("⚠️ Restart otomatis tidak tersedia di versi Hermes ini. Ketik /restart supaya rute "
                               "baru berlaku.")

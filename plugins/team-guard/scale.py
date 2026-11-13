@@ -16,6 +16,7 @@ from typing import Any, Awaitable, Callable, Optional
 
 from .shared import log, log_once
 
+METRICS_SCHEMA = 1            # versi kontrak metrics.json (docs/KONTRAK.md); pembaca mengabaikan kunci tak dikenal
 REFUSAL_KINDS = ("rate", "queue_full", "budget", "user_concurrent")
 RATE_LIMIT_REASONS = ("rate_limit", "upstream_rate_limit")       # agent/error_classifier.py::FailoverReason
 
@@ -297,6 +298,7 @@ def build_metrics(rt: Any, gateway: Any, probe: Any = None, wall: Callable[[], f
     configured = configured_max_active(settings)
     effective = effective_max_active(rt, settings)
     return {
+        "schema": METRICS_SCHEMA,
         "ts": int(wall()),
         "active_sessions": int(active),
         "active_by_user": rt.turns.by_user(now),
@@ -339,6 +341,9 @@ class Monitor:
             else:
                 texts.append(MSG_RECOVERED.format(configured=event["configured"]))
         texts += self.alerts.observe(len(rt.queue), int(rt.metrics.refused.get("queue_full", 0)))
+        schema_text = rt.schema_notice(rt.roster())          # skema roster lebih baru dari plugin (sekali sehari)
+        if schema_text:
+            texts.append(schema_text)
         for text in texts:
             try:
                 await self.notify(text)

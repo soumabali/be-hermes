@@ -1,0 +1,2 @@
+- Skill tim tersedia read-only. Kalau perlu diubah, tulis usulan perubahannya untuk diajukan ke admin.
+- Skill di kategori `shared/` adalah kiriman rekan lewat admin; boleh dipakai dan disesuaikan untuk dirimu sendiri.

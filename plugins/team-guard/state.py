@@ -20,6 +20,9 @@ except ImportError:  # pragma: no cover - Windows
     fcntl = None  # type: ignore[assignment]
 
 
+ONBOARDING_SCHEMA = 1        # versi kontrak onboarding.json (docs/KONTRAK.md); pembaca mengabaikan kunci tak dikenal
+
+
 def now_iso(ts: Optional[float] = None) -> str:
     return datetime.fromtimestamp(time.time() if ts is None else ts, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -80,6 +83,7 @@ class StateStore:
                 if not isinstance(self.data.get(key), dict):
                     self.data[key] = {}
             self.data.setdefault("version", 1)
+            self.data.setdefault("schema", ONBOARDING_SCHEMA)
 
     def save(self) -> None:
         with self._lock:

@@ -10,6 +10,13 @@ import threading
 from pathlib import Path
 from typing import Any, Optional
 
+from .shared import log_once
+
+# Versi kontrak roster.json yang dipahami plugin ini (docs/KONTRAK.md). Roster tanpa field `schema` = 0
+# (kit lama). Roster dengan skema LEBIH BESAR tetap dibaca sebisanya (kunci tak dikenal diabaikan), tetapi
+# admin diberi tahu sekali sehari supaya plugin diperbarui bersama kit.
+MAX_SUPPORTED_ROSTER_SCHEMA = 1
+
 SETTINGS_DEFAULTS: dict[str, Any] = {
     "rate_per_minute": 6, "burst": 4, "max_active": 8, "queue_max_wait": 180,
     "max_keys": 40, "min_length": 6, "scrub_chat": True, "delete_secret_messages": True,
@@ -26,6 +33,14 @@ ONBOARDING_DEFAULTS: dict[str, Any] = {
 }
 
 
+def roster_schema(data: Any) -> int:
+    """`schema` roster sebagai bilangan bulat; tidak ada / bukan bilangan bulat tak-negatif → 0."""
+    value = data.get("schema") if isinstance(data, dict) else None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return 0
+    return value
+
+
 def default_state_dir() -> Path:
     base = os.environ.get("HERMES_TEAM_DIR") or "~/.hermes-team"
     return Path(base).expanduser() / "state"
@@ -37,6 +52,7 @@ class Roster:
     def __init__(self, data: Optional[dict] = None):
         self.data: dict = data if isinstance(data, dict) else {}
         d = self.data
+        self.schema: int = roster_schema(d)
         self.team_name: str = str(d.get("team_name") or "tim")
         self.guild_id: str = str(d.get("guild_id") or "")
         self.admins: set[str] = {str(a) for a in d.get("admins") or []}
@@ -68,6 +84,11 @@ class Roster:
 
     def __bool__(self) -> bool:
         return bool(self.data)
+
+    @property
+    def newer_schema(self) -> bool:
+        """Roster ditulis kit yang lebih baru daripada yang dipahami plugin ini."""
+        return self.schema > MAX_SUPPORTED_ROSTER_SCHEMA
 
     # ------------------------------------------------------------------ orang & channel
     def is_admin(self, user_id: Any) -> bool:
@@ -161,4 +182,9 @@ class RosterCache:
                 self.error = f"roster.json tidak terbaca: {exc}"
                 return self._roster
             self._stamp, self._roster, self.error = stamp, Roster(data), ""
+            if self._roster.newer_schema:
+                log_once(f"roster-schema-{self._roster.schema}",
+                         "roster.json memakai skema %d, plugin ini memahami sampai %d — dibaca sebisanya; perbarui "
+                         "plugin team-guard bersama kit (`hermes_team.py apply`)", self._roster.schema,
+                         MAX_SUPPORTED_ROSTER_SCHEMA)
             return self._roster

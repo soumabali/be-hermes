@@ -1,0 +1,1 @@
+Halo lagi {mention}, ruang kerja Hermes-mu aktif kembali. Memory, skill, dan secret lamamu masih ada. Model AI-mu: {model}.

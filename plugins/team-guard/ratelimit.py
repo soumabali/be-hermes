@@ -9,6 +9,7 @@ import threading
 from typing import Any, Callable, Optional
 
 from .shared import log_once
+from .upstream import HermesGateway
 
 
 class RateLimiter:
@@ -162,17 +163,12 @@ class LoadProbe:
     `GatewayRunner._running_agent_count()` (semua sesi). Keduanya hilang → None: antrean menonaktifkan
     diri dengan SATU baris log dan yang berlaku batas bawaan Hermes (max_concurrent_sessions)."""
 
-    def __init__(self, turns: TurnTracker):
+    def __init__(self, turns: TurnTracker, upstream: Any = None):
         self.turns = turns
+        self.upstream = upstream or HermesGateway()
 
     def __call__(self, gateway: Any, now: float) -> Optional[int]:
-        runner_count: Optional[int] = None
-        fn = getattr(gateway, "_running_agent_count", None)
-        if callable(fn):
-            try:
-                runner_count = int(fn())
-            except Exception:
-                runner_count = None
+        runner_count: Optional[int] = self.upstream.running_agent_count(gateway)
         hook_count = self.turns.active(now) if self.turns.trusted() else None
         if runner_count is None and hook_count is None:
             log_once("queue-disabled", "antrean sesi nonaktif: GatewayRunner._running_agent_count tidak ada dan "

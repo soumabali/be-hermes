@@ -219,12 +219,14 @@ class _Writer:
 
 
 class Wire:
-    """TeamCtl sungguhan (confirm asli) yang dilayani lewat JSON-RPC per baris, di dalam proses."""
+    """TeamCtl sungguhan (confirm asli) yang dilayani lewat JSON-RPC per baris, di dalam proses.
 
-    def __init__(self, env: Env, consent_timeout=20.0, elicitation=True, protocol="2025-06-18"):
+    `registry`: registri tool lokal (teamctl.registry.Registry) untuk uji tool buatan; bawaan = registri kit."""
+
+    def __init__(self, env: Env, consent_timeout=20.0, elicitation=True, protocol="2025-06-18", registry=None):
         self.inp, self.out = _Reader(), _Writer()
         self.ctl = tm.TeamCtl(env.team_file, env.members_file, str(env.bin), env.root,
-                              consent_timeout=consent_timeout, out=self.out, inp=self.inp)
+                              consent_timeout=consent_timeout, out=self.out, inp=self.inp, registry=registry)
         self.thread = threading.Thread(target=self.ctl.serve, daemon=True)
         self.thread.start()
         self.backlog: list[dict] = []

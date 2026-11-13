@@ -9,12 +9,34 @@ antar profile. Bagian yang harus tunggal per proses (listener Discord, antrean, 
 from __future__ import annotations
 
 import logging
+import re
 import sys
 import threading
 import types
+from pathlib import Path
 from typing import Any, Callable
 
-VERSION = "3.1.0"
+
+def read_manifest_version(manifest: Any = None) -> str:
+    """Versi plugin dari plugin.yaml (satu-satunya sumber). PyYAML (dependensi Hermes) bila ada, kalau tidak
+    pengurai regex kecil untuk baris `version:` tingkat atas. Tidak terbaca → "0.0.0" (bukan galat)."""
+    path = Path(manifest) if manifest is not None else Path(__file__).with_name("plugin.yaml")
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return "0.0.0"
+    try:
+        import yaml
+        value = (yaml.safe_load(text) or {}).get("version")
+        if value is not None:
+            return str(value).strip()
+    except Exception:
+        pass
+    match = re.search(r"""^version:\s*["']?([^"'\s#]+)""", text, re.MULTILINE)
+    return match.group(1) if match else "0.0.0"
+
+
+VERSION = read_manifest_version()
 _NAME = "_team_guard_shared"
 
 log = logging.getLogger("team-guard")

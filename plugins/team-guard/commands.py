@@ -15,6 +15,7 @@ from typing import Any, Callable, Optional
 
 from .secrets import SecretStore, check_env_name, check_env_value, stale_names, sync_passthrough
 from .shared import log, log_once
+from .upstream import HermesGateway
 
 MSG_WHERE = ("Perintah ini hanya berfungsi di channel pribadimu (#hermes-<nama>) atau thread di dalamnya. "
              "Secret tersimpan per profile dan tidak terlihat anggota lain.")
@@ -44,21 +45,16 @@ def resolve_env_target(roster: Any, user_id: Any, channel_ids: Any) -> tuple:
     return profile, ""
 
 
+_UPSTREAM = HermesGateway()
+
+
 def _upstream_blocklist() -> Optional[Callable[[str], bool]]:
     """Daftar nama yang dipakai Hermes versi ini (bila bisa diimpor) — melengkapi daftar statis kit."""
-    try:
-        from tools.env_passthrough import _is_hermes_provider_credential  # type: ignore[import-not-found]
-        return _is_hermes_provider_credential
-    except Exception:
-        return None
+    return _UPSTREAM.provider_credential_checker()
 
 
 def _live_allow(names: list) -> None:
-    try:
-        from tools.env_passthrough import register_env_passthrough  # type: ignore[import-not-found]
-        register_env_passthrough(names)
-    except Exception:
-        pass
+    _UPSTREAM.register_env_passthrough(names)
 
 
 async def do_env_set(roster: Any, profile: str, name: Any, value: Any, by: Any = "", *,
