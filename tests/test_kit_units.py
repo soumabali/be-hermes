@@ -64,13 +64,12 @@ def skills_kit(kit, monkeypatch, tmp_path):
 # =========================================================================== helper murni
 
 def hide_scanner(monkeypatch, kit):
-    """Buat `tools.skills_guard` tidak bisa di-import oleh proses pemindai, JUGA bila Hermes asli terpasang di
-    Python ini (job integrasi CI): paket `tools` kosong di PYTHONPATH menutupi milik Hermes. `delenv` saja tidak
-    cukup di sana — pemindai asli tetap ditemukan dan menjawab "safe"."""
-    shadow = kit.root.parent / "tanpa-pemindai"
-    (shadow / "tools").mkdir(parents=True, exist_ok=True)
-    (shadow / "tools" / "__init__.py").write_text("", encoding="utf-8")
-    monkeypatch.setenv("PYTHONPATH", str(shadow))
+    """Simulasikan instalasi tanpa pemindai Hermes: interpreter Hermes tidak ditemukan. Dulu uji ini hanya
+    menghapus PYTHONPATH, yang tidak berpengaruh bila Hermes asli terpasang di Python uji (job integrasi CI):
+    pemindai asli tetap ditemukan dan menjawab "safe". Menambal penentu interpreter berlaku di kedua keadaan."""
+    monkeypatch.delenv("PYTHONPATH", raising=False)
+    monkeypatch.setattr(ht, "_hermes_python", lambda _binary: None)
+
 
 class TestIds:
     def test_plain_snowflake(self):
@@ -1262,16 +1261,18 @@ class TestSkillGuard:
         assert report["guard"]["verdict"] == "unknown" and "tidak ditemukan" in report["guard"]["findings"][0]
 
     def test_scanner_is_not_imported_from_current_directory(self, skills_kit, monkeypatch, tmp_path):
+        """`tools/skills_guard.py` di direktori kerja tidak boleh menggantikan pemindai Hermes. Modul jahat
+        meninggalkan jejak bila sampai di-import; berlaku baik dengan pemindai tiruan maupun Hermes asli."""
         kit = skills_kit
-        hide_scanner(monkeypatch, kit)
-        evil = tmp_path / "cwd-jahat"
+        evil, marker = tmp_path / "cwd-jahat", tmp_path / "TERIMPOR"
         (evil / "tools").mkdir(parents=True)
         (evil / "tools" / "__init__.py").write_text("")
         (evil / "tools" / "skills_guard.py").write_text(
+            f"open({str(marker)!r}, 'w').close()\n"
             "class R:\n    verdict='safe'\n    findings=[]\ndef scan_skill(path, source='x'):\n    return R()\n")
         monkeypatch.chdir(evil)                                      # dulu: cwd ada di sys.path → "safe" palsu
-        report = ht.scan_skill(kit.hermes(), "be-be1", kit.make_skill("be-be1", "deploy"))
-        assert report["guard"]["verdict"] == "unknown" and report["problems"]
+        ht.scan_skill(kit.hermes(), "be-be1", kit.make_skill("be-be1", "deploy"))
+        assert not marker.exists(), "pemindai diambil dari direktori kerja"
 
     def test_scanner_subprocess_gets_safe_path_and_cwd(self, skills_kit, monkeypatch):
         kit = skills_kit
