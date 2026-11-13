@@ -122,6 +122,12 @@ def _probe(modules: tuple[str, ...], owner: str, attr: str) -> dict:
                     break
             if obj is not None:
                 return {"available": True, "reason": f"ada ({module} sudah dimuat)"}
+            # Atribut INSTANS (`self.x = ...` di konstruktor) tidak ada di kelasnya, hanya di objek yang sudah
+            # dibuat; cari penugasannya di sumber modul supaya tidak salah melapor "hilang".
+            if owner:
+                text = _source_text(module)
+                if text and re.search(rf"\bself\.{re.escape(attr)}\b\s*(?::[^=\n]+)?=", text):
+                    return {"available": True, "reason": f"atribut instans di sumber {module} (modul sudah dimuat)"}
             seen_missing.append(module)
             continue
         text = _source_text(module)

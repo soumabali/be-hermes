@@ -3124,7 +3124,10 @@ class TestUpstreamAdapterLayer:
         (pkg / "__init__.py").write_text("raise RuntimeError('tidak boleh dijalankan')\n")
         (pkg / "profile_routing.py").write_text("def parse_profile_routes(raw):\n    return raw\n")
         monkeypatch.syspath_prepend(str(tmp_path))
-        monkeypatch.delitem(sys.modules, "gateway", raising=False)
+        # Dengan Hermes asli terpasang (job integrasi CI) submodulnya mungkin sudah dimuat: singkirkan semuanya
+        # untuk uji ini (monkeypatch memulihkannya) supaya yang diperiksa memang jalur "belum dimuat".
+        for name in [k for k in sys.modules if k == "gateway" or k.startswith("gateway.")]:
+            monkeypatch.delitem(sys.modules, name)
         shared.reset()
         caps = upstreammod.HermesGateway().capabilities()
         assert "gateway" not in sys.modules                                   # tidak ada kode hulu yang dijalankan
@@ -3132,6 +3135,36 @@ class TestUpstreamAdapterLayer:
         assert "sumber" in caps["gateway.profile_routing.parse_profile_routes"]["reason"]
         assert caps["gateway.profile_routing.match_profile_route"]["available"] is False
         assert caps["gateway.control_socket.rescan_gateway_profiles"]["available"] is False
+
+    def test_loaded_module_instance_attribute_is_found_in_source(self, tmp_path, monkeypatch):
+        """`DiscordAdapter._gate_env_snapshot` dibuat di __init__ (atribut instans): probe modul yang SUDAH dimuat
+        tidak boleh melapornya hilang hanya karena kelasnya tidak punya atribut itu (temuan CI terhadap Hermes asli)."""
+        src = tmp_path / "plugins" / "platforms" / "discord"
+        src.mkdir(parents=True)
+        for pkg in (tmp_path / "plugins", tmp_path / "plugins" / "platforms", src):
+            (pkg / "__init__.py").write_text("")
+        (src / "adapter.py").write_text(
+            "class DiscordAdapter:\n    def __init__(self):\n        self._gate_env_snapshot: dict = {}\n")
+        monkeypatch.syspath_prepend(str(tmp_path))
+        loaded = types.ModuleType("plugins.platforms.discord.adapter")
+        loaded.DiscordAdapter = type("DiscordAdapter", (), {})                  # kelas tanpa atribut instans
+        monkeypatch.setitem(sys.modules, "plugins.platforms.discord.adapter", loaded)
+        shared.reset()
+        entry = upstreammod.HermesGateway().capabilities()["DiscordAdapter._gate_env_snapshot"]
+        assert entry["available"] is True and "instans" in entry["reason"]
+
+    def test_loaded_module_without_the_attribute_anywhere_is_reported_missing(self, tmp_path, monkeypatch):
+        src = tmp_path / "plugins" / "platforms" / "discord"
+        src.mkdir(parents=True)
+        for pkg in (tmp_path / "plugins", tmp_path / "plugins" / "platforms", src):
+            (pkg / "__init__.py").write_text("")
+        (src / "adapter.py").write_text("class DiscordAdapter:\n    def __init__(self):\n        self.lain = 1\n")
+        monkeypatch.syspath_prepend(str(tmp_path))
+        loaded = types.ModuleType("plugins.platforms.discord.adapter")
+        loaded.DiscordAdapter = type("DiscordAdapter", (), {})
+        monkeypatch.setitem(sys.modules, "plugins.platforms.discord.adapter", loaded)
+        shared.reset()
+        assert upstreammod.HermesGateway().capabilities()["DiscordAdapter._gate_env_snapshot"]["available"] is False
 
     def test_capabilities_check_loaded_modules_directly(self, monkeypatch):
         fake = types.ModuleType("tools.env_passthrough")
