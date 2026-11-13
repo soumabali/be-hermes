@@ -472,8 +472,9 @@ Setelah perbaikan apa pun: `python3 /opt/hermes-team/kit_doctor.py --discord`.
 1. Perbarui kit: `sudo git -C /opt/hermes-team pull` (atau salin versi baru), pemilik tetap root.
 2. Tambahkan blok `threads` dan `usage`, serta setelan `scale` baru, dari `team.example.yaml` ke `team.yaml`-mu.
    Perhatikan: cron dan `/goal` untuk anggota mati secara bawaan (§10).
-3. `python3 /opt/hermes-team/hermes_team.py apply`, lalu pasang ulang `/etc/hermes/config.yaml` (`managed`).
-4. Pasang timer pemakaian (§10b).
+3. `python3 /opt/hermes-team/hermes_team.py apply`, pasang ulang `/etc/hermes/config.yaml` (`managed`), lalu
+   `apply` **sekali lagi** (empat setelan pindah dari managed ke tiap profile; lihat §10).
+4. Pasang timer pemakaian dan, bila dipakai, timer laporan terjadwal (§10b).
 5. `/restart` **sekali**, lalu `python3 /opt/hermes-team/kit_doctor.py --discord`.
 
 Baca §12b untuk perubahan perilaku. SOUL.md yang sudah ada tidak ditimpa kecuali `--force-soul`.
@@ -818,7 +819,8 @@ flowchart TD
 | Mengirim pesan saat bot sibuk | Masuk antrean sesi, tidak memotong pekerjaan | `busy_input_mode: queue` |
 | Tugas kecil memakai model mahal | Tugas auxiliary ke model murah, judul sesi tanpa LLM | `llm.aux_model`, `title_llm` |
 | Banyak orang di-onboard sekaligus | `onboard-batch`: semua channel dibuat, lalu satu `apply`; onboarding lewat role tetap berurutan | `onboarding.*` |
-| Beban RAM | Browser otomatis & computer use mati; `kit_doctor.py --docker` melaporkan RAM tiap sandbox | `allow_browser: false` |
+| Beban RAM | Sandbox 1 GB per orang secara bawaan, bisa dinaikkan per anggota; `check` menghitung kasus terburuk dan memperingatkan bila melebihi RAM server; browser otomatis & computer use mati; `kit_doctor.py --docker` melaporkan RAM tiap sandbox | `sandbox.memory_mb`, `members.yaml` → `sandbox`, `allow_browser: false` |
+| Model berbeda, jendela konteks berbeda | Ambang kompresi bisa diatur per model | `llm.models.<alias>.compression_threshold_tokens`, `.proactive_prune_tokens` |
 
 ### Mengukur, bukan menebak
 
@@ -848,7 +850,26 @@ berkas keluarannya hanya berisi angka dan ID user.
 Menambah jatah token seseorang untuk hari ini: di `#hermes-admin` tulis "tambah kuota budi 2 juta
 token" (tool `set_usage_budget_extra`, dengan tombol konfirmasi). Tambahan hangus saat hari berganti.
 
+### Memori sandbox per anggota
+
+```bash
+python3 /opt/hermes-team/hermes_team.py set-sandbox budi --memory-mb 4096 --cpu 2   # naikkan untuk satu orang
+python3 /opt/hermes-team/hermes_team.py set-sandbox budi --reset                    # kembali ke bawaan tim
+```
+
+Atau tulis `sandbox: {memory_mb: 4096, cpu: 2}` pada anggota itu di `members.yaml`, lalu `apply`.
+Container yang sudah ada tetap memakai batas lama sampai dibuat ulang.
+
 ### Yang perlu diketahui
+
+- **RAM bawaan sandbox turun dari 2 GB ke 1 GB.** Build Java/Maven atau Node yang besar bisa kehabisan
+  memori; naikkan per orang dengan `set-sandbox` atau ubah `sandbox.memory_mb`.
+- **Empat setelan tidak lagi dipin root:** batas CPU/RAM sandbox dan dua ambang kompresi kini ditulis di
+  config tiap profile (supaya bisa berbeda per orang/model), bukan di `/etc/hermes/config.yaml`. Anggota
+  tetap tidak bisa mengubahnya (agent bekerja di sandbox tanpa akses ke `~/.hermes`, perintah config
+  hanya untuk admin), tetapi operator dengan akses shell bisa.
+- **Urutan upgrade penting:** `apply` → pasang ulang `/etc/hermes/config.yaml` (`managed`) → `apply` lagi.
+  Selama berkas managed lama masih mengunci empat setelan itu, `apply` melewatinya dan memberi peringatan.
 
 - **Perubahan bawaan saat upgrade:** anggota dan `#hermes-shared` kehilangan toolset cron serta `/goal`
   dan `/subgoal` pada `apply` berikutnya. Buka lagi dengan `allow_member_cron: true` / `allow_goals: true`.

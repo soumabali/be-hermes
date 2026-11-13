@@ -62,6 +62,16 @@ def skills_kit(kit, monkeypatch, tmp_path):
 
 
 # =========================================================================== helper murni
+
+def hide_scanner(monkeypatch, kit):
+    """Buat `tools.skills_guard` tidak bisa di-import oleh proses pemindai, JUGA bila Hermes asli terpasang di
+    Python ini (job integrasi CI): paket `tools` kosong di PYTHONPATH menutupi milik Hermes. `delenv` saja tidak
+    cukup di sana — pemindai asli tetap ditemukan dan menjawab "safe"."""
+    shadow = kit.root.parent / "tanpa-pemindai"
+    (shadow / "tools").mkdir(parents=True, exist_ok=True)
+    (shadow / "tools" / "__init__.py").write_text("", encoding="utf-8")
+    monkeypatch.setenv("PYTHONPATH", str(shadow))
+
 class TestIds:
     def test_plain_snowflake(self):
         assert ht._id("100000000000000001", "x") == "100000000000000001"
@@ -1180,7 +1190,7 @@ class TestSkillGuard:
 
     def test_missing_scanner_refuses_by_default(self, skills_kit, monkeypatch):
         kit = skills_kit
-        monkeypatch.delenv("PYTHONPATH")                             # tools.skills_guard tidak bisa di-import
+        hide_scanner(monkeypatch, kit)                               # tools.skills_guard tidak bisa di-import
         kit.make_skill("be-be1", "deploy")
         with pytest.raises(ht.TeamError) as err:
             ht.share_skill(kit.team(), kit.hermes(), "deploy", "be1", ["budi"])
@@ -1191,14 +1201,14 @@ class TestSkillGuard:
 
     def test_missing_scanner_with_explicit_opt_out(self, skills_kit, monkeypatch):
         kit = skills_kit
-        monkeypatch.delenv("PYTHONPATH")
+        hide_scanner(monkeypatch, kit)
         kit.make_skill("be-be1", "deploy")
         result = ht.share_skill(kit.team(), kit.hermes(), "deploy", "be1", ["budi"], allow_unscanned=True)
         assert result["results"] == {"budi": "terpasang"} and result["guard"] == "unknown"
 
     def test_scan_report_marks_unknown_and_opt_out(self, skills_kit, monkeypatch):
         kit = skills_kit
-        monkeypatch.delenv("PYTHONPATH")
+        hide_scanner(monkeypatch, kit)
         skill = kit.make_skill("be-be1", "deploy")
         strict = ht.scan_skill(kit.hermes(), "be-be1", skill)
         assert strict["guard"]["verdict"] == "unknown" and len(strict["problems"]) == 1
@@ -1253,7 +1263,7 @@ class TestSkillGuard:
 
     def test_scanner_is_not_imported_from_current_directory(self, skills_kit, monkeypatch, tmp_path):
         kit = skills_kit
-        monkeypatch.delenv("PYTHONPATH")
+        hide_scanner(monkeypatch, kit)
         evil = tmp_path / "cwd-jahat"
         (evil / "tools").mkdir(parents=True)
         (evil / "tools" / "__init__.py").write_text("")
@@ -1539,7 +1549,7 @@ class TestMain:
 
     def test_share_skill_cli_flag(self, skills_kit, monkeypatch, capsys):              # #7
         kit = skills_kit
-        monkeypatch.delenv("PYTHONPATH")
+        hide_scanner(monkeypatch, kit)
         kit.make_skill("be-be1", "deploy")
         with pytest.raises(SystemExit) as exit_info:
             ht.main(cli(kit, "share-skill", "deploy", "--from", "be1", "--to", "budi"))

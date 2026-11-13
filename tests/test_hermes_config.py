@@ -72,6 +72,9 @@ def test_managed_and_host_config_keys_are_known_to_hermes():
         elif not has(section):
             unknown.append(section)
     assert not unknown, f"key managed yang tidak ada di DEFAULT_CONFIG Hermes: {unknown}"
+    # Key yang dipindah dari managed ke config per profile (batas sandbox, ambang kompresi) juga harus dikenal.
+    scoped = [k for k in ht.PROFILE_SCOPED_KEYS if not has(k)]
+    assert not scoped, f"key per profile yang tidak ada di DEFAULT_CONFIG Hermes: {scoped}"
 
 
 def _sample_team():

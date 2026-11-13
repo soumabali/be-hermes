@@ -18,11 +18,11 @@ Rencana ini sudah dijalankan. "Selesai" berarti kodenya ada dan lulus uji unit s
 | 3 | Fallback dan 429 | Selesai | Pembatas adaptif menurunkan batas sesi, bukan `max_llm_parallel` |
 | 4 | Ukur kapasitas endpoint | Selesai (`tools/probe_llm.py`) | Harus dijalankan di server; angka bawaan belum diganti |
 | 5 | Anggaran token | Selesai | Mati secara bawaan; status "sudah diperingatkan" hilang saat restart |
-| 6 | Sandbox menganggur dan RAM | Sebagian | `sandbox_idle.py` hanya melaporkan; `memory_mb` per orang dan bawaan 1024 belum |
-| 7 | Metrik | Selesai | Belum ada ekspor ke Prometheus/DataDog |
+| 6 | Sandbox menganggur dan RAM | Sebagian | Batas per orang dan bawaan 1 GB selesai; `sandbox_idle.py` hanya melaporkan (restart container belum terbukti) |
+| 7 | Metrik | Selesai | Ekspor Prometheus lewat `tools/metrics_export.py` |
 | 8 | Antrean adil | Selesai | Antrean sesi-sibuk milik Hermes tetap di luar pembatas |
-| 9 | Kompresi per model | Belum | Butuh data pemakaian nyata dulu |
-| 10 | Retensi | Sebagian | Retensi sesi selesai; durasi arsip thread belum diatur |
+| 9 | Kompresi per model | Selesai | Nilainya perlu disetel dari data pemakaian nyata |
+| 10 | Retensi | Selesai | Durasi arsip thread tidak bisa diatur: Hermes memakai nilai tetap 24 jam |
 | 11 | Onboarding massal | Selesai (`onboard-batch`) | — |
 | 12 | Uji beban | Sebagian | Simulasi dan LLM tiruan ada; penggerak 20 user ke gateway sungguhan belum |
 
