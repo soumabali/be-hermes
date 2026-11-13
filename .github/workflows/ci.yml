@@ -61,7 +61,7 @@ jobs:
         env:
           PYTHONPATH: ${{ github.workspace }}/.hermes-src
       - name: Uji (integrasi tidak boleh dilewati)
-        run: .hermes-src/.venv/bin/python -m pytest tests -q -rs -p no:cacheprovider
+        run: .hermes-src/.venv/bin/python -m pytest tests -q -rfEs -p no:cacheprovider
         env:
           PYTHONPATH: ${{ github.workspace }}/.hermes-src
           KIT_REQUIRE_HERMES: "1"

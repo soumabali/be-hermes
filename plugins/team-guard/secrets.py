@@ -68,6 +68,8 @@ HERMES_PREFIXES = (
     "SMS_", "STEPFUN_", "TEAMCTL_", "TEAMS_", "TELEGRAM_", "TERMINAL_", "TOKENHUB_", "TOKENPLAN_",
     "TOOL_GATEWAY_", "TWILIO_", "UPSTAGE_", "VERCEL_", "VERTEX_", "VOICE_TOOLS_", "WEBHOOK_", "WECOM_",
     "WEIXIN_", "WHATSAPP_", "XAI_", "XIAOMI_", "ZAI_", "Z_AI_", "_HERMES_",
+    # Ditemukan uji drift di CI terhadap Hermes asli (tabel env saat runtime, tidak terlihat dari pindaian statis):
+    "CAMOFOX_", "HASS_", "YUANBAO_",
 )
 # Bentuk setelan Hermes apa pun namespacenya: endpoint LLM, gerbang akses, saklar/alamat adapter, webhook, proxy.
 BLOCKED_SHAPE = re.compile(
