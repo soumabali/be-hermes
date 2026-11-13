@@ -43,9 +43,10 @@ from typing import Any, Callable, Optional
 import yaml
 
 import kit_paths
+from kit.profiles import SYSTEM_KINDS
 
 ERROR, WARN, INFO = "error", "warn", "info"
-SYSTEM_PROFILES_KEYS = ("shared", "admin")
+SYSTEM_PROFILES_KEYS = SYSTEM_KINDS      # jenis profile ber-channel sendiri (kit/profiles.py)
 
 
 class Report:
@@ -97,8 +98,7 @@ def _read_yaml(path: Path) -> dict:
 def check_local(team: dict, root: Path, rep: Report, ht: Any) -> None:
     active = ht.active_members(team)
     inactive = [m for m in team["members"] if not m.get("active", True)]
-    known = {m["profile"] for m in team["members"]} | {team["shared"]["profile"], team["admin"]["profile"],
-                                                      team["template"]}
+    known = {m["profile"] for m in team["members"]} | {team[k]["profile"] for k in SYSTEM_KINDS} | {team["template"]}
     # profile
     for m in active:
         if not _home(root, m["profile"]).is_dir():
@@ -423,8 +423,7 @@ def check_docker(team: dict, root: Path, rep: Report, run: Runner = run_command,
                  meminfo: Path = Path("/proc/meminfo")) -> None:
     """Sandbox per profile (status, RAM) dan ukuran state.db. Hanya membaca; docker hilang → satu peringatan
     dan pemeriksaan state.db tetap jalan."""
-    profiles = [m["profile"] for m in team["members"]] + [team["shared"]["profile"], team["admin"]["profile"],
-                                                          "default"]
+    profiles = [m["profile"] for m in team["members"]] + [team[k]["profile"] for k in SYSTEM_KINDS] + ["default"]
     by_profile: dict[str, list] = {}
     docker_ok = True
     try:
@@ -594,10 +593,9 @@ def check_discord_setup(team: dict, rep: Report, ht: Any, api: Any) -> bool:
                         "siapkan kategori baru sebelum penuh")
     # channel bersama, admin, laporan
     everyone_base = _bits((roles.get(guild) or {}).get("permissions"))
-    targets = [("shared.channel_id", team["shared"]["channel_id"], True),
-               ("admin.channel_id", team["admin"]["channel_id"], True)]
+    targets = [(f"{k}.channel_id", team[k]["channel_id"], True) for k in SYSTEM_KINDS]
     report_channel = (team.get("usage") or {}).get("report_channel_id")
-    if report_channel and report_channel not in (team["shared"]["channel_id"], team["admin"]["channel_id"]):
+    if report_channel and report_channel not in (team[k]["channel_id"] for k in SYSTEM_KINDS):
         targets.append(("usage.report_channel_id", report_channel, False))
     for key, cid, must_be_private in targets:
         ch = channels.get(cid)
@@ -665,8 +663,7 @@ def check_discord(team: dict, rep: Report, ht: Any, api: Any) -> None:
 
 def main(argv: Optional[list[str]] = None, *, run: Optional[Runner] = None, api: Any = None) -> int:
     """`run` (perintah sistem) dan `api` (klien Discord) bisa disuntik untuk uji."""
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
-    import hermes_team as ht
+    import hermes_team as ht      # folder skrip otomatis ada di sys.path saat dijalankan sebagai skrip
 
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--config", help="team.yaml (default: $HERMES_TEAM_DIR/team.yaml, kalau tidak "

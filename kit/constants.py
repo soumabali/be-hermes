@@ -35,8 +35,6 @@ ALIAS_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,79}$")
 ENV_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]{1,63}$")
 
 
-# Nama yang bentrok dengan target set-model / profile bawaan → tidak boleh jadi nama anggota baru.
-RESERVED_NAMES = {"all", "semua", "all-members", "shared", "admin", "lobby", "default", "main", "template"}
 
 
 # Perintah slash untuk anggota non-admin. Admin selalu boleh semuanya.

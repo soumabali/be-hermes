@@ -100,7 +100,7 @@ sys.dont_write_bytecode = True
 import plugin_stubs as S
 P = S.load_plugin()
 for name in ("redact", "guard", "secrets", "ratelimit", "dispatch", "livereload", "roster", "state",
-             "onboarding", "hooks", "commands", "discord_events", "runtime", "shared"):
+             "onboarding", "hooks", "commands", "discord_events", "runtime", "shared", "upstream", "limiters"):
     S.sub(P, name)
 ctx = S.StubContext({{"state_dir": {str(tmp_path)!r}}})
 P.register(ctx)
@@ -349,10 +349,45 @@ class TestCommandGuard:
 
 # ============================================================================= nama & nilai secret
 class TestEnvNamePolicy:
-    @pytest.mark.parametrize("name", ["GH_PAT", "DB_PASSWORD", "MY_OPENAI_KEY", "DEPLOY_KEY_B64", "STRIPE_SECRET",
-                                      "AB", "X9_TOKEN"])
+    @pytest.mark.parametrize("name", ["GH_PAT", "MY_DB_PASSWORD", "MY_OPENAI_KEY", "MY_DEPLOY_KEY_B64",
+                                      "STRIPE_SECRET", "MY_AB", "MY_X9_TOKEN"])
     def test_ordinary_names_allowed(self, name):
+        """Kebijakan DAFTAR IZIN: awalan `MY_` atau nama alat dev yang dikenal (secrets.DEV_TOOL_NAMES)."""
         assert secrets.check_env_name(name, reserved=["TD_API_KEY"]) == (True, "")
+
+    @pytest.mark.parametrize("name", ["DB_PASSWORD", "DEPLOY_KEY_B64", "AB", "X9_TOKEN", "STRIPE_API_KEY",
+                                      "API_TOKEN", "HOSTING_TOKEN", "PORTAL_PASS", "SUPPORT_KEY",
+                                      "REPORTING_SECRET", "NEWPLAT_SECRET"])
+    def test_names_outside_the_allowlist_are_rejected_with_the_allowed_shapes(self, name):
+        """Regresi akar masalah: nama yang tidak dikenal Hermes SEKARANG pun ditolak (Hermes bisa memakainya besok);
+        pesan menyebut bentuk yang diizinkan + nama pengganti `MY_…` yang pasti lolos."""
+        ok, why = secrets.check_env_name(name)
+        assert not ok and "tidak termasuk bentuk nama yang diizinkan" in why
+        for fragment in ("`MY_`", "secrets.allow_names", "`GH_PAT`", "nama lain"):
+            assert fragment in why
+        assert len(why) < 900                                                    # muat di balasan ephemeral Discord
+        assert secrets.check_env_name(secrets.suggest_name(name)) == (True, "")
+
+    def test_allow_names_opens_a_name_outside_the_allowlist(self):
+        assert secrets.check_env_name("DB_PASSWORD", allow=["DB_PASSWORD"]) == (True, "")
+        assert not secrets.check_env_name("DB_PASSWORD", allow=["DB_PASSWORD"], deny=["DB_PASSWORD"])[0]
+        assert not secrets.check_env_name("DB_PASSWORD_2", allow=["DB_PASSWORD"])[0]       # hanya nama persis
+
+    def test_builtin_allowlist_is_conservative_and_passes_the_blocklist(self):
+        names = secrets.DEV_TOOL_NAMES
+        assert "GH_PAT" in names and len(names) >= 20
+        for name in sorted(names):
+            assert secrets.ENV_NAME_RE.match(name) and not name.startswith(secrets.SAFE_PREFIX), name
+            assert secrets.blocked_kind(name) == "", f"{name} kena daftar tolak (namespace Hermes/bentuk setelan/sistem)"
+            assert secrets.check_env_name(name) == (True, "")
+        assert not names & set(secrets.HERMES_NAMES) and not names & secrets.SYSTEM_NAMES
+        assert not names & set(secrets.SUGGEST) - {"GH_PAT"}
+
+    def test_blocklist_stays_as_defence_in_depth_behind_the_allowlist(self):
+        assert not secrets.check_env_name("MY_X", reserved=["MY_X"])[0]
+        assert not secrets.check_env_name("MY_X", deny=["MY_X"])[0]
+        assert not secrets.check_env_name("GH_PAT", upstream=lambda n: n == "GH_PAT")[0]    # Hermes terpasang menang
+        assert not secrets.check_env_name("PATH")[0] and not secrets.check_env_name("DISCORD_BOT_TOKEN")[0]
 
     @pytest.mark.parametrize("name,fragment", [
         ("GITHUB_TOKEN", "GH_PAT"), ("GH_TOKEN", "GH_PAT"), ("OPENAI_API_KEY", "MY_OPENAI_KEY"),
@@ -403,9 +438,9 @@ class TestEnvNamePolicy:
         assert "`MY_" in why or "`GH_PAT`" in why                             # selalu ada saran nama aman
 
     @pytest.mark.parametrize("name", ["GH_PAT", "MY_NTFY_TOPIC", "MY_OPENAI_BASE_URL", "MY_DEPLOY_WEBHOOK_URL",
-                                      "MY_DB_HOST", "STRIPE_API_KEY", "JIRA_TOKEN", "NPM_TOKEN", "SENTRY_DSN",
-                                      "API_TOKEN", "DB_PASSWORD", "DEPLOY_KEY_B64", "HOSTING_TOKEN", "PORTAL_PASS",
-                                      "SUPPORT_KEY", "REPORTING_SECRET"])
+                                      "MY_DB_HOST", "MY_STRIPE_API_KEY", "JIRA_TOKEN", "NPM_TOKEN", "SENTRY_DSN",
+                                      "MY_API_TOKEN", "MY_DB_PASSWORD", "MY_DEPLOY_KEY_B64", "MY_HOSTING_TOKEN",
+                                      "MY_PORTAL_PASS", "MY_SUPPORT_KEY", "MY_REPORTING_SECRET"])
     def test_safe_namespace_and_ordinary_secret_names_stay_allowed(self, name):
         assert secrets.check_env_name(name) == (True, "")
 
@@ -440,8 +475,8 @@ class TestEnvNamePolicy:
             assert must in secrets.HERMES_PREFIXES
 
     def test_upstream_blocklist_is_consulted_and_fail_safe(self):
-        assert not secrets.check_env_name("VENDOR_X_KEY", upstream=lambda n: n == "VENDOR_X_KEY")[0]
-        assert secrets.check_env_name("VENDOR_Y_KEY", upstream=lambda n: 1 / 0)[0]
+        assert not secrets.check_env_name("MY_VENDOR_X_KEY", upstream=lambda n: n == "MY_VENDOR_X_KEY")[0]
+        assert secrets.check_env_name("MY_VENDOR_Y_KEY", upstream=lambda n: 1 / 0)[0]
 
     @pytest.mark.parametrize("value,ok", [
         ("123456", True), ("12345", False), ("a\nb-multi-line", False), ("x" * 8193, False), (None, False),
@@ -598,7 +633,7 @@ class TestEnvCommands:
 
     @pytest.mark.parametrize("name,value,fragment", [
         ("GITHUB_TOKEN", SECRET, "GH_PAT"), ("TD_API_KEY", SECRET, "API key LLM"), ("GH_PAT", "abc", "terlalu pendek"),
-        ("bad name", SECRET, "HURUF BESAR"), ("MULTI_LINE", "a\nbbbbbbb", "_B64"),
+        ("bad name", SECRET, "HURUF BESAR"), ("MY_MULTI_LINE", "a\nbbbbbbb", "_B64"),
     ])
     def test_env_set_rejections_store_nothing(self, env, name, value, fragment):
         ok, text = run(commands.do_env_set(self._roster(env), "be-budi", name, value, S.U_BUDI))
@@ -606,19 +641,19 @@ class TestEnvCommands:
         assert not (env.home("be-budi") / ".env").exists()
 
     def test_env_set_respects_roster_policy(self, env):
-        env.set("settings", max_keys=2, deny_names=["LEGACY_KEY"], allow_names=["GITHUB_TOKEN"], min_length=10)
+        env.set("settings", max_keys=2, deny_names=["MY_LEGACY_KEY"], allow_names=["GITHUB_TOKEN"], min_length=10)
 
         async def runner(argv, environ):
             return 0, ""
 
         roster = env.rt().roster(force=True)
         do = lambda n, v: run(commands.do_env_set(roster, "be-budi", n, v, S.U_BUDI, runner=runner))
-        assert not do("LEGACY_KEY", SECRET)[0]
-        assert not do("SHORT_ONE", "123456789")[0]                           # min_length 10
-        assert do("GITHUB_TOKEN", SECRET)[0] and do("SECOND_KEY", SECRET + "2")[0]
-        ok, text = do("THIRD_KEY", SECRET + "3")
+        assert not do("MY_LEGACY_KEY", SECRET)[0]
+        assert not do("MY_SHORT_ONE", "123456789")[0]                           # min_length 10
+        assert do("GITHUB_TOKEN", SECRET)[0] and do("MY_SECOND_KEY", SECRET + "2")[0]
+        ok, text = do("MY_THIRD_KEY", SECRET + "3")
         assert not ok and "Batas 2" in text
-        assert do("SECOND_KEY", SECRET + "x")[0]                             # mengganti yang ada tetap boleh
+        assert do("MY_SECOND_KEY", SECRET + "x")[0]                             # mengganti yang ada tetap boleh
 
     def test_env_set_reports_passthrough_failure_but_keeps_secret(self, env):
         async def runner(argv, environ):
@@ -631,9 +666,9 @@ class TestEnvCommands:
     def test_env_list_shows_names_only(self, env):
         store = secrets.SecretStore(env.home("be-budi"), extra_env=())
         store.set("GH_PAT", SECRET)
-        store.set("DB_PASSWORD", "hunter2-hunter2")
+        store.set("MY_DB_PASSWORD", "hunter2-hunter2")
         text = run(commands.do_env_list(self._roster(env), "be-budi"))
-        assert "`GH_PAT`" in text and "`DB_PASSWORD`" in text and "2/40" in text
+        assert "`GH_PAT`" in text and "`MY_DB_PASSWORD`" in text and "2/40" in text
         assert SECRET not in text and "hunter2" not in text
         assert "Belum ada secret" in run(commands.do_env_list(self._roster(env), "be-be1"))
         assert "⚠️" not in text
@@ -2821,7 +2856,7 @@ class TestBudget(ScaleBase):
 
 
 class TestMetricsAndAlerts(ScaleBase):
-    KEYS = {"ts", "active_sessions", "active_by_user", "llm_inflight", "llm_inflight_peak_5m", "queue_len",
+    KEYS = {"schema", "ts", "active_sessions", "active_by_user", "llm_inflight", "llm_inflight_peak_5m", "queue_len",
             "queue_wait_p95_s", "refused", "http_429_last_minute", "effective_max_active", "configured_max_active",
             "throttled", "budget"}
 
@@ -2912,7 +2947,7 @@ class TestMetricsAndAlerts(ScaleBase):
         data = scale.build_metrics(self.rt, self.env.runner, d.probe, wall=lambda: NOON + 0.7)
         assert set(data) == self.KEYS
         assert data == {
-            "ts": int(NOON), "active_sessions": 2, "active_by_user": {S.U_BUDI: 1, S.U_BE1: 1},
+            "schema": 1, "ts": int(NOON), "active_sessions": 2, "active_by_user": {S.U_BUDI: 1, S.U_BE1: 1},
             "llm_inflight": 1, "llm_inflight_peak_5m": 2, "queue_len": 0, "queue_wait_p95_s": 0.0,
             "refused": {"rate": 0, "queue_full": 0, "budget": 0, "user_concurrent": 1},
             "http_429_last_minute": 3, "effective_max_active": 3, "configured_max_active": 6, "throttled": True,
@@ -2987,6 +3022,428 @@ class TestMetricsAndAlerts(ScaleBase):
             assert all(t.done() or t.cancelling() for t in ctx.spawned)
 
         run(main())
+
+
+# ============================================================================= lapisan adaptor upstream
+upstreammod = S.sub(P, "upstream")
+limiters = S.sub(P, "limiters")
+
+FORBIDDEN_IMPORT_ROOTS = {"gateway", "tools", "agent", "hermes_cli", "hermes_constants"}
+# Atribut privat runner/adapter/event Hermes: hanya upstream.py yang boleh menyebutnya (sebagai kode).
+PRIVATE_UPSTREAM_NAMES = {
+    "_session_key_for_source", "_is_session_running", "_running_agent_count", "_gate_env_snapshot",
+    "_get_allowed_channels", "_discord_free_response_channels", "_multiplex_profile_homes",
+    "_is_hermes_provider_credential", "register_vault_redaction_value", "rescan_gateway_profiles", "get_command",
+    "request_restart", "get_hermes_home",
+}   # (parse_profile_routes / match_profile_route / register_env_passthrough juga nama metode HermesGateway,
+#     jadi penyentuhan aslinya ditangkap oleh uji impor di atas)
+
+
+def _code_references(path):
+    """(import yang memuat internal Hermes, nama privat yang dipakai sebagai kode) di satu berkas — lewat AST,
+    jadi docstring/komentar yang menyebut nama itu tidak dihitung."""
+    import ast
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    imports, names = [], []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imports += [a.name for a in node.names if a.name.split(".")[0] in FORBIDDEN_IMPORT_ROOTS]
+        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+            if node.module.split(".")[0] in FORBIDDEN_IMPORT_ROOTS:
+                imports.append(node.module)
+        elif isinstance(node, ast.Call) and getattr(node.func, "attr", getattr(node.func, "id", "")) == "import_module":
+            if node.args and isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, str) \
+                    and node.args[0].value.split(".")[0] in FORBIDDEN_IMPORT_ROOTS:
+                imports.append(node.args[0].value)
+        if isinstance(node, ast.Attribute) and node.attr in PRIVATE_UPSTREAM_NAMES:
+            names.append(node.attr)
+        elif isinstance(node, ast.Constant) and isinstance(node.value, str) and node.value in PRIVATE_UPSTREAM_NAMES:
+            names.append(node.value)                                         # getattr(x, "_running_agent_count")
+        elif isinstance(node, ast.ImportFrom) and any(a.name in PRIVATE_UPSTREAM_NAMES for a in node.names):
+            names += [a.name for a in node.names if a.name in PRIVATE_UPSTREAM_NAMES]
+    return imports, names
+
+
+class TestUpstreamAdapterLayer:
+    """`upstream.py` adalah SATU-SATUNYA tempat yang menyentuh internal Hermes."""
+
+    def test_only_upstream_py_imports_hermes_internals(self):
+        offenders = {}
+        for path in sorted(S.PLUGIN_DIR.glob("*.py")):
+            if path.name == "upstream.py":
+                continue
+            imports, _names = _code_references(path)
+            if imports:
+                offenders[path.name] = imports
+        assert offenders == {}, ("import internal Hermes (gateway / tools. / agent. / hermes_cli / hermes_constants) "
+                                 f"hanya boleh di upstream.py: {offenders}")
+
+    def test_only_upstream_py_touches_private_runner_adapter_and_event_names(self):
+        offenders = {}
+        for path in sorted(S.PLUGIN_DIR.glob("*.py")):
+            if path.name == "upstream.py":
+                continue
+            _imports, names = _code_references(path)
+            if names:
+                offenders[path.name] = sorted(set(names))
+        assert offenders == {}, f"nama internal Hermes hanya boleh disentuh di upstream.py: {offenders}"
+
+    def test_the_scanner_itself_catches_violations(self, tmp_path):
+        bad = tmp_path / "bad.py"
+        bad.write_text("import gateway.run\nfrom tools.env_passthrough import x\nimport importlib\n"
+                       "importlib.import_module('agent.redact')\nfrom hermes_cli import config\n"
+                       "def f(g):\n    return g._running_agent_count(), getattr(g, '_is_session_running')\n")
+        imports, names = _code_references(bad)
+        assert sorted(imports) == ["agent.redact", "gateway.run", "hermes_cli", "tools.env_passthrough"]
+        assert sorted(names) == ["_is_session_running", "_running_agent_count"]
+        ok = tmp_path / "ok.py"
+        ok.write_text('"""menyebut _running_agent_count dan gateway di docstring"""\nimport os\n# from tools.x import y\n')
+        assert _code_references(ok) == ([], [])
+
+    def test_pure_ctx_registration_is_still_allowed_everywhere(self):
+        # register_* lewat PluginContext (ctx.register_hook, …) bukan internal: tidak termasuk daftar terlarang.
+        text = (S.PLUGIN_DIR / "__init__.py").read_text(encoding="utf-8")
+        assert "ctx.register_hook" in text and _code_references(S.PLUGIN_DIR / "__init__.py") == ([], [])
+
+    def test_capabilities_have_one_entry_per_upstream_api_with_a_stable_shape(self):
+        caps = upstreammod.HermesGateway().capabilities()
+        probes = {key for key, *_ in upstreammod._PROBES}
+        assert probes <= set(caps) and len(probes) == len(upstreammod._PROBES) >= 18
+        for key, entry in caps.items():
+            assert set(entry) == {"available", "reason"} and isinstance(entry["available"], bool), key
+            assert isinstance(entry["reason"], str) and entry["reason"], key
+        # tiap API internal yang dipakai kode muncul sebagai probe (nama atribut ada di tabel)
+        text = (S.PLUGIN_DIR / "upstream.py").read_text(encoding="utf-8")
+        for name in ("_session_key_for_source", "_is_session_running", "_running_agent_count", "_gate_env_snapshot",
+                     "_get_allowed_channels", "_discord_free_response_channels", "_multiplex_profile_homes"):
+            assert f'"{name}"' in text.split("def _source_text")[0], name
+
+    def test_capabilities_probe_reads_source_without_importing_it(self, tmp_path, monkeypatch):
+        pkg = tmp_path / "gateway"
+        pkg.mkdir()
+        (pkg / "__init__.py").write_text("raise RuntimeError('tidak boleh dijalankan')\n")
+        (pkg / "profile_routing.py").write_text("def parse_profile_routes(raw):\n    return raw\n")
+        monkeypatch.syspath_prepend(str(tmp_path))
+        monkeypatch.delitem(sys.modules, "gateway", raising=False)
+        shared.reset()
+        caps = upstreammod.HermesGateway().capabilities()
+        assert "gateway" not in sys.modules                                   # tidak ada kode hulu yang dijalankan
+        assert caps["gateway.profile_routing.parse_profile_routes"]["available"] is True
+        assert "sumber" in caps["gateway.profile_routing.parse_profile_routes"]["reason"]
+        assert caps["gateway.profile_routing.match_profile_route"]["available"] is False
+        assert caps["gateway.control_socket.rescan_gateway_profiles"]["available"] is False
+
+    def test_capabilities_check_loaded_modules_directly(self, monkeypatch):
+        fake = types.ModuleType("tools.env_passthrough")
+        fake.register_env_passthrough = lambda names: None
+        monkeypatch.setitem(sys.modules, "tools.env_passthrough", fake)
+        shared.reset()
+        caps = upstreammod.HermesGateway().capabilities()
+        assert caps["tools.env_passthrough.register_env_passthrough"]["available"] is True
+        assert caps["tools.env_passthrough._is_hermes_provider_credential"]["available"] is False
+
+    def test_register_writes_capabilities_json_atomically_with_schema_and_ctx_entries(self, env):
+        env.register("default")
+        path = env.state_dir / "capabilities.json"
+        doc = json.loads(path.read_text(encoding="utf-8"))
+        assert doc["schema"] == 1 and doc["plugin_version"] == shared.VERSION
+        assert set(doc) >= {"schema", "generated_at", "plugin_version", "hermes_version", "capabilities"}
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+        assert not [p for p in env.state_dir.iterdir() if p.name.startswith(".capabilities.json.")]   # tanpa sisa tmp
+        caps = doc["capabilities"]
+        assert caps["ctx.hook pre_gateway_dispatch"] == {"available": True, "reason": "terdaftar"}
+        assert "GatewayRunner._running_agent_count" in caps and "tools.env_passthrough._is_hermes_provider_credential" in caps
+
+    def test_capabilities_document_uses_injected_clock_and_unknown_keys_are_ignorable(self, tmp_path):
+        gw = upstreammod.HermesGateway()
+        path = gw.write_capabilities(tmp_path / "state", wall=lambda: NOON)
+        doc = json.loads(path.read_text(encoding="utf-8"))
+        assert doc["generated_at"] == "2027-01-15T08:00:00Z" and doc["schema"] == 1
+
+    def test_registered_failures_are_reported_as_unavailable(self, env):
+        class Old(S.StubContext):
+            def register_middleware(self, kind, callback):
+                raise AttributeError("no register_middleware")
+        ctx = Old({"state_dir": str(env.state_dir)})
+        P.register(ctx)
+        caps = json.loads((env.state_dir / "capabilities.json").read_text())["capabilities"]
+        assert caps["ctx.middleware llm_request"]["available"] is False
+        assert "AttributeError" in caps["ctx.middleware llm_request"]["reason"]
+
+    def test_rewrite_is_skipped_while_content_is_unchanged_and_fresh(self, tmp_path):
+        gw = upstreammod.HermesGateway()
+        path = gw.write_capabilities(tmp_path, wall=lambda: NOON)
+        before = path.stat().st_mtime_ns
+        gw.write_capabilities(tmp_path, wall=lambda: NOON + 3600)                 # isi sama, masih segar → tidak ditulis
+        assert path.stat().st_mtime_ns == before
+        gw.write_capabilities(tmp_path, wall=lambda: NOON + 7 * 3600)             # sudah basi → diperbarui
+        assert json.loads(path.read_text())["generated_at"] == "2027-01-15T15:00:00Z"
+        upstreammod.note_ctx("hook baru", True)
+        gw.write_capabilities(tmp_path, wall=lambda: NOON + 7 * 3600 + 1)         # isi berubah → ditulis
+        assert "ctx.hook baru" in json.loads(path.read_text())["capabilities"]
+
+    def test_unwritable_state_dir_never_raises(self, tmp_path):
+        blocker = tmp_path / "file"
+        blocker.write_text("x")
+        assert upstreammod.HermesGateway().write_capabilities(blocker / "sub") is None
+
+    def test_gateway_helpers_degrade_like_before(self):
+        gw = upstreammod.HermesGateway()
+        bare = types.SimpleNamespace()
+        assert gw.running_agent_count(bare) is None and gw.session_probe(bare) is None
+        assert gw.session_key(bare, object()) == "" and gw.session_running(bare, object()) is False
+        assert gw.event_get_command(types.SimpleNamespace()) == (False, None)
+        assert gw.event_get_command(types.SimpleNamespace(get_command=lambda: "stop")) == (True, "stop")
+        assert gw.event_get_command(types.SimpleNamespace(get_command=lambda: 1 / 0)) == (True, None)
+        checker = gw.provider_credential_checker()
+        assert checker is None or callable(checker)                           # Hermes terpasang (CI) → fungsi aslinya
+        assert isinstance(gw.register_env_passthrough([]), bool)
+
+
+# ============================================================================= pembatas berurutan (Limiter)
+class TestLimiterPipeline(ScaleBase):
+    def test_default_order_is_budget_rate_admission(self, d):
+        assert [lim.name for lim in self.rt.limiters] == ["budget", "rate", "admission"]
+        assert [lim.name for lim in limiters.default_limiters()] == ["budget", "rate", "admission"]
+        assert {a.name for a in (limiters.UserCap(), limiters.GlobalSlots())} == {"user_concurrency",
+                                                                                 "global_admission"}
+
+    def test_every_refusal_kind_has_one_message_and_metric(self):
+        for kind, (key, template) in limiters.REFUSAL_TEXT.items():
+            assert key and "{uid}" in template, kind
+        assert set(scale.REFUSAL_KINDS) >= {"rate", "queue_full", "budget", "user_concurrent"}
+
+    def test_added_limiter_is_consulted_in_order_and_refuses_through_the_single_path(self, d):
+        calls = []
+
+        class Recorder:
+            def __init__(self, name, verdict=None):
+                self.name, self.verdict = name, verdict
+
+            async def check(self, ctx):
+                calls.append((self.name, ctx.uid, ctx.admin, ctx.command))
+                return self.verdict
+
+        deny = limiters.Verdict("queue_full", "uji pembatas baru", "queue_full", {"wait": 7})
+        self.rt.limiters[:] = [Recorder("a"), Recorder("b", deny), Recorder("c")]
+        got = self.go(d, event(S.U_BUDI, S.CH_BUDI))
+        assert [c[0] for c in calls] == ["a", "b"]                            # berhenti di penolakan pertama
+        assert got == {"action": "skip", "reason": "team-guard: uji pembatas baru"}
+        assert self.rt.metrics.refused["queue_full"] == 1
+        assert any("masih penuh setelah 7 detik" in s for s in self.said())
+
+    def test_admin_and_exempt_commands_never_reach_any_limiter(self, d):
+        calls = []
+
+        class Boom:
+            name = "boom"
+
+            async def check(self, ctx):
+                calls.append(ctx.uid)
+                return limiters.Verdict("rate", "x", "rate", {"wait": 1, "rate": 1})
+
+        self.rt.limiters[:] = [Boom()]
+        assert self.go(d, event(S.ADMIN, S.CH_ADMIN)) is None
+        assert self.go(d, event(S.U_BUDI, S.CH_BUDI, "/stop")) is None
+        assert calls == []
+        assert self.go(d, event(S.U_BUDI, S.CH_BUDI, "/btw apa"))["action"] == "skip"
+        assert calls == [S.U_BUDI]
+
+    def test_context_carries_command_source_settings_and_clock(self, d):
+        seen = []
+
+        class Peek:
+            name = "peek"
+
+            async def check(self, ctx):
+                seen.append(ctx)
+
+        self.rt.limiters[:] = [Peek()]
+        self.go(d, event(S.U_BUDI, S.CH_BUDI, "/btw apa"))
+        ctx = seen[0]
+        assert (ctx.uid, ctx.admin, ctx.command, ctx.slash) == (S.U_BUDI, False, "btw", True)
+        assert ctx.source.chat_id == S.CH_BUDI and ctx.settings["rate_per_minute"] == 6
+        assert ctx.clock() == self.clock() and ctx.roster.guild_id == S.GUILD
+
+    def test_uncounted_refusal_is_not_in_metrics(self, d):
+        self.rt.limiters[:] = [type("L", (), {"name": "x", "check": staticmethod(
+            lambda ctx: _async(limiters.Verdict("queue_cancelled", "antrean dibatalkan", None)))})()]
+        got = self.go(d, event(S.U_BUDI, S.CH_BUDI))
+        assert got["reason"] == "team-guard: antrean dibatalkan" and sum(self.rt.metrics.refused.values()) == 0
+        assert any("dimuat ulang" in s for s in self.said())
+
+    def test_followup_runs_after_the_user_message(self, d):
+        order = []
+
+        async def follow():
+            order.append("admin")
+
+        async def check(ctx):
+            return limiters.Verdict("rate", "r", "rate", {"wait": 3, "rate": 6}, follow)
+
+        self.rt.limiters[:] = [type("L", (), {"name": "x", "check": staticmethod(check)})()]
+        self.go(d, event(S.U_BUDI, S.CH_BUDI))
+        assert order == ["admin"] and self.rt.metrics.refused["rate"] == 1 and "±3 detik" in self.said()[0]
+
+
+async def _async(value):
+    return value
+
+
+# ============================================================================= kontrak: skema roster / berkas keluaran
+class TestRosterSchemaContract(ScaleBase):
+    @pytest.fixture(autouse=True)
+    def _wired(self, d):
+        self.d = d
+
+    def _roster_file(self, **extra):
+        data = S.base_roster(self.env.state_dir, self.env.hermes_root)
+        data.update(extra)
+        return data
+
+    def test_hand_written_rosters_with_without_and_larger_schema(self):
+        assert rostermod.MAX_SUPPORTED_ROSTER_SCHEMA == 1
+        old = rostermod.Roster({"team_name": "lama", "guild_id": "1"})                  # tanpa `schema` (kit lama)
+        assert old.schema == 0 and old.newer_schema is False and old.team_name == "lama"
+        now = rostermod.Roster({"team_name": "kini", "schema": 1})
+        assert now.schema == 1 and now.newer_schema is False
+        future = rostermod.Roster({"team_name": "depan", "schema": 2, "kunci_baru": {"x": 1}, "guild_id": "7"})
+        assert future.schema == 2 and future.newer_schema is True
+        assert future.team_name == "depan" and future.guild_id == "7"                   # dibaca sebisanya
+        for bad in ("2", True, -1, 1.5, None, [1]):
+            assert rostermod.Roster({"schema": bad}).schema == 0, bad                   # bukan bilangan bulat sah
+        assert rostermod.Roster({}).schema == 0 and rostermod.Roster(None).schema == 0
+
+    def test_larger_schema_logs_once_and_still_works(self, caplog):
+        self.env.roster.update(schema=2, bagian_baru=[1, 2, 3])
+        self.env.save()
+        with caplog.at_level(logging.WARNING, logger="team-guard"):
+            roster = self.env.rt().roster(force=True)
+            self.env.rt().roster(force=True)
+        assert roster.schema == 2 and roster.users and roster.guild_id == S.GUILD
+        warned = [r for r in caplog.records if "skema 2" in r.getMessage()]
+        assert len(warned) == 1 and "memahami sampai 1" in warned[0].getMessage()
+
+    def test_supported_and_missing_schema_do_not_warn(self, caplog):
+        for extra in ({}, {"schema": 0}, {"schema": 1}):
+            shared.reset()
+            self.env.roster.pop("schema", None)
+            self.env.roster.update(extra)
+            self.env.save()
+            with caplog.at_level(logging.WARNING, logger="team-guard"):
+                roster = self.env.rt().roster(force=True)
+            assert roster.newer_schema is False
+        assert not [r for r in caplog.records if "skema" in r.getMessage()]
+
+    def test_admin_is_told_once_per_day_and_members_are_still_served(self, d):
+        self.rt.wall = lambda: NOON + (self.clock.now - 1000.0)
+        self.env.roster["schema"] = 2
+        self.env.save()
+        assert self.go(d, event(S.U_BUDI, S.CH_BUDI)) is None                     # tetap dilayani
+        assert self.go(d, event(S.U_BE1, S.CH_BE1)) is None
+        told = [s for s in self.admin_said() if "skema 2" in s]
+        assert len(told) == 1 and "memahami sampai skema 1" in told[0]
+        self.clock.advance(15 * 3600)                                             # 23:00 hari yang sama
+        self.go(d, event(S.U_BUDI, S.CH_BUDI))
+        assert len([s for s in self.admin_said() if "skema 2" in s]) == 1
+        self.clock.advance(2 * 3600)                                              # lewat tengah malam UTC
+        self.go(d, event(S.U_BUDI, S.CH_BUDI))
+        assert len([s for s in self.admin_said() if "skema 2" in s]) == 2
+
+    def test_notice_survives_restart_within_the_same_day(self):
+        self.env.roster["schema"] = 2
+        self.env.save()
+        rt = self.env.rt()
+        rt.wall = lambda: NOON
+        roster = rt.roster(force=True)
+        assert "skema 2" in rt.schema_notice(roster) and rt.schema_notice(roster) == ""
+        shared.reset()                                                            # proses baru, state dari onboarding.json
+        rt2 = self.env.rt()
+        rt2.wall = lambda: NOON + 3600
+        assert rt2 is not rt and rt2.schema_notice(rt2.roster(force=True)) == ""
+        rt2.wall = lambda: NOON + 86400
+        assert "skema 2" in rt2.schema_notice(rt2.roster(force=True))
+
+    def test_no_notice_for_supported_schema(self):
+        rt = self.env.rt()
+        assert rt.schema_notice(rostermod.Roster({"schema": 1})) == ""
+        assert rt.schema_notice(rostermod.Roster({})) == ""
+
+    def test_output_files_carry_schema_1_and_readers_ignore_unknown_keys(self, d):
+        self.rt.state.set_live(True, "ok")
+        onboarding = json.loads((self.env.state_dir / "onboarding.json").read_text())
+        assert onboarding["schema"] == 1 and onboarding["version"] == 1
+        assert list(scale.build_metrics(self.rt, None, d.probe))[0] == "schema"
+        assert scale.build_metrics(self.rt, None, d.probe)["schema"] == 1
+        assert upstreammod.HermesGateway().capabilities_document()["schema"] == 1
+        # pembaca mengabaikan kunci tak dikenal & mempertahankannya
+        path = self.env.state_dir / "onboarding.json"
+        path.write_text(json.dumps({"schema": 2, "version": 1, "kunci_masa_depan": {"a": 1}, "held": {"9": {}}}))
+        store = statemod.StateStore(path)
+        assert store.is_held("9") and store.data["kunci_masa_depan"] == {"a": 1} and store.data["schema"] == 2
+
+    def test_plugin_defaults_equal_the_documented_kit_defaults(self):
+        """Duplikat nilai bawaan (SETTINGS_DEFAULTS / ONBOARDING_DEFAULTS) dibandingkan dengan team.example.yaml.
+        Kit tidak diimpor: YAML-nya dibaca langsung. Pengecualian hanya untuk pembatas lanjutan yang SENGAJA mati
+        di plugin supaya roster lama (tanpa kuncinya) berperilaku seperti dulu."""
+        import yaml
+        team = yaml.safe_load((S.REPO / "team.example.yaml").read_text(encoding="utf-8"))
+        scale_y, secrets_y, onboarding_y = team["scale"], team["secrets"], team["onboarding"]
+        mapping = {
+            "rate_per_minute": scale_y["user_rate_per_minute"], "burst": scale_y["user_burst"],
+            "max_active": scale_y["max_concurrent_sessions"], "queue_max_wait": scale_y["queue_max_wait_seconds"],
+            "max_llm_parallel": scale_y["max_llm_parallel"], "daily_token_budget": scale_y["daily_token_budget"],
+            "team_daily_token_budget": scale_y["team_daily_token_budget"],
+            **{key: secrets_y[key] for key in ("max_keys", "min_length", "scrub_chat", "delete_secret_messages",
+                                                "block_env_dump", "hint", "allow_names", "deny_names")},
+        }
+        old_roster_off = {"user_max_concurrent": 0, "adaptive_throttle": False, "cron_min_interval_minutes": 0}
+        for key in old_roster_off:
+            assert key in scale_y, f"kit tidak lagi mendokumentasikan scale.{key}"
+        defaults = rostermod.SETTINGS_DEFAULTS
+        unmapped = set(defaults) - set(mapping) - set(old_roster_off)
+        assert unmapped == set(), f"setelan plugin tanpa padanan di team.example.yaml (perbarui uji ini): {unmapped}"
+        for key, documented in mapping.items():
+            assert defaults[key] == documented, f"settings.{key}: plugin={defaults[key]!r} kit={documented!r}"
+        for key, off in old_roster_off.items():
+            assert defaults[key] == off, f"settings.{key} harus MATI di plugin (roster lama): {defaults[key]!r}"
+        free_text = {"welcome_message", "welcome_back_message"}                    # contoh dikomentari di YAML
+        for key, value in rostermod.ONBOARDING_DEFAULTS.items():
+            if key in free_text:
+                assert value == "" and key not in onboarding_y
+            else:
+                assert key in onboarding_y, f"onboarding.{key} tidak ada di team.example.yaml"
+                assert onboarding_y[key] == value, f"onboarding.{key}: plugin={value!r} kit={onboarding_y[key]!r}"
+
+
+class TestPluginVersion:
+    def test_shared_version_comes_from_plugin_yaml(self):
+        import yaml
+        manifest = yaml.safe_load((S.PLUGIN_DIR / "plugin.yaml").read_text(encoding="utf-8"))
+        assert shared.VERSION == str(manifest["version"]) == P.__version__
+        assert 'VERSION = "' not in (S.PLUGIN_DIR / "shared.py").read_text(encoding="utf-8")   # tidak ditulis ganda
+
+    def test_regex_fallback_agrees_when_pyyaml_is_unavailable(self, monkeypatch):
+        monkeypatch.setitem(sys.modules, "yaml", None)                           # `import yaml` → ImportError
+        assert shared.read_manifest_version() == shared.VERSION
+
+    @pytest.mark.parametrize("text,expected", [
+        ('version: "9.8.7"\nname: x\n', "9.8.7"), ("name: x\nversion: 1.2.3  # komentar\n", "1.2.3"),
+        ("version: '4.5.6'\n", "4.5.6"), ("nama: x\n", "0.0.0"),
+    ])
+    def test_version_parsing_variants(self, tmp_path, monkeypatch, text, expected):
+        manifest = tmp_path / "plugin.yaml"
+        manifest.write_text(text)
+        assert shared.read_manifest_version(manifest) == expected
+        monkeypatch.setitem(sys.modules, "yaml", None)
+        assert shared.read_manifest_version(manifest) == expected
+
+    def test_missing_manifest_gives_placeholder_not_an_error(self, tmp_path):
+        assert shared.read_manifest_version(tmp_path / "tidak-ada.yaml") == "0.0.0"
+
+    def test_no_kit_version_is_hardcoded_in_the_plugin(self):
+        for path in S.PLUGIN_DIR.glob("*.py"):
+            assert "kit_version" not in path.read_text(encoding="utf-8"), path.name
 
 
 # ============================================================================= integrasi (butuh Hermes)
@@ -3078,6 +3535,24 @@ def upstream_env_names(root) -> dict:
     return groups
 
 
+def upstream_source_tokens(root) -> set:
+    """Semua token HURUF_BESAR_UTUH di berkas .py/.yaml/.yml NON-uji pohon sumber Hermes (statis, tanpa menjalankan)."""
+    import re
+    token = re.compile(r"(?<![A-Za-z0-9_])[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+(?![A-Za-z0-9_])")
+    skip = {"tests", "node_modules", ".git", "web", "website", "apps", "ui-tui", "tests-js", "evals", "locales"}
+    found: set = set()
+    for base, dirs, files in os.walk(str(root)):
+        dirs[:] = [d for d in dirs if d not in skip]
+        for name in files:
+            if name.endswith((".py", ".yaml", ".yml")) and not name.startswith("test_"):
+                try:
+                    with open(os.path.join(base, name), encoding="utf-8", errors="replace") as fh:
+                        found.update(token.findall(fh.read()))
+                except OSError:
+                    continue
+    return found
+
+
 class TestIntegrationEnvNames:
     """Pergeseran hulu: SETIAP nama env yang dikenal Hermes harus ditolak /env-set. Sumber Hermes diambil dari
     `HERMES_SOURCE_DIR` (pohon sumber, hanya dibaca) atau dari Hermes yang terpasang; tanpa keduanya DILEWATI."""
@@ -3093,13 +3568,35 @@ class TestIntegrationEnvNames:
         return root
 
     def test_every_upstream_env_name_is_rejected(self, source):
+        """Kebijakan akhir (daftar izin + daftar tolak): TIDAK ADA nama env Hermes yang diterima /env-set."""
         groups = upstream_env_names(source)
         assert len(groups.get("platform", ())) > 150 and len(groups.get("optional", ())) > 100, \
             "enumerasi hulu menyusut — struktur sumber Hermes berubah, perbarui upstream_env_names()"
         names = set().union(*groups.values())
         accepted = sorted(n for n in names if secrets.check_env_name(n)[0])
-        assert accepted == [], (f"{len(accepted)} dari {len(names)} nama env Hermes lolos /env-set — tambahkan "
-                                f"prefiksnya ke secrets.HERMES_PREFIXES / HERMES_NAMES: {accepted}")
+        assert accepted == [], (f"{len(accepted)} dari {len(names)} nama env Hermes lolos /env-set — periksa "
+                                f"secrets.DEV_TOOL_NAMES / awalan MY_: {accepted}")
+        assert [n for n in names if n.startswith(secrets.SAFE_PREFIX)] == [], \
+            "Hermes kini membaca nama berawalan MY_ — namespace anggota tidak lagi aman, pilih awalan lain"
+
+    def test_builtin_allowlisted_names_are_unknown_to_hermes(self, source):
+        """Setiap nama di secrets.DEV_TOOL_NAMES tidak boleh dikenal Hermes: bukan di enumerasi nama env hulu DAN
+        tidak muncul di berkas Python/YAML non-uji mana pun di pohon sumbernya (token utuh)."""
+        known = set().union(*upstream_env_names(source).values())
+        clash = sorted(secrets.DEV_TOOL_NAMES & known)
+        assert clash == [], f"Hermes kini mengenal nama allowlist ini — keluarkan dari DEV_TOOL_NAMES: {clash}"
+        mentioned = sorted(secrets.DEV_TOOL_NAMES & upstream_source_tokens(source))
+        assert mentioned == [], f"nama allowlist muncul di sumber Hermes (periksa pemakaiannya): {mentioned}"
+
+    def test_blocklist_coverage_of_upstream_names_is_advisory(self, source):
+        """Daftar tolak = lapis kedua. Nama Hermes yang lolos DAFTAR TOLAK (tetapi sudah ditolak daftar izin) hanya
+        diperingatkan, supaya CI tidak lagi memaksa mengejar nama baru satu per satu."""
+        import warnings
+        names = set().union(*upstream_env_names(source).values())
+        uncovered = sorted(n for n in names if secrets.ENV_NAME_RE.match(n) and not secrets.blocked_kind(n))
+        if uncovered:
+            warnings.warn(f"{len(uncovered)} nama env Hermes belum ada di daftar tolak (aman: daftar izin menolaknya): "
+                          f"{uncovered[:20]}", stacklevel=1)
 
     def test_runtime_tables_of_installed_hermes_are_rejected_too(self):
         """Dengan Hermes terpasang: tabel yang dibangun saat jalan (registri provider, blocklist sandbox)."""
@@ -3267,3 +3764,23 @@ class TestIntegrationWithRealHermes:
         for name in ("_running_agent_count", "request_restart", "_hm_pre_gateway_dispatch_hook",
                      "_is_session_running", "_session_key_for_source"):
             assert callable(getattr(GatewayRunner, name, None)), name
+
+    def test_adapter_layer_sees_every_internal_it_uses(self):
+        """Modul hulu sudah dimuat → capabilities() memeriksa objeknya langsung; semuanya harus ada."""
+        import importlib
+        for module in ("gateway.profile_routing", "gateway.control_socket", "gateway.restart", "gateway.run",
+                       "gateway.platforms.event", "plugins.platforms.discord.adapter", "tools.env_passthrough",
+                       "agent.redact", "hermes_constants"):
+            importlib.import_module(module)
+        shared.reset()
+        caps = upstreammod.HermesGateway().capabilities()
+        missing = sorted(k for k, v in caps.items() if not v["available"] and not k.startswith("ctx."))
+        assert missing == [], f"internal Hermes yang dipakai plugin hilang di versi ini: {missing}"
+
+    def test_adapter_layer_real_provider_blocklist_and_event_command(self):
+        from gateway.platforms.event import MessageEvent
+        gw = upstreammod.HermesGateway()
+        checker = gw.provider_credential_checker()
+        assert callable(checker) and checker("OPENAI_API_KEY") is True and checker("MY_OWN_TOKEN") is False
+        assert gw.event_get_command(MessageEvent(text="/stop")) == (True, "stop")
+

@@ -6,7 +6,8 @@ import os
 from pathlib import Path
 from typing import Callable, Iterable, Optional
 from kit_base import TeamError
-from kit.templates import SOUL_ADMIN, SOUL_LOBBY, SOUL_MEMBER, SOUL_SHARED, SOUL_TEAM_SKILLS_NOTE
+from kit.profiles import PROFILE_KINDS, SYSTEM_KINDS
+from kit.templates import SOUL_LOBBY, SOUL_MEMBER, SOUL_TEAM_SKILLS_NOTE
 from kit.util import atomic_write
 from kit.config import _lock_depth, reload_team, team_lock
 from kit.derive import active_members, host_settings, profile_settings, roster_data
@@ -78,7 +79,7 @@ def provision_role(team: dict, hermes: Hermes, key: str, *, force_soul: bool = F
     profile = team[key]["profile"]
     hermes.say(f" {profile}")
     created = hermes.create(profile, team["template"])
-    soul = (SOUL_SHARED if key == "shared" else SOUL_ADMIN).format(team_name=team["team_name"])
+    soul = PROFILE_KINDS[key].soul.format(team_name=team["team_name"])
     hermes.write_file(hermes.home(profile) / "SOUL.md", soul, force=force_soul or created, backup=not created)
     hermes.config_set(profile, profile_settings(team, key, hermes_bin=hermes.binary, hermes_root=hermes.root))
     hermes.install_plugin(profile)
@@ -196,7 +197,7 @@ def _cmd_apply(team: dict, hermes: Hermes, *, only: Optional[list[str]], host_on
                 on_member_error(member, exc)
         if not only:
             hermes.say("\n[3/4] Profile bersama & admin")
-            for key in ("shared", "admin"):
+            for key in SYSTEM_KINDS:
                 provision_role(team, hermes, key, force_soul=force_soul)
     hermes.say("\n[4/4] Host gateway (profile default)")
     provision_host(team, hermes)

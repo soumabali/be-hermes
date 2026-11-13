@@ -1,6 +1,6 @@
 """Lokasi berkas tim — SATU sumber kebenaran untuk hermes_team.py, kit_doctor.py, usage_ledger.py, usage_report.py.
 
-Hanya stdlib. Urutan penentuan team.yaml:
+Hanya stdlib (PyYAML dimuat malas hanya saat berkas dibaca). Urutan penentuan team.yaml:
   1. `--config <berkas>` (argumen `explicit`)
   2. env `HERMES_TEAM_DIR` (folder)
   3. `~/.hermes-team`
@@ -66,3 +66,44 @@ def cwd_notice(resolved: PathLike, cwd: Optional[PathLike] = None) -> Optional[s
         return None
     return (f"catatan: memakai {used}; ./team.yaml di folder ini TIDAK dipakai "
             f"(pilih dengan --config {shown} atau {ENV_VAR}={shown.parent})")
+
+
+# --------------------------------------------------------------------------- membaca team.yaml (SATU pembaca)
+def load_raw(team_yaml: Optional[PathLike] = None, *, strict: bool = False) -> dict:
+    """Isi MENTAH team.yaml (dict) — satu-satunya pembaca YAML team.yaml untuk alat ringan (usage_ledger,
+    usage_report, tools/usage_post, kit_doctor). Berkas hilang / rusak / bukan mapping → {} kecuali
+    `strict=True` (→ kit_base.TeamError berisi alasannya). Validasi nilai ada di kit_config (skema)."""
+    path = team_file(team_yaml)
+    try:
+        import yaml
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except Exception as exc:        # noqa: BLE001 — OSError, YAMLError, ImportError: semuanya = tidak terbaca
+        if strict:
+            from kit_base import TeamError
+            raise TeamError(f"{path} tidak terbaca ({type(exc).__name__}: {exc})")
+        return {}
+    if not isinstance(data, dict):
+        if strict:
+            from kit_base import TeamError
+            raise TeamError(f"{path}: isi teratas harus mapping")
+        return {}
+    return data
+
+
+def usage_view(team_yaml: Optional[PathLike] = None, *, raw: Optional[dict] = None) -> dict:
+    """Bagian `usage.*` TERVALIDASI ({"timezone", "report_channel_id", "reports": {daily, weekly, monthly}}).
+    Skemanya dari kit_config (diimpor malas supaya alat ringan tetap ringan); nilai salah → TeamError."""
+    import kit_config
+    return kit_config.usage_view(raw if raw is not None else load_raw(team_yaml))
+
+
+def usage_timezone(team_yaml: Optional[PathLike] = None) -> str:
+    """`usage.timezone` apa adanya (longgar: tidak pernah gagal, untuk penentu zona waktu di alat ringan)."""
+    usage = load_raw(team_yaml).get("usage")
+    return str((usage.get("timezone") if isinstance(usage, dict) else "") or "").strip()
+
+
+def profile_prefix(team_yaml: Optional[PathLike] = None, default: str = "be-") -> str:
+    """`profile_prefix` dari team.yaml: key tidak ada → `default`; string kosong sah (profile = nama anggota)."""
+    value = load_raw(team_yaml).get("profile_prefix", default)
+    return default if value is None else str(value)

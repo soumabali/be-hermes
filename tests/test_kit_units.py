@@ -18,6 +18,7 @@ import yaml
 import fake_discord as fd
 import hermes_team as ht
 from conftest import BE1, BOT_TOKEN, BUDI, CITRA, DODI, EKA, HOST_ONLY_SECRET
+from conftest import patch_kit as patch_kit_everywhere
 
 VIEW = ht.PERM["VIEW_CHANNEL"]
 BE1_UID, BE1_CH = BE1["discord_user_id"], BE1["channel_id"]
@@ -70,7 +71,7 @@ def hide_scanner(monkeypatch, kit):
     menghapus PYTHONPATH, yang tidak berpengaruh bila Hermes asli terpasang di Python uji (job integrasi CI):
     pemindai asli tetap ditemukan dan menjawab "safe". Menambal penentu interpreter berlaku di kedua keadaan."""
     monkeypatch.delenv("PYTHONPATH", raising=False)
-    monkeypatch.setattr(ht, "_hermes_python", lambda _binary: None)
+    patch_kit_everywhere(monkeypatch, "_hermes_python", lambda _binary: None)
 
 
 class TestIds:
@@ -642,7 +643,7 @@ class TestApply:
         assert not (kit.state / "roster.json").exists()
         assert "gateway" not in kit.config("default")              # rute belum menunjuk ke profile yang tidak ada
 
-    def test_roster_written_after_profiles_exist(self, kit, monkeypatch):
+    def test_roster_written_after_profiles_exist(self, kit, monkeypatch, patch_kit):
         seen = {}
         real = ht.write_roster
 
@@ -650,7 +651,7 @@ class TestApply:
             seen["profiles"] = sorted(p.name for p in (kit.root / "profiles").iterdir())
             seen["routes"] = "gateway" in kit.config("default")
             return real(team, hermes)
-        monkeypatch.setattr(ht, "write_roster", spy)
+        patch_kit("write_roster", spy)
         ht.cmd_apply(kit.team(), kit.hermes())
         assert {"be-be1", "be-budi", "team-admin", "team-shared"} <= set(seen["profiles"]) and seen["routes"]
         assert kit.roster()["users"][BE1_UID]["profile"] == "be-be1"
@@ -1494,10 +1495,10 @@ class TestMain:
         assert "--only" in str(exit_info.value.code) and "bedu" in str(exit_info.value.code)
         assert kit.calls() == []
 
-    def test_unexpected_exception_is_normalised(self, kit, monkeypatch, capsys):       # #17
+    def test_unexpected_exception_is_normalised(self, kit, monkeypatch, capsys, patch_kit):       # #17
         def boom(*_a, **_k):
             raise RuntimeError("kejutan internal")
-        monkeypatch.setattr(ht, "cmd_apply", boom)
+        patch_kit("cmd_apply", boom)
         with pytest.raises(SystemExit) as exit_info:
             ht.main(cli(kit, "apply"))
         captured = capsys.readouterr()
@@ -1505,19 +1506,19 @@ class TestMain:
         assert "tak terduga" in str(exit_info.value.code) and "RuntimeError: kejutan internal" in str(exit_info.value.code)
         assert "Traceback" not in captured.err and "Traceback" not in captured.out
 
-    def test_debug_flag_shows_traceback(self, kit, monkeypatch, capsys):               # #17
+    def test_debug_flag_shows_traceback(self, kit, monkeypatch, capsys, patch_kit):               # #17
         def boom(*_a, **_k):
             raise RuntimeError("kejutan internal")
-        monkeypatch.setattr(ht, "cmd_apply", boom)
+        patch_kit("cmd_apply", boom)
         monkeypatch.setenv("HERMES_TEAM_DEBUG", "1")
         with pytest.raises(SystemExit):
             ht.main(cli(kit, "apply"))
         assert "Traceback (most recent call last)" in capsys.readouterr().err
 
-    def test_unexpected_exception_with_events_emits_error_event(self, kit, monkeypatch, capsys):   # #17
+    def test_unexpected_exception_with_events_emits_error_event(self, kit, monkeypatch, capsys, patch_kit):   # #17
         def boom(*_a, **_k):
             raise KeyError("kolom hilang")
-        monkeypatch.setattr(ht, "onboard_member", boom)
+        patch_kit("onboard_member", boom)
         with pytest.raises(SystemExit) as exit_info:
             ht.main(cli(kit, "onboard", "--user-id", DODI, "--events"))
         lines = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
@@ -1586,14 +1587,14 @@ class TestLlmKey:
             ht.main(cli(kit, "llm-key", "be1", "--stdin"))
         assert "kosong" in str(exit_info.value.code)
 
-    def test_read_modify_write_happens_under_team_lock(self, kit, monkeypatch):
+    def test_read_modify_write_happens_under_team_lock(self, kit, monkeypatch, patch_kit):
         depths = []
         real = ht.atomic_write
 
         def spy(path, text, mode=0o600):
             depths.append(ht._lock_depth())
             return real(path, text, mode=mode)
-        monkeypatch.setattr(ht, "atomic_write", spy)
+        patch_kit("atomic_write", spy)
         monkeypatch.setattr("sys.stdin", io.StringIO("sk-dari-pipe-123456\n"))
         ht.main(cli(kit, "llm-key", "shared", "--stdin"))
         assert depths == [1]
@@ -2141,10 +2142,10 @@ class TestSandboxPerMember:
             ht.main(cli(kit, "set-sandbox", "budi", "--memory-mb", "12"))
         assert "set-sandbox.memory_mb" in str(exit_info.value)
 
-    def test_check_shows_overrides_and_worst_case_total(self, kit, capsys, monkeypatch, tmp_path):
+    def test_check_shows_overrides_and_worst_case_total(self, kit, capsys, monkeypatch, tmp_path, patch_kit):
         meminfo = tmp_path / "meminfo"
         meminfo.write_text("MemTotal:       16384000 kB\nMemFree:  1 kB\n")
-        monkeypatch.setattr(ht, "MEMINFO_PATH", meminfo)
+        patch_kit("MEMINFO_PATH", meminfo)
         kit.write_members([BE1, self.BUDI_BIG, {**CITRA_ROW, "active": False, "sandbox": {"memory_mb": 8192}}])
         team = kit.team()
         assert ht.host_memory_mb() == 16000 and ht.sandbox_worst_case_mb(team) == 1024 + 4096 + 2048
@@ -2157,22 +2158,22 @@ class TestSandboxPerMember:
         assert "MELEBIHI" not in out and "melebihi RAM server" not in out
 
     def test_warning_when_worst_case_exceeds_host_ram_and_meminfo_may_be_absent(self, kit, capsys, monkeypatch,
-                                                                              tmp_path):
+                                                                              tmp_path, patch_kit):
         meminfo = tmp_path / "meminfo"
         meminfo.write_text("MemTotal:        4096000 kB\n")
-        monkeypatch.setattr(ht, "MEMINFO_PATH", meminfo)
+        patch_kit("MEMINFO_PATH", meminfo)
         kit.write_members([BE1, self.BUDI_BIG])
         ht.main(cli(kit, "check"))
         out = capsys.readouterr().out
         assert "MELEBIHI" in out and "Plafon RAM sandbox terburuk 7168 MB melebihi RAM server 4000 MB" in out
         assert out.rstrip().endswith("Konfigurasi valid.")                           # peringatan, bukan kegagalan
-        monkeypatch.setattr(ht, "MEMINFO_PATH", tmp_path / "tidak-ada")
+        patch_kit("MEMINFO_PATH", tmp_path / "tidak-ada")
         assert ht.host_memory_mb() is None and ht.sandbox_warnings(kit.team()) == []
         ht.main(cli(kit, "check"))
         out = capsys.readouterr().out
         assert "plafon RAM terburuk 7168 MB" in out and "RAM server" not in out
         meminfo.write_text("isi aneh\n")
-        monkeypatch.setattr(ht, "MEMINFO_PATH", meminfo)
+        patch_kit("MEMINFO_PATH", meminfo)
         assert ht.host_memory_mb() is None
 
     def test_keys_still_pinned_by_an_old_managed_file_are_skipped_with_a_warning(self, kit, capsys):
@@ -2645,10 +2646,10 @@ class TestRemoveMember:                                                         
         assert not (kit.state / "shared-skills" / "deploy").exists()
         assert (kit.home("be-be1") / "skills" / "lint").is_dir()                      # skill asli be1 utuh
 
-    def test_holds_the_team_lock(self, applied, monkeypatch):
+    def test_holds_the_team_lock(self, applied, monkeypatch, patch_kit):
         depths = []
         real = ht.save_members
-        monkeypatch.setattr(ht, "save_members", lambda team: (depths.append(ht._lock_depth()), real(team))[1])
+        patch_kit("save_members", lambda team: (depths.append(ht._lock_depth()), real(team))[1])
         ht.remove_member(applied.team(), applied.hermes(), "budi")
         assert depths and min(depths) >= 1
 
@@ -2815,3 +2816,243 @@ class TestSelftestScript:
         proc, _ = _selftest(tmp_path, "tests/tidak-ada-berkas-ini.py", "-q", HERMES_PYTHON=sys.executable,
                             HERMES_SRC=str(source))
         assert proc.returncode not in (0, 3) and "✗ GAGAL" in proc.stdout
+
+
+
+# --------------------------------------------------------------------------- skema, jenis profile, fasad, versi
+import kit_base  # noqa: E402
+import kit_config  # noqa: E402
+import kit_contracts  # noqa: E402
+import kit_paths  # noqa: E402
+from kit import profiles as kit_profiles  # noqa: E402
+
+# Nama yang dulu terbuka lewat `hermes_team` (sebelum dipecah ke paket kit/). Dipakai teamctl, kit_setup,
+# kit_doctor, plugin, dan uji — tidak boleh hilang; boleh bertambah.
+FACADE_NAMES = """
+    ALIAS_RE ALLOW_PLACEHOLDERS_ENV AUX_TASKS Any BATCH_ENTRY_KEYS BOT_ALLOW CRON_TOOLSET CSV_KEYS Callable
+    DEFAULT_TEAM_DIR DEFAULT_USER_COMMANDS DEFAULT_WELCOME DEFAULT_WELCOME_BACK DM_DECLINE_MESSAGE
+    DiscordAPI DiscordHTTPError ELEVATED_MASK ELEVATED_PERMISSIONS ENV_NAME_RE ENV_PLACEHOLDER GOAL_COMMANDS
+    GUARD_VERDICTS HOST_SIDE_TOOLSETS Hermes ID_RE Iterable KIT_DIR KIT_SKILLS KIT_VERSION LIVE_KEYS
+    LLM_KEYS LLM_MODEL_KEYS LOBBY_DISABLED_TOOLSETS MEMBERS_FILE_KEYS MEMBER_ALLOW MEMBER_KEYS MEMINFO_PATH
+    MODEL_COMPRESSION_KEYS MemberList NAME_RE ONBOARDING_DEFAULTS Optional PERM PERMISSIONS
+    PERMISSION_ALIASES PLACEHOLDER_ID_RE PLUGIN_NAME PLUGIN_SRC PROFILE_RE PROFILE_SCOPED_KEYS Path
+    REPORT_KINDS RESERVED_NAMES RESERVED_SKILL_NAMES RESTART_KEYS ROLE_KEYS SANDBOX_CPU_RANGE
+    SANDBOX_DEFAULT_MEMORY_MB SANDBOX_KEYS SANDBOX_MEMORY_MB_RANGE SCALE_DEFAULTS SCALE_MIN_ONE
+    SECRETS_DEFAULTS SECRET_LIKE_KEYS SECRET_NAME_RE SERVER_ADMIN_DEFAULTS SHARED_CATEGORY SOUL_ADMIN
+    SOUL_LOBBY SOUL_MEMBER SOUL_SHARED SOUL_TEAM_SKILLS_NOTE SYSTEM_PROFILE_KEYS TEAMCTL THREAD_KEYS
+    TOP_LEVEL_KEYS TeamError USAGE_KEYS WORKER_DISABLED_TOOLSETS _FALSE_WORDS _LEAK_PATTERNS _PlainDumper
+    _SKIP_DIRS _TEAM_LOCK _TRUE_WORDS _assert_private_channel _bool _changed_host_keys _channel_conflict
+    _check_new_name _check_only _closing_quote _cmd_apply _cmd_llm_key _cmd_managed _cmd_membership
+    _cmd_onboard_batch _cmd_remove_member _commit_member _common_args _copy_shared_skill _debug_enabled
+    _discord _ensure_member_channel _ensure_member_channel_ex _env_entries _fail _find_reusable_channel
+    _find_skill _flatten _frontmatter _get_nested _hermes_python _hermes_skill_guard _id _install_skill_copy
+    _int _llm_key_target _load_llm _load_member _load_onboarding _load_usage _lock_depth _member_state_stale
+    _members_unknown_keys _membership_summary _new_private_channel _number _onboard_channel
+    _onboard_existing _parse_args _plan_onboard _print_apply_tail _print_warnings _profile
+    _profile_registry_path _profile_secret_values _read_yaml_file _report_time _rollback_member _run _same
+    _sandbox_cleanup_commands _sandbox_override _save_registry _secret_like_keys _set_model _set_sandbox
+    _share_skill _store_member _taken_names _team_unknown_keys _tree_hash _unknown_keys _unquote_double
+    _unshare_skill _unstore_member _validate_model_compression _validate_new_member _validate_unique
+    active_members add_member annotations argparse atomic_write base64 build_routes clean_display_name
+    cli_value cmd_apply compression_limits compression_settings contextlib copy datetime default_team_file
+    default_user_commands derive_member_name describe difflib discord_token dump_yaml ensure_template
+    fallback_warnings fcntl file_lock gateway_channels getpass hashlib host_memory_mb host_settings http
+    install_managed json kit_paths list_skills load_batch_file load_team main managed_blocked_warning
+    managed_config managed_diff managed_diff_clean managed_diff_lines managed_dir managed_install_command
+    managed_yaml members_lock model_alias model_settings nested_yaml now_iso offboard_member onboard_batch
+    onboard_member os parse_env_text permission_bits permission_names placeholder_ids placeholder_message
+    placeholders_allowed plugin_settings private_overwrites profile_settings provision_host provision_member
+    provision_role re reload_team remove_member remove_member_plan resolve_hermes_bin restart_needed
+    rewrite_env_text roster_data sandbox_limits sandbox_settings sandbox_warnings sandbox_worst_case_mb
+    save_members scan_skill scoped_settings secret_variants set_member_active set_model set_sandbox
+    share_skill shared_skill_registry shlex shutil soul_member stage_skill subprocess sync_parking sys
+    team_lock teamctl_server tempfile threading time timezone traceback unicodedata unshare_skill urllib
+    used_model_aliases worker_disabled_toolsets write_roster yaml
+""".split()
+
+
+class TestFacade:
+    def test_every_name_the_monolith_exposed_is_still_there(self):
+        missing = [name for name in FACADE_NAMES if not hasattr(ht, name)]
+        assert missing == []
+
+    def test_public_aliases_for_teamctl_helpers(self):
+        assert ht.taken_names is ht._taken_names and ht.check_new_name is ht._check_new_name
+
+    def test_script_runs_from_any_directory_without_pythonpath(self, tmp_path):
+        import sys
+        env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+        proc = subprocess.run([sys.executable, str(ht.KIT_DIR / "hermes_team.py"), "--version"], cwd=tmp_path, env=env,
+                              capture_output=True, text=True, timeout=60)
+        assert proc.returncode == 0 and ht.KIT_VERSION in proc.stdout, proc.stderr
+
+    def test_soul_texts_are_loaded_from_template_files_unchanged(self):
+        from kit import templates
+        for name in ("SOUL_MEMBER", "SOUL_SHARED", "SOUL_ADMIN", "SOUL_LOBBY", "DEFAULT_WELCOME"):
+            assert getattr(ht, name) is getattr(templates, name) and getattr(ht, name).strip()
+        assert not ht.DEFAULT_WELCOME.endswith("\n") and ht.SOUL_MEMBER.endswith("\n")
+        assert "{display_name}" in ht.SOUL_MEMBER and "{team_name}" in ht.SOUL_SHARED
+        assert (ht.KIT_DIR / "kit" / "templates" / "soul_member.md").is_file()
+
+
+class TestVersionSource:
+    def test_version_file_is_the_single_source(self):
+        text = (ht.KIT_DIR / "VERSION").read_text(encoding="utf-8").strip()
+        assert kit_base.KIT_VERSION == text == kit_base.read_version() == ht.KIT_VERSION
+
+    def test_fallback_constant_matches_version_file(self):
+        assert kit_base._FALLBACK_VERSION == (ht.KIT_DIR / "VERSION").read_text(encoding="utf-8").strip()
+
+    def test_missing_or_garbled_file_falls_back(self, tmp_path):
+        assert kit_base.read_version(tmp_path / "tidak-ada") == kit_base._FALLBACK_VERSION
+        (tmp_path / "VERSION").write_text("bukan versi\n", encoding="utf-8")
+        assert kit_base.read_version(tmp_path / "VERSION") == kit_base._FALLBACK_VERSION
+
+
+class TestProfileKinds:
+    def test_reserved_names_are_the_historic_set(self):
+        assert ht.RESERVED_NAMES == {"all", "semua", "all-members", "shared", "admin", "lobby", "default", "main",
+                                     "template"}
+
+    def test_registry_shape(self):
+        kinds = kit_profiles.PROFILE_KINDS
+        assert list(kinds) == ["member", "template", "shared", "admin", "lobby"]
+        assert kit_profiles.SYSTEM_KINDS == ("shared", "admin")
+        assert kit_profiles.MODEL_TARGETS == ("shared", "admin", "lobby")
+        assert kinds["template"].alias_kind == "member" and kinds["admin"].cron_exempt
+        assert kinds["member"].per_member and not kinds["member"].reserved
+        assert kinds["lobby"].settings is None
+        assert kinds["lobby"].extra_disabled_toolsets == tuple(ht.LOBBY_DISABLED_TOOLSETS)
+
+    def test_settings_come_from_the_registry_and_lobby_is_not_a_worker(self, kit):
+        team = kit.team()
+        with pytest.raises(ValueError):
+            ht.profile_settings(team, "lobby")
+        with pytest.raises(ValueError):
+            ht.profile_settings(team, "bukan-jenis")
+        for role in ("member", "template", "shared", "admin"):
+            keys = [k for k, _ in ht.profile_settings(team, role)]
+            assert keys[0] == "agent.disabled_toolsets" and keys[-1].startswith("plugins.entries.")
+        assert "mcp_servers.teamctl" in dict(ht.profile_settings(team, "admin"))
+        assert "mcp_servers.teamctl" not in dict(ht.profile_settings(team, "shared"))
+
+    def test_souls_by_kind(self):
+        assert kit_profiles.PROFILE_KINDS["shared"].soul is ht.SOUL_SHARED
+        assert kit_profiles.PROFILE_KINDS["admin"].soul is ht.SOUL_ADMIN
+        assert kit_profiles.PROFILE_KINDS["template"].soul is ht.SOUL_MEMBER
+
+
+class TestConfigSchema:
+    def test_scale_defaults_come_from_the_table(self):
+        assert ht.SCALE_DEFAULTS == kit_config.defaults("scale")
+        assert ht.SECRETS_DEFAULTS == kit_config.defaults("secrets")
+        assert ht.ONBOARDING_DEFAULTS == kit_config.defaults("onboarding")
+
+    def test_roster_sections_are_derived_from_flagged_rows_only(self, kit):
+        team = kit.team()
+        roster = ht.roster_data(team, kit.root, "hermes")
+        for section in ("settings", "onboarding"):
+            assert set(roster[section]) == {f.plugin_key for f in kit_config.plugin_fields(section)}
+        assert roster["settings"]["max_active"] == team["scale"]["max_concurrent_sessions"]
+        assert roster["settings"]["rate_per_minute"] == team["scale"]["user_rate_per_minute"]
+        assert roster["onboarding"] == team["onboarding"]
+        assert roster["usage"]["timezone"] == team["usage"]["timezone"]
+        assert roster["live_reload"] is team["live_reload"] and roster["restart_fallback"] == team["restart_fallback"]
+        # setelan yang TIDAK ditegakkan plugin tidak bocor ke roster
+        assert "agent_max_turns" not in roster["settings"] and "allow_goals" not in roster["settings"]
+
+    def test_one_row_adds_a_plugin_enforced_setting_end_to_end(self, kit, monkeypatch):
+        row = kit_config.Field("scale.demo_limit", "int", 7, "contoh", min=1, plugin_key="demo_limit")
+        monkeypatch.setattr(kit_config, "FIELDS", kit_config.FIELDS + (row,))
+        monkeypatch.setattr(kit_config, "FIELD_BY_PATH", {**kit_config.FIELD_BY_PATH, row.path: row})
+        team = kit.team()
+        assert team["scale"]["demo_limit"] == 7
+        assert ht.roster_data(team, kit.root, "hermes")["settings"]["demo_limit"] == 7
+        kit.write_team(scale={"demo_limit": "12"})
+        assert kit.team()["scale"]["demo_limit"] == 12
+        assert not any("demo_limit" in w for w in kit.team()["warnings"])
+        kit.write_team(scale={"demo_limit": 0})
+        with pytest.raises(ht.TeamError, match=r"scale\.demo_limit: minimal 1"):
+            kit.team()
+
+    def test_typed_errors_name_the_key(self, kit):
+        for patch, needle in (
+                ({"scale": {"user_burst": "banyak"}}, r"scale\.user_burst"),
+                ({"scale": {"busy_input_mode": "x"}}, r"scale\.busy_input_mode harus queue, interrupt, atau steer"),
+                ({"secrets": {"max_keys": 0}}, r"secrets\.max_keys: minimal 1"),
+                ({"secrets": {"allow_names": "A"}}, r"secrets\.allow_names: harus daftar"),
+                ({"onboarding": {"enabled": "mungkin"}}, r"onboarding\.enabled"),
+                ({"onboarding": {"welcome_message": ""}}, r"onboarding\.welcome_message: wajib diisi"),
+                ({"onboarding": {"bogus": 1}}, r"onboarding\.bogus: tidak dikenal"),
+                ({"threads": {"personal": "x"}}, r"threads\.personal"),
+                ({"restart_fallback": "kadang"}, r"restart_fallback harus idle atau manual"),
+                ({"usage": {"reports": {"daily": 630}}}, r"usage\.reports\.daily"),
+                ({"usage": {"reports": {"hourly": "08:00"}}}, r"usage\.reports\.hourly: tidak dikenal"),
+                ({"sandbox": {"memory_mb": 8}}, r"sandbox\.memory_mb: minimal 64")):
+            kit.write_team(**patch)
+            with pytest.raises(ht.TeamError, match=needle):
+                kit.team()
+
+    def test_unknown_key_warnings_keep_their_format(self, kit):
+        kit.write_team(scale={"max_concurent_sessions": 3}, usage={"timezon": "UTC"}, ekstra=1)
+        warnings = kit.team()["warnings"]
+        assert ("team.yaml: key 'scale.max_concurent_sessions' tidak dikenal dan DIABAIKAN "
+                "(maksudnya 'max_concurrent_sessions'?)") in warnings
+        assert any("usage.timezon" in w and "maksudnya 'timezone'?" in w for w in warnings)
+        assert any(w.startswith("team.yaml: key 'ekstra' tidak dikenal dan DIABAIKAN (pilihan: ") for w in warnings)
+
+    def test_example_file_documents_exactly_the_schema(self):
+        text = (ht.KIT_DIR / "team.example.yaml").read_text(encoding="utf-8")
+        missing, unknown = kit_config.check_example(text)
+        assert missing == [], (f"team.example.yaml belum mendokumentasikan: {missing} "
+                               "(lihat `python3 kit_config.py --emit-example-section <bagian>`)")
+        assert unknown == [], f"team.example.yaml memuat key yang tidak ada di skema: {unknown}"
+
+    def test_check_example_flags_gaps_and_strangers(self):
+        missing, unknown = kit_config.check_example("team_name: X\nscale:\n  user_burst: 1\n  tidak_ada: 2\nfoo: 1\n")
+        assert "scale.user_rate_per_minute" in missing and "guild_id" in missing
+        assert "scale.tidak_ada" in unknown and "foo" in unknown
+
+    def test_doc_generators(self, capsys):
+        assert kit_config.main(["--emit-example-section", "secrets"]) == 0
+        out = capsys.readouterr().out
+        assert out.startswith("secrets:\n  max_keys: 40") and "deny_names: []" in out
+        assert kit_config.main(["--emit-example-section", "tidak-ada"]) == 1
+        capsys.readouterr()
+        ht.main(["config-doc"])
+        table = capsys.readouterr().out
+        assert table.startswith("| key | tipe | default | plugin | deskripsi |")
+        assert "| `scale.user_rate_per_minute` | int |" in table and "settings.rate_per_minute" in table
+        assert all(f"`{f.path}`" in table for f in kit_config.FIELDS if f.path != "members")
+
+    def test_usage_view_validates_with_the_same_schema(self, tmp_path):
+        team_file = tmp_path / "team.yaml"
+        team_file.write_text("usage:\n  timezone: Asia/Makassar\n  report_channel_id: '400000000000000001'\n"
+                             "  reports: {daily: '8:05'}\n", encoding="utf-8")
+        view = kit_paths.usage_view(team_file)
+        assert view == {"timezone": "Asia/Makassar", "report_channel_id": "400000000000000001",
+                        "reports": {"daily": "08:05", "weekly": "", "monthly": ""}}
+        team_file.write_text("usage:\n  reports: {daily: 630}\n", encoding="utf-8")
+        with pytest.raises(ht.TeamError, match=r"usage\.reports\.daily"):
+            kit_paths.usage_view(team_file)
+        assert kit_paths.load_raw(tmp_path / "tidak-ada.yaml") == {} and kit_paths.usage_timezone(team_file) == ""
+        with pytest.raises(ht.TeamError):
+            kit_paths.load_raw(tmp_path / "tidak-ada.yaml", strict=True)
+        assert kit_paths.profile_prefix(tmp_path / "tidak-ada.yaml") == "be-"
+        team_file.write_text("profile_prefix: ''\n", encoding="utf-8")
+        assert kit_paths.profile_prefix(team_file) == ""
+
+
+class TestRosterContract:
+    def test_roster_carries_schema_and_exactly_the_promised_keys(self, kit):
+        data = ht.roster_data(kit.team(), kit.root, "hermes")
+        assert data["schema"] == kit_contracts.ROSTER_SCHEMA == 1 and data["version"] == 3
+        assert set(data) == kit_contracts.keys_of(kit_contracts.Roster)
+        assert set(data["kit"]) == kit_contracts.keys_of(kit_contracts.RosterKit)
+        assert set(data["gateway"]) == kit_contracts.keys_of(kit_contracts.RosterGateway)
+        assert set(data["usage"]) == kit_contracts.keys_of(kit_contracts.RosterUsage)
+        assert set(next(iter(data["users"].values()))) == kit_contracts.keys_of(kit_contracts.RosterUser)
+
+    def test_written_roster_json_has_the_schema_key(self, kit):
+        ht.cmd_apply(kit.team(), kit.hermes())
+        assert kit.roster()["schema"] == kit_contracts.ROSTER_SCHEMA

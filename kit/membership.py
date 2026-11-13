@@ -10,7 +10,8 @@ from typing import Any, Callable, Iterable, Optional
 import yaml
 from kit_base import TeamError, _id
 from kit_discord import PERM, discord_token, private_overwrites, DiscordAPI
-from kit.constants import NAME_RE, RESERVED_NAMES
+from kit.constants import NAME_RE
+from kit.profiles import MODEL_TARGETS, PROFILE_KINDS, RESERVED_NAMES, SYSTEM_KINDS
 from kit.util import _profile, clean_display_name
 from kit.config import _sandbox_override, _validate_unique, load_team, members_lock, reload_team, save_members, team_lock
 from kit.derive import _get_nested, compression_settings, model_settings, sandbox_limits, sandbox_settings, sandbox_worst_case_mb
@@ -26,6 +27,10 @@ def _check_new_name(team: dict, name: str) -> str:
     if name in RESERVED_NAMES:
         raise TeamError(f"nama '{name}' dipakai sistem; pilih nama lain")
     return name
+
+
+# Nama publik untuk dua pembantu yang dipakai teamctl_mcp.py (nama bergaris bawah tetap ada demi kompatibilitas).
+check_new_name = _check_new_name
 
 
 def _store_member(team: dict, hermes: Hermes, member: dict, *, replace: bool = False) -> None:
@@ -67,9 +72,12 @@ def _taken_names(team: dict, hermes: Hermes) -> set[str]:
     yang sudah ada (sisa anggota lama yang dihapus dari members.yaml masih menyimpan .env/memory/skill)."""
     prefix = team["prefix"]
     taken = {m["name"] for m in team["members"]}
-    profiles = hermes.profile_dirs() | {team["template"], team["shared"]["profile"], team["admin"]["profile"]}
+    profiles = hermes.profile_dirs() | {team["template"], *(team[kind]["profile"] for kind in SYSTEM_KINDS)}
     taken |= {p[len(prefix):] for p in profiles if p.startswith(prefix) and len(p) > len(prefix)}
     return taken
+
+
+taken_names = _taken_names
 
 
 def _validate_new_member(team: dict, hermes: Hermes, *, name: str, user_id: str, model: str = "",
@@ -84,7 +92,7 @@ def _validate_new_member(team: dict, hermes: Hermes, *, name: str, user_id: str,
         if m["user_id"] == user_id:
             raise TeamError(f"user {user_id} sudah terdaftar sebagai '{m['name']}'")
     profile = _profile(f"{team['prefix']}{name}", "name")
-    if profile in (team["template"], team["shared"]["profile"], team["admin"]["profile"]):
+    if profile in (team["template"], *(team[kind]["profile"] for kind in SYSTEM_KINDS)):
         raise TeamError(f"nama '{name}' menghasilkan profile '{profile}' yang dipakai sistem; pilih nama lain")
     if hermes.dir_exists(profile):
         raise TeamError(
@@ -100,10 +108,9 @@ def _validate_new_member(team: dict, hermes: Hermes, *, name: str, user_id: str,
 
 def _channel_conflict(team: dict, channel_id: str, user_id: str) -> str:
     """Kenapa channel ini tidak boleh jadi channel pribadi user tsb. ('' = boleh)."""
-    if channel_id == team["shared"]["channel_id"]:
-        return "itu channel bersama"
-    if channel_id == team["admin"]["channel_id"]:
-        return "itu channel admin"
+    for kind in SYSTEM_KINDS:
+        if channel_id == team[kind]["channel_id"]:
+            return f"itu {PROFILE_KINDS[kind].channel_label}"
     if channel_id == team["category_id"]:
         return "itu kategori, bukan channel"
     for m in team["members"]:
@@ -490,6 +497,150 @@ def load_batch_file(path: Path) -> list:
     return raw
 
 
+def _batch_validate(team: dict, hermes: Hermes, entries: list) -> list[dict]:
+    """Langkah 1 onboard_batch: validasi SEMUA entri tanpa efek samping. `probe` ikut memuat anggota baru yang
+    sudah direncanakan supaya nama turunan dan keunikan dicek terhadap sesama isi berkas."""
+    probe = dict(team)
+    probe["members"] = list(team["members"])
+    items: list[dict] = []
+    errors: list[str] = []
+    seen: set[str] = set()
+    for i, entry in enumerate(entries):
+        where = f"entri[{i}]"
+        try:
+            if not isinstance(entry, dict):
+                raise TeamError("harus mapping {user_id, username?, display_name?, name?, model?}")
+            unknown = sorted(str(k) for k in entry if k not in BATCH_ENTRY_KEYS)
+            if unknown:
+                raise TeamError(f"key tidak dikenal: {', '.join(unknown)}")
+            user_id = _id(entry.get("user_id") or entry.get("discord_user_id"), "user_id")
+            if user_id in seen:
+                raise TeamError(f"user {user_id} muncul dua kali di berkas")
+            plan = _plan_onboard(probe, hermes, user_id=user_id,
+                                 username=str(entry.get("username") or ""),
+                                 display_name=str(entry.get("display_name") or ""),
+                                 name=str(entry.get("name") or ""), model=str(entry.get("model") or ""))
+        except TeamError as exc:
+            errors.append(f"{where}: {exc}")
+            continue
+        seen.add(user_id)
+        if plan["kind"] == "created":
+            probe["members"].append(dict(plan["member"], channel_id=f"batch-{i}"))
+        items.append({"index": i, "user_id": user_id, "plan": plan, "notes": [], "status": plan["kind"],
+                      "channel_created": False, "error": "", "result": {}})
+    if errors:
+        raise TeamError("berkas onboarding massal tidak valid, tidak ada yang diubah:\n  - "
+                        + "\n  - ".join(errors))
+    return items
+
+
+def _batch_fail(item: dict, exc: BaseException, undone: Iterable[str] = ()) -> None:
+    item["status"] = "failed"
+    item["error"] = str(exc) + (f" — dibatalkan: {'; '.join(undone)}" if undone else "")
+
+
+def _batch_emitter(emit: Callable[..., None], item: dict) -> Callable[..., None]:
+    return lambda event, **fields: emit(event, user_id=item["user_id"], **fields)
+
+
+def _batch_channels(team: dict, hermes: Hermes, items: list[dict], api: Optional[DiscordAPI],
+                    emit: Callable[..., None]) -> None:
+    """Langkah 2: channel untuk semua (anggota yang sudah aktif hanya dipastikan/disembuhkan seperti biasa)."""
+    for item in items:
+        plan = item["plan"]
+        try:
+            if plan["kind"] == "exists":
+                item["result"] = _onboard_existing(team, hermes, plan["previous"], api, _batch_emitter(emit, item),
+                                                   item["notes"])
+                plan["member"] = item["result"]["member"]
+                continue
+            item["channel_created"] = _onboard_channel(team, hermes, plan, api, _batch_emitter(emit, item),
+                                                       item["notes"])
+            if hermes.dry_run and plan["kind"] == "created":
+                plan["member"]["channel_id"] = str(10 ** 18 - 1 - item["index"])  # unik per entri
+        except TeamError as exc:
+            _batch_fail(item, exc)
+
+
+def _batch_store(team: dict, hermes: Hermes, items: list[dict], api: Optional[DiscordAPI]) -> dict[str, dict]:
+    """Langkah 3: members.yaml untuk semua yang channel-nya siap → {nama anggota: item} yang menunggu apply."""
+    pending: dict[str, dict] = {}
+    for item in items:
+        plan = item["plan"]
+        if item["status"] == "failed" or plan["kind"] == "exists":
+            continue
+        member = plan["member"]
+        item["had_dir"] = hermes.dir_exists(member["profile"])
+        try:
+            if hermes.dry_run:   # `_store_member` tidak menulis saat dry-run → kumpulkan di memori saja
+                team["members"] = [m for m in team["members"] if m["user_id"] != member["user_id"]] + [member]
+                _validate_unique(team)
+            else:
+                _store_member(team, hermes, member, replace=plan["previous"] is not None)
+        except TeamError as exc:
+            _batch_fail(item, exc, _rollback_member(team, hermes, api, member, previous=plan["previous"],
+                                                    stored=False, remove_dir=False,
+                                                    channel_created=item["channel_created"]))
+            continue
+        pending[member["name"]] = item
+    return pending
+
+
+def _batch_apply(team: dict, hermes: Hermes, items: list[dict], pending: dict[str, dict],
+                 api: Optional[DiscordAPI]) -> dict:
+    """Langkah 4: SATU apply untuk semuanya. Profile yang gagal dibuat dibatalkan saat itu juga (pembatal yang
+    sama dengan onboarding tunggal: entri members.yaml, folder setengah jadi, channel baru), sehingga rute dan
+    roster yang ditulis di akhir apply hanya memuat anggota yang berhasil."""
+    summary: dict = {"created": [], "restart_needed": False, "live_changed": []}
+
+    def merge(result: dict) -> None:
+        summary["created"] = list(dict.fromkeys(summary["created"] + list(result.get("created", []))))
+        summary["restart_needed"] = summary["restart_needed"] or bool(result.get("restart_needed"))
+        summary["live_changed"] = sorted(set(summary["live_changed"]) | set(result.get("live_changed", [])))
+
+    def undo(item: dict, exc: BaseException) -> None:
+        plan = item["plan"]
+        _batch_fail(item, exc, _rollback_member(
+            team, hermes, api, plan["member"], previous=plan["previous"], stored=True,
+            remove_dir=not item["had_dir"], channel_created=item["channel_created"]))
+
+    for item in items:
+        if item["plan"]["kind"] == "exists" and item["status"] != "failed":
+            merge(item["result"])
+    if pending:
+        try:
+            merge(cmd_apply(team, hermes, only=list(pending),
+                            sync_shared=[n for n, it in pending.items() if it["plan"]["kind"] == "reactivated"],
+                            on_member_error=lambda member, exc: undo(pending[member["name"]], exc)))
+        except Exception as exc:  # noqa: BLE001 — gagal di luar profile anggota (template, host gateway)
+            if hermes.dry_run:
+                raise
+            for item in pending.values():
+                if item["status"] != "failed":
+                    undo(item, exc)
+            # Samakan lagi host gateway + roster dengan members.yaml yang sekarang (tanpa anggota batal).
+            try:
+                merge(cmd_apply(team, hermes, only=[], host_only=True))
+            except Exception as sync_exc:  # noqa: BLE001
+                hermes.failures.append(f"sinkronisasi host setelah pembatalan gagal: {sync_exc}")
+    return summary
+
+
+def _batch_report(hermes: Hermes, items: list[dict]) -> list[dict]:
+    members = []
+    for item in items:
+        member = item["plan"]["member"]
+        marker = f" {shlex.join(Hermes.profile_args(member['profile']))} "
+        own = [f for f in hermes.failures if marker in f]
+        if item["status"] == "failed":
+            own = [item["error"]] + own
+        elif item["plan"]["kind"] == "exists":
+            own = list(dict.fromkeys(list(item["result"].get("failures", [])) + own))
+        members.append({"status": item["status"], "user_id": item["user_id"], "member": member,
+                        "notes": item["notes"], "failures": own})
+    return members
+
+
 def onboard_batch(team: dict, hermes: Hermes, entries: Iterable[Any], *, api: Optional[DiscordAPI] = None,
                   emit: Optional[Callable[..., None]] = None) -> dict:
     """Onboarding banyak orang sekaligus (hari pertama): validasi SEMUA entri → semua channel → semua
@@ -503,130 +654,13 @@ def onboard_batch(team: dict, hermes: Hermes, entries: Iterable[Any], *, api: Op
     entries = list(entries)
     with team_lock(team):
         reload_team(team)
-        # --- 1. validasi semua, tanpa efek samping. `probe` ikut memuat anggota baru yang sudah direncanakan
-        #        supaya nama turunan dan keunikan dicek terhadap sesama isi berkas.
-        probe = dict(team)
-        probe["members"] = list(team["members"])
-        items: list[dict] = []
-        errors: list[str] = []
-        seen: set[str] = set()
-        for i, entry in enumerate(entries):
-            where = f"entri[{i}]"
-            try:
-                if not isinstance(entry, dict):
-                    raise TeamError("harus mapping {user_id, username?, display_name?, name?, model?}")
-                unknown = sorted(str(k) for k in entry if k not in BATCH_ENTRY_KEYS)
-                if unknown:
-                    raise TeamError(f"key tidak dikenal: {', '.join(unknown)}")
-                user_id = _id(entry.get("user_id") or entry.get("discord_user_id"), "user_id")
-                if user_id in seen:
-                    raise TeamError(f"user {user_id} muncul dua kali di berkas")
-                plan = _plan_onboard(probe, hermes, user_id=user_id,
-                                     username=str(entry.get("username") or ""),
-                                     display_name=str(entry.get("display_name") or ""),
-                                     name=str(entry.get("name") or ""), model=str(entry.get("model") or ""))
-            except TeamError as exc:
-                errors.append(f"{where}: {exc}")
-                continue
-            seen.add(user_id)
-            if plan["kind"] == "created":
-                probe["members"].append(dict(plan["member"], channel_id=f"batch-{i}"))
-            items.append({"index": i, "user_id": user_id, "plan": plan, "notes": [], "status": plan["kind"],
-                          "channel_created": False, "error": "", "result": {}})
-        if errors:
-            raise TeamError("berkas onboarding massal tidak valid, tidak ada yang diubah:\n  - "
-                            + "\n  - ".join(errors))
+        items = _batch_validate(team, hermes, entries)
         if not hermes.dry_run and any(it["plan"]["kind"] != "exists" for it in items):
             api = _discord(hermes, api)
-
-        def member_emit(item: dict) -> Callable[..., None]:
-            return lambda event, **fields: emit(event, user_id=item["user_id"], **fields)
-
-        def fail(item: dict, exc: BaseException, undone: Iterable[str] = ()) -> None:
-            item["status"] = "failed"
-            item["error"] = str(exc) + (f" — dibatalkan: {'; '.join(undone)}" if undone else "")
-
-        # --- 2. channel untuk semua (anggota yang sudah aktif hanya dipastikan/disembuhkan seperti biasa)
-        for item in items:
-            plan = item["plan"]
-            try:
-                if plan["kind"] == "exists":
-                    item["result"] = _onboard_existing(team, hermes, plan["previous"], api, member_emit(item),
-                                                       item["notes"])
-                    plan["member"] = item["result"]["member"]
-                    continue
-                item["channel_created"] = _onboard_channel(team, hermes, plan, api, member_emit(item),
-                                                           item["notes"])
-                if hermes.dry_run and plan["kind"] == "created":
-                    plan["member"]["channel_id"] = str(10 ** 18 - 1 - item["index"])  # unik per entri
-            except TeamError as exc:
-                fail(item, exc)
-        # --- 3. members.yaml untuk semua yang channel-nya siap
-        pending: dict[str, dict] = {}
-        for item in items:
-            plan = item["plan"]
-            if item["status"] == "failed" or plan["kind"] == "exists":
-                continue
-            member = plan["member"]
-            item["had_dir"] = hermes.dir_exists(member["profile"])
-            try:
-                if hermes.dry_run:   # `_store_member` tidak menulis saat dry-run → kumpulkan di memori saja
-                    team["members"] = [m for m in team["members"] if m["user_id"] != member["user_id"]] + [member]
-                    _validate_unique(team)
-                else:
-                    _store_member(team, hermes, member, replace=plan["previous"] is not None)
-            except TeamError as exc:
-                fail(item, exc, _rollback_member(team, hermes, api, member, previous=plan["previous"],
-                                                 stored=False, remove_dir=False,
-                                                 channel_created=item["channel_created"]))
-                continue
-            pending[member["name"]] = item
-        # --- 4. SATU apply untuk semuanya. Profile yang gagal dibuat dibatalkan saat itu juga (pembatal yang
-        #        sama dengan onboarding tunggal: entri members.yaml, folder setengah jadi, channel baru),
-        #        sehingga rute dan roster yang ditulis di akhir apply hanya memuat anggota yang berhasil.
-        summary: dict = {"created": [], "restart_needed": False, "live_changed": []}
-
-        def merge(result: dict) -> None:
-            summary["created"] = list(dict.fromkeys(summary["created"] + list(result.get("created", []))))
-            summary["restart_needed"] = summary["restart_needed"] or bool(result.get("restart_needed"))
-            summary["live_changed"] = sorted(set(summary["live_changed"]) | set(result.get("live_changed", [])))
-
-        def undo(item: dict, exc: BaseException) -> None:
-            plan = item["plan"]
-            fail(item, exc, _rollback_member(
-                team, hermes, api, plan["member"], previous=plan["previous"], stored=True,
-                remove_dir=not item["had_dir"], channel_created=item["channel_created"]))
-
-        for item in items:
-            if item["plan"]["kind"] == "exists" and item["status"] != "failed":
-                merge(item["result"])
-        if pending:
-            try:
-                merge(cmd_apply(team, hermes, only=list(pending),
-                                sync_shared=[n for n, it in pending.items() if it["plan"]["kind"] == "reactivated"],
-                                on_member_error=lambda member, exc: undo(pending[member["name"]], exc)))
-            except Exception as exc:  # noqa: BLE001 — gagal di luar profile anggota (template, host gateway)
-                if hermes.dry_run:
-                    raise
-                for item in pending.values():
-                    if item["status"] != "failed":
-                        undo(item, exc)
-                # Samakan lagi host gateway + roster dengan members.yaml yang sekarang (tanpa anggota batal).
-                try:
-                    merge(cmd_apply(team, hermes, only=[], host_only=True))
-                except Exception as sync_exc:  # noqa: BLE001
-                    hermes.failures.append(f"sinkronisasi host setelah pembatalan gagal: {sync_exc}")
-        members = []
-        for item in items:
-            member = item["plan"]["member"]
-            marker = f" {shlex.join(Hermes.profile_args(member['profile']))} "
-            own = [f for f in hermes.failures if marker in f]
-            if item["status"] == "failed":
-                own = [item["error"]] + own
-            elif item["plan"]["kind"] == "exists":
-                own = list(dict.fromkeys(list(item["result"].get("failures", [])) + own))
-            members.append({"status": item["status"], "user_id": item["user_id"], "member": member,
-                            "notes": item["notes"], "failures": own})
+        _batch_channels(team, hermes, items, api, emit)
+        pending = _batch_store(team, hermes, items, api)
+        summary = _batch_apply(team, hermes, items, pending, api)
+        members = _batch_report(hermes, items)
         failed = [m for m in members if m["status"] == "failed"]
         return {"members": members, "failed": failed, **summary,
                 "failures": [f"{m['member']['name']} ({m['user_id']}): {m['failures'][0]}" for m in failed]
@@ -677,7 +711,7 @@ def _set_model(team: dict, hermes: Hermes, target: str, alias: str) -> dict:
     with members_lock(Path(team["paths"]["team_file"])):
         fresh = load_team(Path(team["paths"]["team_file"]), Path(team["paths"]["members_file"]))
         touched: list[tuple[str, str, Optional[dict]]] = []
-        if target in ("shared", "admin", "lobby"):
+        if target in MODEL_TARGETS:
             fresh["model_overrides"][target] = alias
             profile = "default" if target == "lobby" else fresh[target]["profile"]
             touched.append((target, profile, None))

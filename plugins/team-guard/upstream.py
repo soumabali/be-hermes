@@ -31,6 +31,7 @@ import os
 import re
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Optional
 
@@ -40,6 +41,7 @@ from .state import atomic_write, now_iso
 
 CAPABILITIES_SCHEMA = 1
 CAPABILITIES_FILE = "capabilities.json"
+CAPABILITIES_REFRESH = 6 * 3600.0       # detik; isi yang sama tidak ditulis ulang selama ini
 _SOURCE_LIMIT = 4_000_000
 
 ENV_ALLOWED = "DISCORD_ALLOWED_CHANNELS"
@@ -351,12 +353,22 @@ class HermesGateway:
                 "hermes_version": hermes_version(), "capabilities": self.capabilities()}
 
     def write_capabilities(self, state_dir: Any, wall: Callable[[], float] = time.time) -> Optional[Path]:
-        """Tulis `<state_dir>/capabilities.json` (atomik, 0600). Gagal → satu log; tidak pernah melempar."""
+        """Tulis `<state_dir>/capabilities.json` (atomik, 0600). Isi sama dan masih segar (< 6 jam) → tidak
+        ditulis ulang (tiap profile + tiap proses `hermes config set` memuat plugin ini). Gagal → satu log."""
         import json
         path = Path(str(state_dir)).expanduser() / CAPABILITIES_FILE
         try:
-            atomic_write(path, json.dumps(self.capabilities_document(wall), indent=2, ensure_ascii=False,
-                                          sort_keys=True) + "\n", 0o600)
+            doc = self.capabilities_document(wall)
+            try:
+                old = json.loads(path.read_text(encoding="utf-8"))
+                same = all(old.get(k) == doc[k] for k in ("schema", "plugin_version", "hermes_version", "capabilities"))
+                fresh = (wall() - datetime.strptime(str(old.get("generated_at")), "%Y-%m-%dT%H:%M:%SZ")
+                         .replace(tzinfo=timezone.utc).timestamp()) < CAPABILITIES_REFRESH
+                if same and fresh:
+                    return path
+            except (OSError, ValueError, AttributeError, TypeError):
+                pass
+            atomic_write(path, json.dumps(doc, indent=2, ensure_ascii=False, sort_keys=True) + "\n", 0o600)
         except Exception as exc:
             log_once("capabilities-write", "capabilities.json tidak bisa ditulis (%s: %s)", type(exc).__name__, exc)
             return None

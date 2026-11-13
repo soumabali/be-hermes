@@ -320,6 +320,29 @@ def kit(tmp_path, monkeypatch):
     return k
 
 
+def patch_kit(monkeypatch, name, value):
+    """Timpa fungsi/konstanta kit di SEMUA tempat kode mencarinya: fasad `hermes_team` dan tiap modul `kit.*`
+    yang punya nama itu (kode di kit/ memanggil nama di modulnya sendiri, jadi menimpa fasad saja tidak terlihat
+    oleh kode yang diuji). Gagal bila tidak ada modul kit yang punya nama itu (supaya uji tidak lolos hampa)."""
+    import importlib
+    import pkgutil
+    import kit as kit_pkg
+    hit = []
+    for info in pkgutil.iter_modules(kit_pkg.__path__):
+        mod = importlib.import_module(f"kit.{info.name}")
+        if name in vars(mod):
+            monkeypatch.setattr(mod, name, value)
+            hit.append(mod.__name__)
+    assert hit, f"tidak ada modul kit.* yang punya {name}"
+    monkeypatch.setattr(ht, name, value)
+    return hit
+
+
+@pytest.fixture(name="patch_kit")
+def _patch_kit_fixture(monkeypatch):
+    return lambda name, value: patch_kit(monkeypatch, name, value)
+
+
 @pytest.fixture(autouse=True)
 def _no_real_discord(monkeypatch):
     """Tanpa server tiruan, panggilan Discord apa pun harus gagal cepat, bukan keluar ke internet."""

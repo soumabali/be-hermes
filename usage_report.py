@@ -26,9 +26,8 @@ import time
 from pathlib import Path
 from typing import Optional
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-import kit_paths  # noqa: E402
-import usage_ledger  # noqa: E402
+import kit_paths
+import usage_ledger
 
 COLUMNS = ("api_call_count", "input_tokens", "output_tokens", "cache_read_tokens",
            "cache_write_tokens", "reasoning_tokens", "estimated_cost_usd", "actual_cost_usd")

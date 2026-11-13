@@ -9,9 +9,11 @@ import sys
 import traceback
 from pathlib import Path
 from typing import Any, Optional
+import kit_config
 import kit_paths
 from kit_base import KIT_VERSION, TeamError, rewrite_env_text
 from kit.constants import PLUGIN_NAME
+from kit.profiles import PROFILE_KINDS, SYSTEM_KINDS
 from kit.util import atomic_write
 from kit.config import load_team, placeholder_ids, placeholder_message, placeholders_allowed, reload_team, team_lock
 from kit.derive import _get_nested, active_members, fallback_warnings, host_memory_mb, host_settings, install_managed, managed_diff, managed_diff_clean, managed_diff_lines, managed_install_command, managed_yaml, model_alias, nested_yaml, sandbox_limits, sandbox_warnings, sandbox_worst_case_mb
@@ -77,7 +79,8 @@ def describe(team: dict, hermes: Optional[Hermes] = None) -> str:
         model = model_alias(team, "member", m) if llm else "-"
         state = "" if m["active"] else "  [NONAKTIF]"
         lines.append(f"{m['channel_id']:<21} {m['profile']:<18} {model:<14} pribadi {m['display_name']}{state}")
-    for key, note in (("shared", "bersama, @mention → thread"), ("admin", "admin, tanpa @mention")):
+    for key in SYSTEM_KINDS:
+        note = PROFILE_KINDS[key].note
         model = model_alias(team, key) if llm else "-"
         lines.append(f"{team[key]['channel_id']:<21} {team[key]['profile']:<18} {model:<14} {note}")
     lobby_model = model_alias(team, "lobby") if llm else "-"
@@ -117,7 +120,7 @@ def describe(team: dict, hermes: Optional[Hermes] = None) -> str:
     if hermes is not None:
         lines.append("")
         for profile in [team["template"], *(m["profile"] for m in team["members"]),
-                        team["shared"]["profile"], team["admin"]["profile"], "default"]:
+                        *(team[kind]["profile"] for kind in SYSTEM_KINDS), "default"]:
             cfg = hermes.read_config(profile)
             ok = hermes.exists(profile)
             plugin = PLUGIN_NAME in (_get_nested(cfg, "plugins.enabled") or [])
@@ -248,10 +251,11 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     p.add_argument("profile", help="nama anggota, shared, admin, atau default")
     p.add_argument("--stdin", action="store_true",
                    help="baca key dari stdin (satu baris), untuk dipakai dari skrip/pipe")
+    sub.add_parser("config-doc", help="cetak tabel setelan team.yaml (Markdown) dari skema kit_config")
     return parser.parse_args(argv)
 
 
-def _run(args: argparse.Namespace, events: bool) -> None:
+def _open_team(args: argparse.Namespace, events: bool) -> tuple[dict, Hermes, str]:
     team_file = kit_paths.team_file(args.config)
     notice = None if args.config else kit_paths.cwd_notice(team_file)
     if notice:
@@ -261,36 +265,109 @@ def _run(args: argparse.Namespace, events: bool) -> None:
     except TeamError as exc:
         _fail(f"konfigurasi: {exc}", events, code=1)
     hermes_bin = resolve_hermes_bin(args.hermes_bin)
-    hermes = Hermes(hermes_bin, Path(args.hermes_root), dry_run=args.dry_run, quiet=events)
-    placeholders = [] if placeholders_allowed(args.allow_placeholders) else placeholder_ids(team)
+    return team, Hermes(hermes_bin, Path(args.hermes_root), dry_run=args.dry_run, quiet=events), hermes_bin
 
+
+def _run_readonly(args: argparse.Namespace, team: dict, hermes: Hermes, placeholders: list[str]) -> bool:
+    """Perintah yang tidak mengubah apa pun. True bila `args.command` termasuk di sini (sudah dijalankan)."""
     if args.command == "check":
         print(describe(team))
         _print_warnings(team)
         if placeholders:
             sys.exit("\nKonfigurasi BELUM siap: " + placeholder_message(placeholders))
         print("\nKonfigurasi valid.")
-        return
-    if args.command == "managed":
+    elif args.command == "managed":
         _cmd_managed(team, args)
-        return
-    if args.command == "host-yaml":
+    elif args.command == "host-yaml":
         print(nested_yaml(host_settings(team)), end="")
-        return
-    if args.command == "status":
+    elif args.command == "status":
         print(describe(team, hermes))
         _print_warnings(team)
-        return
-    if args.command == "apply" and placeholders:
-        sys.exit("apply ditolak: " + placeholder_message(placeholders))
-    if args.command == "list-skills":
+    elif args.command == "list-skills":
         member = next((m for m in team["members"] if m["name"] == args.member), None)
         if member is None:
             sys.exit(f"anggota '{args.member}' tidak ada")
         for s in list_skills(hermes, member["profile"]):
             print(f"{s['path']:<40} {s['description']}")
-        return
+    else:
+        return False
+    return True
 
+
+def _do_apply(team: dict, hermes: Hermes, args: argparse.Namespace) -> None:
+    only = [n.strip() for n in args.only.split(",") if n.strip()] or None
+    result = cmd_apply(team, hermes, only=only, host_only=args.host_only, force_soul=args.force_soul)
+    _print_apply_tail(team, hermes, result)
+
+
+def _do_add_member(team: dict, hermes: Hermes, args: argparse.Namespace) -> None:
+    result = add_member(team, hermes, name=args.name, user_id=args.discord_user_id,
+                        display_name=args.display_name, model=args.model, channel_id=args.channel_id,
+                        create_channel=not args.channel_id)
+    for note in result["notes"]:
+        print(f"  • {note}")
+    _print_apply_tail(team, hermes, result)
+
+
+def _do_set_model(team: dict, hermes: Hermes, args: argparse.Namespace) -> None:
+    result = set_model(team, hermes, args.target, args.model)
+    print(f"Model {result['target']} → {result['model']} ({', '.join(result['profiles'])}). "
+          "Berlaku untuk sesi baru (/new).")
+    _print_warnings(team, hermes)
+
+
+def _do_set_sandbox(team: dict, hermes: Hermes, args: argparse.Namespace) -> None:
+    result = set_sandbox(team, hermes, args.member, memory_mb=args.memory_mb, cpu=args.cpu, reset=args.reset)
+    kind = "pengecualian" if result["override"] else "bawaan tim"
+    print(f"Sandbox {result['name']} ({result['profile']}): {result['memory_mb']} MB, {result['cpu']} CPU "
+          f"({kind}). Plafon RAM terburuk tim: {result['worst_case_mb']} MB.")
+    if not result["applied"]:
+        print("Anggota ini nonaktif: tersimpan di members.yaml, diterapkan saat ia diaktifkan lagi.")
+    else:
+        print("Berlaku saat container sandbox profile itu dibuat lagi; container yang sudah ada tetap "
+              "memakai batas lama sampai dihapus (docker rm) — /workspace tersimpan di volume.")
+    _print_warnings(team, hermes)
+
+
+def _do_set_active(team: dict, hermes: Hermes, args: argparse.Namespace) -> None:
+    _print_apply_tail(team, hermes, set_member_active(team, hermes, args.name, args.state == "on"))
+
+
+def _do_share_skill(team: dict, hermes: Hermes, args: argparse.Namespace) -> None:
+    result = share_skill(team, hermes, args.skill, args.from_member, args.to.split(","), args.overwrite,
+                         allow_unscanned=args.allow_unscanned)
+    print(json.dumps(result, indent=2, ensure_ascii=False))
+
+
+def _do_unshare_skill(team: dict, hermes: Hermes, args: argparse.Namespace) -> None:
+    print(json.dumps(unshare_skill(team, hermes, args.skill, args.from_members.split(",")), indent=2,
+                     ensure_ascii=False))
+
+
+# Perintah yang mengubah sesuatu dan berjalan di dalam `try/except TeamError` yang sama (hasil → "gagal: …").
+_MUTATING = {
+    "apply": _do_apply,
+    "add-member": _do_add_member,
+    "set-model": _do_set_model,
+    "set-sandbox": _do_set_sandbox,
+    "set-active": _do_set_active,
+    "remove-member": lambda team, hermes, args: _cmd_remove_member(team, hermes, args),
+    "share-skill": _do_share_skill,
+    "unshare-skill": _do_unshare_skill,
+    "llm-key": lambda team, hermes, args: _cmd_llm_key(team, hermes, args.profile, use_stdin=args.stdin),
+}
+
+
+def _run(args: argparse.Namespace, events: bool) -> None:
+    if args.command == "config-doc":        # tidak butuh team.yaml: tabel dari skema (kit_config.FIELDS)
+        sys.stdout.write(kit_config.markdown_table())
+        return
+    team, hermes, hermes_bin = _open_team(args, events)
+    placeholders = [] if placeholders_allowed(args.allow_placeholders) else placeholder_ids(team)
+    if _run_readonly(args, team, hermes, placeholders):
+        return
+    if args.command == "apply" and placeholders:
+        sys.exit("apply ditolak: " + placeholder_message(placeholders))
     if os.geteuid() == 0 and not args.dry_run and not args.allow_root:
         sys.exit("Jangan jalankan sebagai root; pakai user Linux yang menjalankan Hermes.")
     if not args.dry_run and not Path(hermes_bin).exists() and not shutil.which(hermes_bin):
@@ -302,48 +379,7 @@ def _run(args: argparse.Namespace, events: bool) -> None:
         _cmd_onboard_batch(team, hermes, args, events)
         return
     try:
-        if args.command == "apply":
-            only = [n.strip() for n in args.only.split(",") if n.strip()] or None
-            result = cmd_apply(team, hermes, only=only, host_only=args.host_only, force_soul=args.force_soul)
-            _print_apply_tail(team, hermes, result)
-        elif args.command == "add-member":
-            result = add_member(team, hermes, name=args.name, user_id=args.discord_user_id,
-                                display_name=args.display_name, model=args.model, channel_id=args.channel_id,
-                                create_channel=not args.channel_id)
-            for note in result["notes"]:
-                print(f"  • {note}")
-            _print_apply_tail(team, hermes, result)
-        elif args.command == "set-model":
-            result = set_model(team, hermes, args.target, args.model)
-            print(f"Model {result['target']} → {result['model']} ({', '.join(result['profiles'])}). "
-                  "Berlaku untuk sesi baru (/new).")
-            _print_warnings(team, hermes)
-        elif args.command == "set-sandbox":
-            result = set_sandbox(team, hermes, args.member, memory_mb=args.memory_mb, cpu=args.cpu,
-                                 reset=args.reset)
-            kind = "pengecualian" if result["override"] else "bawaan tim"
-            print(f"Sandbox {result['name']} ({result['profile']}): {result['memory_mb']} MB, {result['cpu']} CPU "
-                  f"({kind}). Plafon RAM terburuk tim: {result['worst_case_mb']} MB.")
-            if not result["applied"]:
-                print("Anggota ini nonaktif: tersimpan di members.yaml, diterapkan saat ia diaktifkan lagi.")
-            else:
-                print("Berlaku saat container sandbox profile itu dibuat lagi; container yang sudah ada tetap "
-                      "memakai batas lama sampai dihapus (docker rm) — /workspace tersimpan di volume.")
-            _print_warnings(team, hermes)
-        elif args.command == "set-active":
-            result = set_member_active(team, hermes, args.name, args.state == "on")
-            _print_apply_tail(team, hermes, result)
-        elif args.command == "remove-member":
-            _cmd_remove_member(team, hermes, args)
-        elif args.command == "share-skill":
-            result = share_skill(team, hermes, args.skill, args.from_member, args.to.split(","), args.overwrite,
-                                 allow_unscanned=args.allow_unscanned)
-            print(json.dumps(result, indent=2, ensure_ascii=False))
-        elif args.command == "unshare-skill":
-            print(json.dumps(unshare_skill(team, hermes, args.skill, args.from_members.split(",")), indent=2,
-                             ensure_ascii=False))
-        elif args.command == "llm-key":
-            _cmd_llm_key(team, hermes, args.profile, use_stdin=args.stdin)
+        _MUTATING[args.command](team, hermes, args)
     except TeamError as exc:
         sys.exit(f"gagal: {exc}")
     if hermes.failures:
@@ -497,7 +533,7 @@ def _llm_key_target(team: dict, who: str) -> tuple[str, str]:
     """(profile, nama env key) untuk `llm-key <who>`."""
     if not team["llm"]:
         raise TeamError("team.yaml belum punya bagian llm")
-    if who in ("shared", "admin"):
+    if who in SYSTEM_KINDS:
         profile, alias = team[who]["profile"], model_alias(team, who)
     elif who in ("default", "lobby"):
         profile, alias = "default", model_alias(team, "lobby")

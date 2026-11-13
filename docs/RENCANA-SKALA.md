@@ -57,7 +57,7 @@ menentukan biaya dan kestabilan belum dibatasi: sesi paralel per orang, pekerjaa
 
 **Sekarang.** Pembatas per orang hanya token bucket pesan (`RateLimiter` di
 `plugins/team-guard/ratelimit.py`): 4 pesan langsung, lalu 6 per menit. Antrean masuk
-(`Dispatcher._admit` di `dispatch.py`) menghitung sesi aktif **seluruh tim**, bukan per orang.
+(dulu `Dispatcher._admit`; kini `limiters.AdmissionLimiter` di `plugins/team-guard/`) menghitung sesi aktif **seluruh tim**, bukan per orang.
 Sejak `threads.personal: true`, setiap pesan baru di channel pribadi membuka sesi baru. Jadi satu
 orang yang menulis 4 pesan beruntun memegang 4 dari 8 slot, masing-masing bisa berjalan sampai 60
 langkah tool.

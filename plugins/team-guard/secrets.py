@@ -22,18 +22,30 @@ MAX_VALUE = 8192
 MANAGED_ENV = Path("/etc/hermes/.env")      # .env managed (milik root); hanya dibaca untuk penyamaran
 
 # ---------------------------------------------------------------------------------------------------------
-# Kebijakan nama /env-set.
+# Kebijakan nama /env-set — DAFTAR IZIN (allowlist) di depan, daftar tolak (blocklist) sebagai lapis kedua.
 #
-# Nilai /env-set ditulis ke `.env` profile, dan Hermes membaca berkas itu sebagai KONFIGURASI (token adapter
-# platform, gerbang `*_ALLOWED_USERS`, `*_BASE_URL` provider, …). Jadi nama yang dikenal Hermes tidak boleh
-# bisa diisi anggota: ia bisa menyalakan adapter platform lain untuk profilenya (melewati gerbang Discord,
-# pembatas, dan anggaran) atau membelokkan lalu lintas LLM. Penolakan memakai POLA, bukan hanya daftar:
+# Akar masalah: nilai /env-set ditulis ke `.env` profile, dan Hermes membaca berkas itu sebagai KONFIGURASI
+# (token adapter platform, gerbang `*_ALLOWED_USERS`, `*_BASE_URL` provider, …), juga lewat secret scope /
+# secret source (agent/secret_scope.py::build_profile_secret_scope) dan `docker_forward_env`
+# (tools/environments/remote_common.py::resolve_passthrough_env membaca `os.getenv(k) or load_env()[k]`).
+# Daftar tolak harus mengejar SETIAP nama env Hermes selamanya — dan CI terus menemukan nama baru yang
+# terlewat pindaian statis (CAMOFOX_, HASS_, YUANBAO_, BWS_, OP_SERVICE_ACCOUNT_). Karena itu kebijakannya
+# DIBALIK: nama diterima HANYA bila
+#   1. berawalan `MY_` (namespace anggota; tidak ada nama env Hermes berawalan itu — diuji di CI), atau
+#   2. salah satu `DEV_TOOL_NAMES` (nama alat developer yang terkenal dan TERBUKTI tidak dibaca kode Hermes:
+#      tiap nama dicek ke pohon sumber hulu oleh `TestIntegrationEnvNames`), atau
+#   3. didaftarkan admin di `secrets.allow_names` (pintu darurat; juga membuka nama yang biasanya ditolak).
+# Nama yang lolos itu TETAP diperiksa daftar tolak di bawah (pertahanan berlapis): `reserved`/`deny_names`,
+# namespace Hermes, bentuk setelan, nama sistem, dan `_is_hermes_provider_credential` Hermes yang terpasang.
+# Pemakaian tidak berubah: `/env-set MY_X` lalu `$MY_X` di perintah sandbox (terminal.env_passthrough).
+# Nama yang tersimpan di bawah kebijakan lama dan kini ditolak ditandai `/env-list` dengan saran ganti nama
+# (tidak pernah dihapus otomatis).
+#
+# Daftar tolak (lapis kedua) disusun dari:
 #   1. HERMES_PREFIXES — namespace platform / provider / gateway;
 #   2. HERMES_NAMES    — nama tunggal yang awalannya terlalu umum untuk dijadikan prefiks;
-#   3. BLOCKED_SHAPE   — bentuk yang oleh Hermes dipakai sebagai setelan apa pun namespacenya (juga menutup
-#      platform/provider yang baru ditambahkan hulu sebelum daftar ini diperbarui);
+#   3. BLOCKED_SHAPE   — bentuk yang oleh Hermes dipakai sebagai setelan apa pun namespacenya;
 #   4. SYSTEM_NAMES / SYSTEM_PREFIXES — variabel sistem/loader.
-# Namespace aman untuk anggota: awalan `MY_` (tidak pernah dibaca Hermes) — itu yang disarankan pesan tolak.
 #
 # Asal data (1) dan (2): Hermes hulu commit 5d87ea2, dibaca statis (tanpa menjalankan kodenya):
 #   - nama direktori `plugins/platforms/*` (26 platform) → `<NAMA>_`;
@@ -46,7 +58,8 @@ MANAGED_ENV = Path("/etc/hermes/.env")      # .env managed (milik root); hanya d
 #   Hasil: 531 nama. Token pertama tiap nama menjadi prefiks, kecuali token yang terlalu umum (API, TOOL, AI,
 #   MODEL, LLM, META, GH, HF, …) → prefiks dua token (`API_SERVER_`, `TOOL_GATEWAY_`, …) atau nama persis.
 #   Uji `TestIntegrationEnvNames` (butuh Hermes terpasang) menghitung ulang daftar itu dari Hermes yang
-#   terpasang dan gagal bila ada nama yang lolos — jadi pergeseran hulu tertangkap di CI.
+#   terpasang: GAGAL bila ada nama Hermes yang diterima kebijakan (allowlist+blocklist) atau bila ada nama
+#   `DEV_TOOL_NAMES` yang kini dikenal Hermes; kebocoran daftar tolak saja hanya diperingatkan.
 HERMES_NAMES = {
     "ACTUAL_API_KEY", "ACTUAL_BASE_URL", "BRAVE_API_KEY", "BRAVE_SEARCH_API_KEY", "BRV_API_KEY",
     "DAYTONA_API_KEY", "ELEVENLABS_API_KEY", "EXA_API_KEY", "FAL_KEY", "FFMPEG_PATH", "GH_TOKEN",
@@ -79,6 +92,21 @@ BLOCKED_SHAPE = re.compile(
     r"|_HOME_CHANNEL(?:_[A-Z0-9_]+)?|_HOME_ROOM|_PROXY|_REQUIRE_MENTION|_FREE_RESPONSE_[A-Z0-9_]+)$"
     r"|(?:^|_)WEBHOOK(?:_|$)")
 SAFE_PREFIX = "MY_"         # namespace anggota: tidak pernah dibaca Hermes, bebas dari aturan prefiks & bentuk
+# Nama alat developer yang terkenal. Syarat masuk: (a) tidak muncul di kode Hermes mana pun (pohon sumber hulu
+# 5d87ea2 dipindai: nol hasil selain contoh dokumentasi/uji), (b) lolos daftar tolak di bawah. Konservatif:
+# menambah nama = bukti baru ke pohon sumber hulu, bukan tebakan. Nama lain → awalan `MY_` atau allow_names.
+DEV_TOOL_NAMES = frozenset({
+    "AIRTABLE_API_KEY", "BITBUCKET_TOKEN", "CIRCLECI_TOKEN", "CODECOV_TOKEN", "DATADOG_API_KEY",
+    "DIGITALOCEAN_TOKEN", "FLY_API_TOKEN", "GH_PAT", "GITLAB_PAT", "HEROKU_API_KEY", "JIRA_API_TOKEN",
+    "JIRA_TOKEN", "MAILGUN_API_KEY", "NETLIFY_AUTH_TOKEN", "NPM_TOKEN", "PAGERDUTY_TOKEN", "POSTMARK_TOKEN",
+    "PYPI_TOKEN", "RAILWAY_TOKEN", "SENDGRID_API_KEY", "SENTRY_AUTH_TOKEN", "SENTRY_DSN", "SHOPIFY_TOKEN",
+    "SONAR_TOKEN", "STRIPE_SECRET", "SUPABASE_SERVICE_KEY", "TF_TOKEN",
+})
+MSG_ALLOWED_SHAPES = (
+    "Nama secret hanya boleh: (1) berawalan `MY_` (mis. `MY_STRIPE_KEY`), (2) salah satu nama alat dev umum "
+    "(mis. `GH_PAT`, `NPM_TOKEN`, `PYPI_TOKEN`, `SENTRY_AUTH_TOKEN`; daftar lengkap ada di docs), atau (3) nama "
+    "yang didaftarkan admin tim di `secrets.allow_names`. Alasannya: Hermes membaca `.env` profil sebagai "
+    "konfigurasi, jadi nama bebas bisa bentrok dengan setelan Hermes.")
 SYSTEM_NAMES = {
     "PATH", "HOME", "USER", "LOGNAME", "SHELL", "PWD", "OLDPWD", "LANG", "LANGUAGE", "TERM", "TZ", "TMPDIR",
     "TEMP", "TMP", "HOSTNAME", "IFS", "PS1", "PS2", "PS4", "ENV", "BASH_ENV", "PROMPT_COMMAND", "SHLVL", "EDITOR",
@@ -131,8 +159,9 @@ def blocked_kind(name: str) -> str:
 
 def check_env_name(name: Any, *, reserved: Iterable[str] = (), allow: Iterable[str] = (),
                    deny: Iterable[str] = (), upstream: Optional[Callable[[str], bool]] = None) -> tuple[bool, str]:
-    """(boleh?, pesan). `reserved` (key LLM tim) dan `deny` selalu ditolak; `allow` (secrets.allow_names)
-    adalah pintu darurat admin: hanya membuka nama yang biasanya ditolak karena dipakai Hermes/sistem."""
+    """(boleh?, pesan). Urutan: bentuk nama → `reserved` (key LLM tim) / `deny` (selalu ditolak) → `allow`
+    (secrets.allow_names, pintu darurat admin: membuka nama yang biasanya ditolak) → daftar tolak (Hermes /
+    bentuk setelan / sistem / `upstream`) → DAFTAR IZIN (awalan `MY_` atau `DEV_TOOL_NAMES`)."""
     if not isinstance(name, str) or not ENV_NAME_RE.match(name):
         return False, ("Nama harus HURUF BESAR, angka, dan garis bawah (2–64 karakter, diawali huruf), "
                        "mis. `GH_PAT`.")
@@ -160,6 +189,8 @@ def check_env_name(name: Any, *, reserved: Iterable[str] = (), allow: Iterable[s
                 return False, f"`{name}` dikelola Hermes dan tidak diteruskan ke sandbox." + _suggest(name)
         except Exception:
             pass
+    if not (name.startswith(SAFE_PREFIX) or name in DEV_TOOL_NAMES):
+        return False, f"`{name}` tidak termasuk bentuk nama yang diizinkan. " + MSG_ALLOWED_SHAPES + _suggest(name)
     return True, ""
 
 
@@ -179,8 +210,8 @@ def check_env_value(value: Any, min_length: int = 6) -> tuple[bool, str]:
     if not isinstance(value, str):
         return False, "Nilai harus teks."
     if "\n" in value or "\r" in value or "\x00" in value:
-        return False, ("Nilai multi-baris tidak didukung. Simpan sebagai base64 dengan nama berakhiran `_B64` "
-                       "(mis. `base64 -w0 id_ed25519`).")
+        return False, ("Nilai multi-baris tidak didukung. Simpan sebagai base64 (mis. `base64 -w0 id_ed25519`) dengan "
+                       "nama berawalan `MY_` dan berakhiran `_B64`, mis. `MY_DEPLOY_KEY_B64`.")
     if len(value) < int(min_length):
         return False, (f"Nilai terlalu pendek (minimal {int(min_length)} karakter) — nilai sependek itu tidak "
                        "bisa disamarkan dengan aman.")

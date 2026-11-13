@@ -22,13 +22,17 @@ Di channel pribadimu (atau thread di dalamnya):
 - `/env-list` → daftar nama secret (tanpa nilai). `/env-unset key:<nama>` → hapus.
 - Di chat cukup sebut namanya: "clone repo pakai `$GH_PAT`". AI memakai `$GH_PAT` di perintah
   sandbox tanpa pernah melihat nilainya.
-- Nama yang dibaca Hermes atau sistem ditolak beserta sarannya, karena `.env` profile juga dibaca Hermes
-  sebagai konfigurasi. Itu mencakup semua namespace platform dan provider (`NTFY_*`, `OPENAI_*`, `AWS_*`,
-  `GITHUB_*`, …) dan nama berbentuk setelan (`*_BASE_URL`, `*_HOST`, `*_ENABLED`, `*_ALLOWED_USERS`, …).
-  Pakai nama sendiri, paling aman berawalan `MY_`, lalu petakan saat dipakai:
-  `GH_TOKEN=$GH_PAT gh pr list`, `AWS_ACCESS_KEY_ID=$MY_AWS_KEY_ID aws s3 ls`. `/env-list` menandai nama
-  lama yang kini ditolak beserta saran gantinya; tidak ada yang dihapus. Admin bisa membuka nama tertentu
-  lewat `secrets.allow_names`.
+- **Aturan nama.** Nama secret hanya diterima bila: (1) berawalan **`MY_`** (mis. `MY_STRIPE_KEY`,
+  `MY_DB_PASSWORD`, `MY_AWS_KEY_ID`), atau (2) salah satu nama alat dev umum yang pasti tidak dibaca
+  Hermes (`GH_PAT`, `GITLAB_PAT`, `NPM_TOKEN`, `PYPI_TOKEN`, `SENTRY_AUTH_TOKEN`, `STRIPE_SECRET`,
+  `JIRA_API_TOKEN`, … 27 nama; daftarnya `DEV_TOOL_NAMES` di `plugins/team-guard/secrets.py`), atau
+  (3) nama yang didaftarkan admin di `secrets.allow_names`.
+  Alasannya: Hermes membaca `.env` profile juga sebagai **konfigurasi**, jadi nama bebas seperti
+  `DB_HOST`, `AWS_*`, atau `GITHUB_TOKEN` bisa bentrok dengan setelan Hermes atau menyalakan fitur yang tidak
+  seharusnya. Petakan ke nama yang dibutuhkan alat saat dipakai:
+  `GH_TOKEN=$GH_PAT gh pr list`, `AWS_ACCESS_KEY_ID=$MY_AWS_KEY_ID aws s3 ls`.
+  `/env-list` menandai nama lama yang kini tidak memenuhi aturan beserta saran gantinya; tidak ada yang
+  dihapus dan nilainya tetap bekerja.
 - Nilai multi-baris (private key) simpan sebagai base64 dengan nama berakhiran `_B64`.
 
 Lapisan perlindungan:

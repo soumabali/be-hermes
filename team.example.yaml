@@ -124,6 +124,7 @@ sandbox:
   #  3) Proxy sendiri (lama): isi dua baris berikut dengan jaringan Docker + URL proxy buatanmu.
   # network: hermes-sandbox
   # http_proxy: http://hermes-egress:3128
+  # no_proxy: "localhost,127.0.0.1,::1"   # alamat yang melewati proxy (bawaan di samping)
 
 # --------------------------------------------------------------------------- skala (20 orang)
 scale:

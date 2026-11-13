@@ -3,9 +3,22 @@ Tanpa dependensi lain supaya bisa diimpor oleh kit_discord.py dan hermes_team.py
 from __future__ import annotations
 
 import re
+from pathlib import Path
 from typing import Any, Optional
 
-KIT_VERSION = "3.1.0"
+_FALLBACK_VERSION = "3.1.0"    # hanya dipakai bila berkas VERSION tidak ada; tests/test_kit_units.py menjaga keduanya sama
+
+
+def read_version(path: Optional[Path] = None) -> str:
+    """Versi kit dari berkas `VERSION` di folder kit (SATU sumber; plugin/teamctl membaca atau membandingkan dengannya)."""
+    try:
+        text = (path or Path(__file__).resolve().parent / "VERSION").read_text(encoding="utf-8").strip()
+    except OSError:
+        return _FALLBACK_VERSION
+    return text if re.fullmatch(r"\d+\.\d+\.\d+([-+.][0-9A-Za-z.-]+)?", text) else _FALLBACK_VERSION
+
+
+KIT_VERSION = read_version()
 ID_RE = re.compile(r"^[0-9]{15,21}\Z")      # Discord snowflake (hanya digit ASCII)
 
 

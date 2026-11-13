@@ -335,6 +335,50 @@ def share_skill(team: dict, hermes: Hermes, skill: str, from_member: str, to: It
 RESERVED_SKILL_NAMES = {"registry.json", ".staging", ".team-shared.json"}
 
 
+def _share_targets(team: dict, owner: dict, to: Iterable[str]) -> tuple[list[tuple[str, str]], bool]:
+    """Tujuan berbagi skill → ([(nama, profile)], scope_all). "all"/"semua" = semua anggota aktif + shared."""
+    targets = [str(t).strip().lower() for t in to if str(t).strip()]
+    scope_all = any(t in ("all", "semua") for t in targets)
+    profiles: list[tuple[str, str]] = []
+    if scope_all:
+        profiles = [(m["name"], m["profile"]) for m in active_members(team) if m["name"] != owner["name"]]
+        profiles.append(("shared", team["shared"]["profile"]))
+    else:
+        for t in targets:
+            if t == "shared":
+                profiles.append(("shared", team["shared"]["profile"]))
+                continue
+            member = next((m for m in active_members(team) if m["name"] == t), None)
+            if member is None:
+                raise TeamError(f"anggota tujuan '{t}' tidak ada atau nonaktif")
+            if member["name"] != owner["name"]:
+                profiles.append((member["name"], member["profile"]))
+    if not profiles:
+        raise TeamError("tidak ada tujuan")
+    return profiles, scope_all
+
+
+def _archive_shared_skill(team: dict, skill_dir: Path, archive: Path, skill_name: str, entry: dict,
+                          profiles: list[tuple[str, str]], scope_all: bool) -> None:
+    """Salin skill ke arsip bersama (atomik) dan catat di registri."""
+    archive.parent.mkdir(parents=True, exist_ok=True)
+    tmp = Path(tempfile.mkdtemp(prefix=f".{skill_name}.", dir=str(archive.parent)))
+    try:
+        shutil.copytree(skill_dir, tmp / skill_name, symlinks=True)
+        if archive.exists():
+            shutil.rmtree(archive)
+        os.replace(tmp / skill_name, archive)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    registry = shared_skill_registry(team)
+    previous = registry["skills"].get(skill_name, {})
+    if previous.get("scope") == "all" and not scope_all:
+        entry["scope"] = "all"
+    registry["skills"][skill_name] = {**entry, "targets": sorted(
+        set(previous.get("targets", [])) | {name for name, _ in profiles})}
+    _save_registry(team, registry)
+
+
 def _share_skill(team: dict, hermes: Hermes, skill: str, from_member: str, to: Iterable[str],
                  overwrite: bool = False, staged: Optional[tuple[Path, Path, list[str]]] = None,
                  scan: Optional[dict] = None, allow_unscanned: bool = False) -> dict:
@@ -365,24 +409,7 @@ def _share_skill(team: dict, hermes: Hermes, skill: str, from_member: str, to: I
             raise TeamError("skill tidak dibagikan: " + " | ".join(report["problems"]))
         if report.get("hash") and report["hash"] != _tree_hash(skill_dir):
             raise TeamError("salinan skill berubah setelah dipindai; ulangi")
-        targets = [str(t).strip().lower() for t in to if str(t).strip()]
-        scope_all = any(t in ("all", "semua") for t in targets)
-        profiles: list[tuple[str, str]] = []
-        if scope_all:
-            profiles = [(m["name"], m["profile"]) for m in active_members(team) if m["name"] != owner["name"]]
-            profiles.append(("shared", team["shared"]["profile"]))
-        else:
-            for t in targets:
-                if t == "shared":
-                    profiles.append(("shared", team["shared"]["profile"]))
-                    continue
-                member = next((m for m in active_members(team) if m["name"] == t), None)
-                if member is None:
-                    raise TeamError(f"anggota tujuan '{t}' tidak ada atau nonaktif")
-                if member["name"] != owner["name"]:
-                    profiles.append((member["name"], member["profile"]))
-        if not profiles:
-            raise TeamError("tidak ada tujuan")
+        profiles, scope_all = _share_targets(team, owner, to)
         entry = {"origin_member": owner["name"], "origin_profile": owner["profile"], "shared_at": now_iso(),
                  "hash": _tree_hash(skill_dir), "scope": "all" if scope_all else "some"}
         if other_origin:
@@ -390,22 +417,7 @@ def _share_skill(team: dict, hermes: Hermes, skill: str, from_member: str, to: I
             # dari pemilik lama yang tertinggal dengan nama yang sama.
             _unshare_skill(team, hermes, skill_name, ("all",))
         if not hermes.dry_run:
-            archive.parent.mkdir(parents=True, exist_ok=True)
-            tmp = Path(tempfile.mkdtemp(prefix=f".{skill_name}.", dir=str(archive.parent)))
-            try:
-                shutil.copytree(skill_dir, tmp / skill_name, symlinks=True)
-                if archive.exists():
-                    shutil.rmtree(archive)
-                os.replace(tmp / skill_name, archive)
-            finally:
-                shutil.rmtree(tmp, ignore_errors=True)
-            registry = shared_skill_registry(team)
-            previous = registry["skills"].get(skill_name, {})
-            if previous.get("scope") == "all" and not scope_all:
-                entry["scope"] = "all"
-            registry["skills"][skill_name] = {**entry, "targets": sorted(
-                set(previous.get("targets", [])) | {name for name, _ in profiles})}
-            _save_registry(team, registry)
+            _archive_shared_skill(team, skill_dir, archive, skill_name, entry, profiles, scope_all)
         results = {}
         for name, profile in profiles:
             try:

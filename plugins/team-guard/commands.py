@@ -111,9 +111,11 @@ async def do_env_list(roster: Any, profile: str, *, store: Optional[SecretStore]
     if flagged:
         log_once(f"env-stale-{profile}", "profile %s menyimpan nama secret yang kini ditolak kebijakan: %s",
                  profile, ", ".join(sorted(flagged)))
-        text += ("\n\n⚠️ Nama bertanda di atas kini dicadangkan untuk Hermes/sistem (bisa terbaca sebagai setelan "
-                 "Hermes). Nilainya TIDAK dihapus otomatis. Ganti namanya: simpan ulang nilainya lewat `/env-set` "
-                 "dengan nama baru, lalu hapus yang lama dengan `/env-unset`:\n"
+        text += ("\n\n⚠️ Nama bertanda di atas tidak lagi memenuhi kebijakan nama: harus berawalan `MY_`, nama alat dev "
+                 "umum (mis. `GH_PAT`), atau terdaftar admin (`secrets.allow_names`) — selain itu bisa terbaca "
+                 "sebagai setelan Hermes. Nilainya TIDAK dihapus otomatis dan tetap berfungsi. Ganti namanya: "
+                 "simpan ulang nilainya lewat `/env-set` dengan nama baru, lalu hapus yang lama dengan "
+                 "`/env-unset`:\n"
                  + "\n".join(f"• `{old}` → `{new}`" for old, new in sorted(flagged.items())))
     return text
 

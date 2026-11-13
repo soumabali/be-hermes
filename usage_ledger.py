@@ -38,8 +38,7 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-import kit_paths  # noqa: E402
+import kit_paths
 
 try:
     from zoneinfo import ZoneInfo
@@ -84,20 +83,14 @@ class LedgerError(Exception):
 
 
 # ----------------------------------------------------------------------------- waktu
-def team_timezone() -> str:
+def team_timezone(team_file: Optional[Path] = None) -> str:
     """`usage.timezone` dari team.yaml tim (kosong bila tidak ada / tidak terbaca)."""
-    usage = _team_raw().get("usage")
-    return str((usage.get("timezone") if isinstance(usage, dict) else "") or "").strip()
+    return kit_paths.usage_timezone(team_file)
 
 
 def _team_raw(team_file: Optional[Path] = None) -> dict:
-    """Isi mentah team.yaml (kit_paths: --config/HERMES_TEAM_DIR/~/.hermes-team). Tidak terbaca → {}."""
-    try:
-        import yaml
-        data = yaml.safe_load(Path(team_file or kit_paths.team_file()).expanduser().read_text(encoding="utf-8"))
-    except Exception:
-        return {}
-    return data if isinstance(data, dict) else {}
+    """Isi mentah team.yaml lewat SATU pembaca bersama (kit_paths.load_raw). Tidak terbaca → {}."""
+    return kit_paths.load_raw(team_file)
 
 
 DEFAULT_PROFILE_PREFIX = "be-"
@@ -106,8 +99,7 @@ DEFAULT_PROFILE_PREFIX = "be-"
 def team_profile_prefix(team_file: Optional[Path] = None) -> str:
     """`profile_prefix` dari TEAM.yaml (bukan members.yaml). Aturannya sama dengan hermes_team.load_team:
     key tidak ada → "be-"; string kosong sah (profile = nama anggota)."""
-    value = _team_raw(team_file).get("profile_prefix", DEFAULT_PROFILE_PREFIX)
-    return DEFAULT_PROFILE_PREFIX if value is None else str(value)
+    return kit_paths.profile_prefix(team_file, DEFAULT_PROFILE_PREFIX)
 
 
 def resolve_tz(name: Optional[str] = None):

@@ -25,7 +25,7 @@ from loadtest import fake_llm, sim
 P = S.load_plugin()
 shared = S.sub(P, "shared")
 
-METRIC_KEYS = {"ts", "active_sessions", "active_by_user", "llm_inflight", "llm_inflight_peak_5m", "queue_len",
+METRIC_KEYS = {"schema", "ts", "active_sessions", "active_by_user", "llm_inflight", "llm_inflight_peak_5m", "queue_len",
                "queue_wait_p95_s", "refused", "http_429_last_minute", "effective_max_active",
                "configured_max_active", "throttled", "budget"}
 

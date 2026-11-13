@@ -126,7 +126,7 @@ def register(ctx: Any) -> None:
             # Bisa dipanggil dari thread lain (reload-plugins): tutup jembatan di loop gateway, dan simpan
             # client-nya supaya salinan plugin berikutnya memasang ulang listener tanpa menunggu reconnect.
             # Pesan yang masih menunggu di antrean tidak akan diproses: penunggunya berhenti dan mengabari
-            # pemiliknya supaya mengirim ulang (sebisanya; lihat Dispatcher._admit).
+            # pemiliknya supaya mengirim ulang (sebisanya; lihat limiters.AdmissionLimiter).
             try:
                 rt.queue.cancel_all()
             except Exception:

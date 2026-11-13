@@ -4,7 +4,7 @@
                        _load_directory_module): paket `hermes_plugins.team_guard[__home_<x>]`, impor relatif.
 - `StubContext`        tiruan minimal PluginContext (hermes_cli/plugins_context.py): mencatat pendaftaran
                        dan memicu hook dengan kwargs yang didokumentasikan upstream.
-- `FakeRunner` / `FakeDiscordAdapter` / `FakeUpstream`
+- `FakeRunner` / `FakeDiscordAdapter` / `FakeUpstream(plugin)` (subkelas `upstream.HermesGateway`)
                        meniru atribut gateway yang dipakai plugin (config.profile_routes, gerbang channel
                        `_gate_raw`, `_running_agent_count`, `request_restart`, resolver rute).
 - `FakeBot` / `FakeGuild` / `FakeMember` / …   objek bergaya discord.py.
@@ -256,8 +256,9 @@ class FakeRoute:
         return not (self.guild_id and self.guild_id != guild_id)
 
 
-class FakeUpstream:
-    """Antarmuka yang sama dengan livereload.Upstream, tanpa Hermes."""
+class _FakeUpstreamMethods:
+    """Menimpa bagian `upstream.HermesGateway` yang butuh Hermes asli (resolver rute, soket kontrol, restart).
+    Sisanya (gerbang channel, hitung sesi, …) memakai kode asli lapisan adaptor terhadap runner/adapter tiruan."""
 
     def __init__(self, served: Optional[set] = None):
         self.served = served            # None → "tidak bisa diperiksa"
@@ -302,6 +303,15 @@ class FakeUpstream:
     def restart(self, runner):
         self.restarts.append(runner)
         runner.request_restart(detached=False, via_service=True)
+
+
+def FakeUpstream(plugin: types.ModuleType, served: Optional[set] = None) -> Any:
+    """`upstream.HermesGateway` milik `plugin` dengan bagian yang butuh Hermes ditiru (lihat atas)."""
+    # Modul yang diikat ke paket `plugin` (bukan entri sys.modules terbaru): load_plugin() di berkas uji lain
+    # memuat ulang paket, dan kelas galat dari salinan berbeda tidak akan cocok di `except UpstreamMissing`.
+    module = getattr(plugin, "upstream", None) or sub(plugin, "upstream")
+    base = module.HermesGateway
+    return type("FakeUpstream", (_FakeUpstreamMethods, base), {})(served=served)
 
 
 def _s(value: Any) -> Optional[str]:
@@ -899,7 +909,7 @@ class Env:
         install_fake_kit(self.state_dir)
         self.roster = base_roster(self.state_dir, self.hermes_root)
         self.save()
-        self.upstream = FakeUpstream(served=None)
+        self.upstream = FakeUpstream(self.plugin, served=None)
         self.runner = FakeRunner(self.upstream.parse_profile_routes(self.roster["gateway"]["profile_routes"]))
         gw = self.roster["gateway"]
         self.adapter = FakeDiscordAdapter(

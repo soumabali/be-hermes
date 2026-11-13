@@ -9,10 +9,15 @@ import sys
 from pathlib import Path
 from typing import Any, Optional
 import yaml
+
+import kit_config
+from kit_contracts import ROSTER_SCHEMA
 from kit_base import KIT_VERSION, TeamError
 from kit.constants import AUX_TASKS, CRON_TOOLSET, DM_DECLINE_MESSAGE, HOST_SIDE_TOOLSETS, KIT_DIR, KIT_SKILLS, LOBBY_DISABLED_TOOLSETS, PLUGIN_NAME, PROFILE_SCOPED_KEYS, TEAMCTL, WORKER_DISABLED_TOOLSETS
 from kit.util import atomic_write, dump_yaml, managed_dir, now_iso
-from kit.config import SECRETS_DEFAULTS, compression_limits
+from kit.profiles import (MODEL_TARGETS, PROFILE_KINDS, SYSTEM_KINDS, base_settings, kind_of,  # noqa: F401
+                          teamctl_server, worker_disabled_toolsets)
+from kit.config import compression_limits
 
 
 MEMINFO_PATH = Path("/proc/meminfo")
@@ -25,7 +30,7 @@ def active_members(team: dict) -> list[dict]:
 
 def model_alias(team: dict, role: str, member: Optional[dict] = None) -> str:
     llm = team["llm"]
-    if role in ("member", "template"):
+    if kind_of(role).alias_kind == "member":
         return (member or {}).get("model") or llm["default_model"]
     return team["model_overrides"].get(role) or llm[f"{role}_model"]
 
@@ -85,8 +90,9 @@ def sandbox_settings(team: dict, member: Optional[dict] = None) -> list[tuple[st
 
 def scoped_settings(team: dict, role: str, member: Optional[dict] = None) -> list[tuple[str, object]]:
     """Setelan PROFILE_SCOPED_KEYS untuk satu profile (role: member/template/shared/admin/lobby)."""
-    alias = model_alias(team, "member" if role == "template" else role, member) if team["llm"] else None
-    return sandbox_settings(team, member if role == "member" else None) + compression_settings(team, alias)
+    kind = kind_of(role)
+    alias = model_alias(team, kind.alias_kind, member) if team["llm"] else None
+    return sandbox_settings(team, member if kind.per_member else None) + compression_settings(team, alias)
 
 
 def host_memory_mb(path: Optional[Path] = None) -> Optional[int]:
@@ -119,7 +125,7 @@ def used_model_aliases(team: dict) -> list[str]:
     if not team["llm"]:
         return []
     aliases = [model_alias(team, "member", m) for m in active_members(team)]
-    aliases += [team["llm"]["default_model"]] + [model_alias(team, role) for role in ("shared", "admin", "lobby")]
+    aliases += [team["llm"]["default_model"]] + [model_alias(team, role) for role in MODEL_TARGETS]
     return list(dict.fromkeys(aliases))
 
 
@@ -156,19 +162,6 @@ def plugin_settings(team: dict) -> list[tuple[str, object]]:
     return [(f"plugins.entries.{PLUGIN_NAME}.settings.state_dir", team["paths"]["state_dir"])]
 
 
-def teamctl_server(team: dict, hermes_bin: str, hermes_root: Path) -> dict:
-    return {
-        "command": sys.executable,
-        "args": [str(TEAMCTL), "--team", team["paths"]["team_file"],
-                 "--members", team["paths"]["members_file"]],
-        "env": {"HERMES_BIN": hermes_bin, "HERMES_HOME": str(hermes_root),
-                "HERMES_TEAM_DIR": team["paths"]["team_dir"]},
-        "timeout": 900,
-        "connect_timeout": 60,
-        "elicitation": {"enabled": True, "timeout": 300},
-    }
-
-
 def gateway_channels(team: dict) -> tuple[list[str], list[str]]:
     """(allowed_channels, free_response_channels) untuk adapter Discord host."""
     personal = [m["channel_id"] for m in active_members(team)]
@@ -183,7 +176,7 @@ def host_settings(team: dict) -> list[tuple[str, object]]:
     allowed, free = gateway_channels(team)
     admin = team["admin"]["channel_id"]
     bindings = [{"id": team[k]["channel_id"], "skills": team[k]["auto_skills"]}
-                for k in ("shared", "admin") if team[k]["auto_skills"]]
+                for k in SYSTEM_KINDS if team[k]["auto_skills"]]
     scale = team["scale"]
     settings: list[tuple[str, object]] = [
         ("gateway.multiplex_profiles", True),
@@ -214,7 +207,7 @@ def host_settings(team: dict) -> list[tuple[str, object]]:
     ]
     if team["lobby_restrict"]:
         settings += [
-            ("agent.disabled_toolsets", LOBBY_DISABLED_TOOLSETS),
+            ("agent.disabled_toolsets", list(PROFILE_KINDS["lobby"].extra_disabled_toolsets)),
             ("memory.memory_enabled", False),
             ("memory.user_profile_enabled", False),
         ]
@@ -225,55 +218,15 @@ def host_settings(team: dict) -> list[tuple[str, object]]:
     return settings
 
 
-def worker_disabled_toolsets(team: dict, role: str = "admin") -> list[str]:
-    """Toolset yang dimatikan untuk profile pekerja. Cron job berjalan tanpa pesan (di luar rate limit dan
-    antrean), jadi toolset `cronjob` mati untuk anggota dan profile bersama kecuali
-    `scale.allow_member_cron: true`; profile admin selalu memilikinya (laporan terjadwal)."""
-    disabled = WORKER_DISABLED_TOOLSETS + ([] if team.get("allow_browser") else HOST_SIDE_TOOLSETS)
-    if role != "admin" and not team["scale"].get("allow_member_cron"):
-        disabled = disabled + [CRON_TOOLSET]
-    return disabled
-
-
 def profile_settings(team: dict, role: str, member: Optional[dict] = None, *,
                      hermes_bin: str = "hermes", hermes_root: Optional[Path] = None) -> list[tuple[str, object]]:
-    """Setelan per profile. Selalu eksplisit supaya tidak mewarisi setelan lobby dari clone."""
-    skills_dir = [team["team_skills_dir"]] if team["team_skills_dir"] else []
-    disabled = worker_disabled_toolsets(team, role)
-    if role in ("member", "template"):
-        settings: list[tuple[str, object]] = [
-            ("agent.disabled_toolsets", disabled),
-            ("memory.memory_enabled", True),
-            ("memory.user_profile_enabled", True),
-            ("memory.write_approval", False),
-            ("skills.write_approval", False),
-            ("skills.external_dirs", skills_dir if team["team_skills_in_personal"] else []),
-            ("terminal.docker_forward_env", (member or {}).get("forward_env") or []),
-        ]
-    elif role == "shared":
-        settings = [
-            ("agent.disabled_toolsets", disabled),
-            ("memory.memory_enabled", True),
-            ("memory.user_profile_enabled", False),   # tidak ada "profil user" di otak bersama
-            ("memory.write_approval", True),           # admin menyetujui via /memory pending
-            ("skills.write_approval", True),           # admin menyetujui via /skills pending
-            ("skills.external_dirs", skills_dir),
-        ]
-    elif role == "admin":
-        settings = [
-            ("agent.disabled_toolsets", disabled),
-            ("memory.memory_enabled", True),
-            ("memory.user_profile_enabled", True),
-            ("memory.write_approval", False),
-            ("skills.write_approval", False),
-            # Skill bawaan kit (mis. team-usage-report) dibaca langsung dari folder kit yang dimiliki root.
-            ("skills.external_dirs", skills_dir + ([str(KIT_SKILLS)] if KIT_SKILLS.is_dir() else [])),
-            ("mcp_servers.teamctl", teamctl_server(team, hermes_bin, hermes_root or Path("~/.hermes").expanduser())),
-        ]
-    else:
-        raise ValueError(role)
+    """Setelan per profile. Selalu eksplisit supaya tidak mewarisi setelan lobby dari clone.
+    Bagian yang khas per jenis ada di kit.profiles.PROFILE_KINDS; model, batas sandbox/kompresi, dan plugin
+    sama untuk semua jenis."""
+    kind = kind_of(role)
+    settings = base_settings(team, role, member, hermes_bin, hermes_root or Path("~/.hermes").expanduser())
     if team["llm"]:
-        settings += model_settings(team, model_alias(team, "member" if role == "template" else role, member))
+        settings += model_settings(team, model_alias(team, kind.alias_kind, member))
     settings += scoped_settings(team, role, member)
     settings += plugin_settings(team)
     return settings
@@ -435,14 +388,14 @@ def roster_data(team: dict, hermes_root: Path, hermes_bin: str) -> dict:
     # Anggota nonaktif: hanya untuk mengenali channel lamanya (tidak dirutekan, tidak dilayani).
     inactive = {m["user_id"]: {"name": m["name"], "channel_id": m["channel_id"]}
                 for m in team["members"] if not m.get("active", True)}
-    channels[team["shared"]["channel_id"]] = {"profile": team["shared"]["profile"], "kind": "shared"}
-    channels[team["admin"]["channel_id"]] = {"profile": team["admin"]["profile"], "kind": "admin"}
+    for kind in SYSTEM_KINDS:
+        channels[team[kind]["channel_id"]] = {"profile": team[kind]["profile"], "kind": kind}
     reserved = sorted({str(p["key_env"]) for p in (llm.get("providers") or {}).values()
                        if p.get("key_env")}) if llm else []
-    scale, secrets = team["scale"], team["secrets"]
     allowed, free = gateway_channels(team)
     return {
-        "version": 3,
+        "version": 3,                 # lama, dipertahankan demi kompatibilitas; pembeda sebenarnya: "schema"
+        "schema": ROSTER_SCHEMA,
         "kit_version": KIT_VERSION,
         "generated": now_iso(),
         "team_name": team["team_name"],
@@ -461,25 +414,15 @@ def roster_data(team: dict, hermes_root: Path, hermes_bin: str) -> dict:
         # Keadaan gateway yang diinginkan; plugin menerapkannya ke proses yang sedang jalan (live reload).
         "gateway": {"profile_routes": build_routes(team), "allowed_channels": allowed,
                     "free_response_channels": free},
-        "live_reload": team["live_reload"],
-        "restart_fallback": team["restart_fallback"],
-        "onboarding": dict(team["onboarding"]),
+        # Setelan yang ditegakkan plugin DITURUNKAN dari tabel kit_config.FIELDS (baris ber-`plugin_key`):
+        # menambah satu setelan di sana otomatis muncul di sini; tidak ada salinan manual lagi.
+        **kit_config.plugin_view(team, "root"),                 # live_reload, restart_fallback
+        "onboarding": kit_config.plugin_view(team, "onboarding"),
         "kit": {"python": sys.executable, "script": str(KIT_DIR / "hermes_team.py"),
                 "team_file": team["paths"]["team_file"], "members_file": team["paths"]["members_file"]},
-        "settings": {
-            "rate_per_minute": scale["user_rate_per_minute"], "burst": scale["user_burst"],
-            "max_active": scale["max_concurrent_sessions"], "queue_max_wait": scale["queue_max_wait_seconds"],
-            **{k: secrets[k] for k in SECRETS_DEFAULTS},
-            # docs/RENCANA-SKALA.md — ditegakkan plugin team-guard (key baru; yang lama tidak berubah).
-            "user_max_concurrent": int(scale["user_max_concurrent"]),
-            "max_llm_parallel": int(scale["max_llm_parallel"]),
-            "daily_token_budget": int(scale["daily_token_budget"]),
-            "team_daily_token_budget": int(scale["team_daily_token_budget"]),
-            "adaptive_throttle": bool(scale["adaptive_throttle"]),
-            "cron_min_interval_minutes": int(scale["cron_min_interval_minutes"]),
-        },
+        "settings": kit_config.plugin_view(team, "settings"),
         # Anggaran token harian dihitung dari buku besar ini, dengan batas hari di zona waktu yang sama.
-        "usage": {"timezone": team["usage"]["timezone"],
+        "usage": {**kit_config.plugin_view(team, "usage"),
                   "ledger": str(Path(team["paths"]["state_dir"]) / "usage.db")},
     }
 
