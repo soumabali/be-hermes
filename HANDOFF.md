@@ -2,7 +2,7 @@
 
 Berkas ini dulu dipakai untuk memindahkan pekerjaan antar sesi. Isinya sudah digantikan oleh:
 
-- `README.md` — instalasi (satu perintah: `sudo bash setup.sh`), cara kerja, operasi, batasan
+- `README.md` — gambaran dan instalasi satu perintah (`sudo bash setup.sh`); rinciannya di `docs/` (INSTALL, ADMIN, ANGGOTA, SKALA, PEMAKAIAN, OPERASI, BATASAN)
 - `CHANGELOG.md` — perubahan per versi
 - `docs/RENCANA-SKALA.md` — rencana skala dan status tiap butir
 

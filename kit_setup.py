@@ -9,7 +9,7 @@
     sudo HERMES_SETUP_BOT_TOKEN=... HERMES_SETUP_LLM_KEY=... \\
         bash setup.sh --non-interactive --answers jawaban.yaml
 
-Wizard ini mengotomatiskan "Panduan instalasi dari nol" di README. Yang tetap manual: membuat
+Wizard ini mengotomatiskan "Instalasi manual" (docs/INSTALL.md). Yang tetap manual: membuat
 aplikasi bot di Discord Developer Portal dan mengklik tautan undangan (Discord tidak menyediakan
 API untuk keduanya); wizard memberi instruksi lalu memeriksa hasilnya lewat API.
 
@@ -77,7 +77,7 @@ PORTAL_URL = "https://discord.com/developers/applications"
 RESUME_HINT = "sudo bash setup.sh"
 
 # --------------------------------------------------------------------------- Discord: izin & intent
-# Izin bot yang diminta lewat tautan undangan (README Langkah 3). Nama = kunci kit_discord.PERMISSIONS.
+# Izin bot yang diminta lewat tautan undangan (docs/INSTALL.md Langkah 3). Nama = kunci kit_discord.PERMISSIONS.
 INVITE_PERMISSIONS = (
     "view_channel", "send_messages", "send_messages_in_threads", "read_message_history", "embed_links",
     "attach_files", "add_reactions", "create_public_threads", "use_application_commands",
@@ -791,7 +791,7 @@ class Preflight(Step):
         if ram is None:
             ctx.warn("RAM tidak bisa dibaca")
         elif ram < 7.5:      # mesin "8 GB" melapor sedikit di bawah 8
-            ctx.warn(f"RAM {ram:.1f} GB (di bawah 8 GB): cukup untuk mencoba, kurang untuk tim (README: ±32 GB untuk 20 orang)")
+            ctx.warn(f"RAM {ram:.1f} GB (di bawah 8 GB): cukup untuk mencoba, kurang untuk tim (docs/SKALA.md: ±32 GB untuk 20 orang)")
         else:
             ctx.say(f"  ✓ RAM: {ram:.1f} GB")
         if free is None:
@@ -1678,7 +1678,7 @@ class WriteConfig(Step):
 
 
 def run_provision(ctx: Context) -> None:
-    """apply → pasang managed → apply lagi (empat setelan pindah dari managed ke tiap profile; README §10)."""
+    """apply → pasang managed → apply lagi (empat setelan pindah dari managed ke tiap profile; docs/SKALA.md)."""
     kit, team = str(ctx.kit_dir / "hermes_team.py"), str(ctx.team_file)
     fix = ("baca pesan di atas. `apply` menolak key di llm.providers → pindahkan key ke /etc/hermes/.env. "
            f"Setelah diperbaiki: {RESUME_HINT}")
@@ -1733,7 +1733,7 @@ def set_sandbox_image(text: str, image: str) -> Optional[str]:
 
 class Extras(Step):
     name, title = "extras", "Tambahan opsional: image sandbox dan timer pemakaian"
-    explain = "Tiga hal opsional; masing-masing ditanyakan. Semua bisa dipasang nanti (README Langkah 8 dan §10b)."
+    explain = "Tiga hal opsional; masing-masing ditanyakan. Semua bisa dipasang nanti (docs/INSTALL.md Langkah 8 dan docs/PEMAKAIAN.md)."
     UNITS = {"collect": ("hermes-usage-collect.service", "hermes-usage-collect.timer"),
              "report": ("hermes-usage-report.service", "hermes-usage-report.timer")}
 
@@ -1874,7 +1874,7 @@ CHECKLIST = """  Uji di Discord sekarang (pakai akun uji, bukan admin):
     3. Akun uji menulis di channelnya   → bot membuka thread baru dan menjawab.
     4. /env-set di channelnya           → form pribadi; minta "jalankan printenv" → diblokir.
     5. Admin mencabut @{member}         → akses channel hilang, @{entry} kembali.
-  Daftar lengkap 11 butir: README, "Langkah 11". Bila ada yang tidak jalan: README, "Bila ada yang
+  Daftar lengkap 11 butir: docs/INSTALL.md, "Langkah 11". Bila ada yang tidak jalan: docs/INSTALL.md, "Bila ada yang
   tidak jalan", lalu  python3 {kit}/kit_doctor.py --discord"""
 
 
@@ -2041,7 +2041,7 @@ def run_wizard(ctx: Context, steps: Optional[List[Step]] = None, start: Optional
         except (StepError, TeamError, OSError, RuntimeError, ValueError, KeyError) as exc:
             if isinstance(exc, TeamError) and not isinstance(exc, StepError):
                 exc = StepError(str(exc), cause="permintaan ke Discord gagal",
-                                fix="periksa koneksi dan izin bot; lihat README, bagian \"Bila ada yang tidak jalan\"")
+                                fix="periksa koneksi dan izin bot; lihat docs/INSTALL.md, bagian \"Bila ada yang tidak jalan\"")
             _save_quietly(ctx)
             report_failure(ctx, step, exc)
             return 1

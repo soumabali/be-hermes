@@ -1,6 +1,6 @@
 # Rencana perbaikan: skala 20 orang
 
-Dokumen ini menilai tabel "Skala 20 orang" di README §10 terhadap kode kit v3.1 dan Hermes
+Dokumen ini menilai tabel "Skala 20 orang" di [SKALA.md](SKALA.md) terhadap kode kit v3.1 dan Hermes
 (commit `5d87ea2`, 12 Nov 2026), lalu menyusun perbaikannya menurut prioritas.
 
 Status tiap temuan: **terbukti** = terlihat langsung di kode; **perlu diukur** = masuk akal dari
@@ -130,7 +130,7 @@ subagent dari #2). Jalankan saat instalasi dan tiap ganti endpoint.
 
 ### 5. Tidak ada anggaran token per orang — P1, terbukti
 
-> **Sebagian sudah ada:** pencatatannya (`usage_ledger.py`, README §10b) sudah dibuat. Yang belum:
+> **Sebagian sudah ada:** pencatatannya (`usage_ledger.py`, [PEMAKAIAN.md](PEMAKAIAN.md)) sudah dibuat. Yang belum:
 > penegakan anggaran (peringatan 80%, penolakan 100%) di plugin.
 
 **Sekarang.** Pembatas menghitung pesan. Satu pesan bisa menghabiskan 60 langkah tool dengan
@@ -190,7 +190,7 @@ ada di memori plugin. Admin tidak bisa melihatnya.
 
 **Sekarang.** `AdmissionQueue` adalah daftar di memori. Orang yang mengirim 3 pesan menempati 3
 posisi. Restart gateway mengosongkan antrean tanpa pemberitahuan. Pesan yang dikirim saat sesi
-sibuk masuk antrean Hermes tanpa lewat hook (dicatat di README §8), jadi tidak terkena rate limit.
+sibuk masuk antrean Hermes tanpa lewat hook (dicatat di [ANGGOTA.md](ANGGOTA.md)), jadi tidak terkena rate limit.
 
 **Perbaikan.**
 - Giliran adil: satu tiket per orang di antrean global, sisanya menunggu di belakang tiket itu.
