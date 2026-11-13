@@ -317,7 +317,10 @@ class TestManagedConfigAndRoster:
         term = policy["terminal"]
         assert term["backend"] == "docker" and term["docker_mount_cwd_to_workspace"] is False
         assert term["docker_volumes"] == [] and term["docker_extra_args"] == []
-        assert (term["container_cpu"], term["container_memory"], term["docker_image"]) == (2, 4096, "team/img:1")
+        assert term["docker_image"] == "team/img:1" and term["container_persistent"] is True
+        # Dipindah ke config per profile (managed menang atas semua profile, jadi tidak bisa dibedakan).
+        assert "container_cpu" not in term and "container_memory" not in term
+        assert policy["compression"] == {"idle_compact_after_seconds": 3600}
         assert term["docker_env"]["HTTPS_PROXY"] == "http://egress:3128" and term["docker_network"] == "hermes-sandbox"
         assert policy["security"] == {"redact_secrets": True}
         assert policy["agent"]["max_turns"] == 60 and policy["delegation"]["max_spawn_depth"] == 1

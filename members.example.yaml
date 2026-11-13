@@ -1,7 +1,7 @@
 # members.yaml — anggota tim Hermes dan model AI per orang.
 # Boleh diedit manual lalu jalankan `python3 hermes_team.py apply`; juga ditulis oleh tool admin
 # di #hermes-admin ("tambahkan Citra…", "ganti model be1 ke td-normal") dan oleh
-# `hermes_team.py add-member` / `set-model`.
+# `hermes_team.py add-member` / `set-model` / `set-sandbox`.
 
 members:
   - name: be1                           # huruf kecil/angka/-/_  → profile be-be1, channel #hermes-be1
@@ -13,6 +13,9 @@ members:
     display_name: Budi
     discord_user_id: "500000000000000002"
     channel_id: "600000000000000002"
+    # Opsional — batas sandbox khusus orang ini (tanpa ini → team.yaml: sandbox.memory_mb / sandbox.cpu).
+    # memory_mb 256..65536, cpu 0.25..64. Lewat CLI:  hermes_team.py set-sandbox budi --memory-mb 4096 --cpu 2
+    # sandbox: {memory_mb: 4096, cpu: 2}
   # - name: citra
   #   display_name: Citra
   #   discord_user_id: "500000000000000003"

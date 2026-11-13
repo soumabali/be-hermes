@@ -72,6 +72,15 @@ llm:
   models:                                    # alias → provider + nama model di endpoint
     td-normal: {provider: "custom:td", model: td-normal}
     td-simple: {provider: "custom:td", model: td-simple}
+    # Ambang kompresi khusus satu model (opsional; tanpa ini → scale.compression_threshold_tokens dan
+    # scale.proactive_prune_tokens). Model berjendela konteks besar boleh dipangkas lebih jarang: tiap
+    # pemangkasan menulis ulang riwayat dan memutus prompt cache. Pangkas harus lebih kecil dari kompresi.
+    # Ditulis `apply` ke config tiap profile sesuai modelnya; `set-model` ikut memperbaruinya.
+    #   td-normal:
+    #     provider: "custom:td"
+    #     model: td-normal
+    #     compression_threshold_tokens: 120000
+    #     proactive_prune_tokens: 90000
   default_model: td-simple    # anggota tanpa `model` di members.yaml
   admin_model: td-normal      # profile team-admin
   shared_model: td-simple     # profile team-shared (#hermes-shared)
@@ -93,14 +102,17 @@ llm:
   per_user_keys: false        # true = tiap profile boleh punya key sendiri (hermes_team.py llm-key)
 
 # --------------------------------------------------------------------------- sandbox
-# Dipin lewat /etc/hermes/config.yaml. image kosong = image bawaan Hermes. Untuk tim backend pakai image
+# Dipin lewat /etc/hermes/config.yaml, KECUALI cpu dan memory_mb: keduanya ditulis `apply` ke config tiap
+# profile supaya bisa berbeda per orang (members.yaml → `sandbox:`, atau `hermes_team.py set-sandbox`).
+# image kosong = image bawaan Hermes. Untuk tim backend pakai image
 # sendiri berisi toolchain (PHP/Composer, Go, Java, Node, Python, klien DB, gh): lihat docker/sandbox/Dockerfile,
 #   docker build -t hermes-team-sandbox:2026.11 docker/sandbox   →   image: "hermes-team-sandbox:2026.11"
 # Pakai tag bertanggal, bukan :latest, supaya semua sandbox sama dan rollback mudah.
 sandbox:
   image: ""
-  cpu: 1
-  memory_mb: 2048
+  cpu: 1                            # bawaan per profile (pengecualian: 0.25..64)
+  memory_mb: 1024                   # bawaan per profile; plafon, bukan cadangan (pengecualian: 256..65536).
+                                    # `check` menjumlahkan plafon terburuk dan memperingatkan bila > RAM server.
   # Membatasi internet sandbox — pilih salah satu:
   #  1) Proxy bawaan Hermes (disarankan): di server jalankan `hermes egress install && hermes egress setup &&
   #     hermes egress start`. Sandbox hanya memegang token proxy (kunci provider asli tetap di host) dan
@@ -120,7 +132,7 @@ scale:
   agent_max_turns: 60               # langkah tool per giliran (mencegah loop tak berujung)
   goals_max_turns: 4                # batas lanjutan otomatis /goal (4 × agent_max_turns langkah dari satu pesan)
   delegation_max_children: 1        # subagent paralel per giliran (tiap subagent = satu percakapan LLM lagi)
-  compression_threshold_tokens: 64000   # kompres konteks paling lambat di angka ini
+  compression_threshold_tokens: 64000   # kompres konteks paling lambat di angka ini (bawaan; per model: llm.models)
   proactive_prune_tokens: 48000     # pangkas output tool lama tanpa LLM
   idle_compact_after_seconds: 3600  # sesi yang dibuka lagi setelah 1 jam diringkas dulu
   busy_input_mode: queue            # pesan susulan saat bot sibuk masuk antrean, tidak memotong
@@ -142,6 +154,14 @@ scale:
 # (hanya angka; tanpa isi percakapan). Batas hari/minggu/bulan memakai zona waktu ini.
 usage:
   timezone: ""                      # mis. "Asia/Makassar" (WITA) atau "Asia/Jakarta"; kosong = zona waktu server
+  # Laporan pemakaian terjadwal, dikirim tools/usage_post.py ke channel di bawah. Jam "HH:MM" 24 jam dalam
+  # zona waktu di atas dan WAJIB di dalam tanda kutip; kosong ("") atau false = laporan itu mati.
+  # Jangan pakai channel pribadi anggota (laporan memuat angka semua orang) — ditolak `check`.
+  report_channel_id: ""             # mis. ID #hermes-admin atau channel khusus #hermes-usage
+  reports:
+    daily: ""                       # mis. "08:00" → tiap hari: laporan KEMARIN
+    weekly: ""                      # mis. "08:05" → tiap Senin: laporan MINGGU LALU
+    monthly: ""                     # mis. "08:10" → tiap tanggal 1: laporan BULAN LALU
 
 # --------------------------------------------------------------------------- secret (/env-set)
 secrets:

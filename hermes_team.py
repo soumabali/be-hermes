@@ -21,6 +21,7 @@ Perintah:
                  plugin saat role @backend diberikan, juga oleh tool admin)
   offboard       nonaktifkan anggota dari user Discord (data tetap; dipanggil plugin saat role dicabut)
   set-model      ganti model AI anggota / shared / admin / lobby
+  set-sandbox    batas RAM/CPU sandbox khusus satu anggota (--memory-mb, --cpu, --reset)
   set-active     aktif/nonaktifkan anggota berdasarkan nama
   list-skills    daftar skill milik seorang anggota
   share-skill    bagikan skill seorang anggota ke anggota lain atau semua anggota (ditolak bila pemindai
@@ -393,6 +394,79 @@ def _secret_like_keys(block: Any, trail: str = "") -> list[str]:
     return found
 
 
+# Key opsional di llm.models.<alias>: (ambang kompresi, ambang pangkas output tool) khusus model itu.
+MODEL_COMPRESSION_KEYS = ("compression_threshold_tokens", "proactive_prune_tokens")
+# Batas wajar untuk sandbox satu profile (pengecualian per anggota di members.yaml / set-sandbox).
+SANDBOX_MEMORY_MB_RANGE = (256, 65536)
+SANDBOX_CPU_RANGE = (0.25, 64)
+SANDBOX_DEFAULT_MEMORY_MB = 1024
+# Key yang DULU dipin di /etc/hermes/config.yaml dan sekarang ditulis per profile (lihat managed_config).
+PROFILE_SCOPED_KEYS = ("terminal.container_cpu", "terminal.container_memory",
+                       "compression.threshold_tokens", "compression.proactive_prune_tokens")
+REPORT_KINDS = ("daily", "weekly", "monthly")
+MEMINFO_PATH = Path("/proc/meminfo")
+
+
+def _sandbox_override(raw: Any, where: str) -> dict:
+    """`sandbox: {memory_mb, cpu}` milik satu anggota → dict berisi hanya key yang diisi (boleh kosong)."""
+    if raw is None or raw == {}:
+        return {}
+    if not isinstance(raw, dict):
+        raise TeamError(f"{where}: harus mapping (memory_mb, cpu)")
+    unknown = sorted(str(k) for k in raw if k not in ("memory_mb", "cpu"))
+    if unknown:
+        raise TeamError(f"{where}.{unknown[0]}: tidak dikenal (pilihan: memory_mb, cpu)")
+    out: dict = {}
+    if raw.get("memory_mb") is not None:
+        low, high = SANDBOX_MEMORY_MB_RANGE
+        memory = _int(raw["memory_mb"], f"{where}.memory_mb")
+        if not low <= memory <= high:
+            raise TeamError(f"{where}.memory_mb: harus {low}..{high} MB (sekarang {memory})")
+        out["memory_mb"] = memory
+    if raw.get("cpu") is not None:
+        low_cpu, high_cpu = SANDBOX_CPU_RANGE
+        cpu = _number(raw["cpu"], f"{where}.cpu")
+        if not low_cpu <= cpu <= high_cpu:
+            raise TeamError(f"{where}.cpu: harus {low_cpu}..{high_cpu} (sekarang {cpu})")
+        out["cpu"] = int(cpu) if cpu == int(cpu) else float(cpu)
+    return out
+
+
+def _report_time(value: Any, where: str) -> str:
+    """Jam laporan "HH:MM" (24 jam, waktu lokal usage.timezone). Kosong/false = laporan itu mati."""
+    if value is None or value is False or value == "":
+        return ""
+    if isinstance(value, (int, float)):
+        # YAML 1.1 membaca 10:30 tanpa kutip sebagai bilangan (630), jadi jamnya sudah hilang di sini.
+        raise TeamError(f"{where}: tulis jam di dalam tanda kutip, mis. \"08:00\" (sekarang {value!r})")
+    match = re.fullmatch(r"(\d{1,2}):(\d{2})", str(value).strip())
+    if not match or int(match.group(1)) > 23 or int(match.group(2)) > 59:
+        raise TeamError(f"{where}: '{value}' bukan jam \"HH:MM\" 24 jam (mis. \"08:00\"); kosongkan untuk mematikan")
+    return f"{int(match.group(1)):02d}:{match.group(2)}"
+
+
+def _load_usage(raw: Any) -> dict:
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, dict):
+        raise TeamError("usage: harus mapping (timezone, report_channel_id, reports)")
+    channel = raw.get("report_channel_id")
+    reports_raw = raw.get("reports")
+    if reports_raw is None or reports_raw is False:
+        reports_raw = {}
+    if not isinstance(reports_raw, dict):
+        raise TeamError("usage.reports: harus mapping (daily, weekly, monthly)")
+    unknown = sorted(str(k) for k in reports_raw if k not in REPORT_KINDS)
+    if unknown:
+        raise TeamError(f"usage.reports.{unknown[0]}: tidak dikenal (pilihan: {', '.join(REPORT_KINDS)})")
+    return {
+        "timezone": str(raw.get("timezone") or "").strip(),
+        # Channel tujuan laporan pemakaian terjadwal (tools/usage_post.py). Kosong = tidak ada.
+        "report_channel_id": _id(channel, "usage.report_channel_id") if channel else "",
+        "reports": {kind: _report_time(reports_raw.get(kind), f"usage.reports.{kind}") for kind in REPORT_KINDS},
+    }
+
+
 def _load_llm(raw: dict) -> dict:
     llm = raw.get("llm")
     if not llm:
@@ -427,6 +501,15 @@ def _load_llm(raw: dict) -> dict:
         if provider.startswith("custom:") and provider[7:] not in providers:
             raise TeamError(f"llm.models.{alias}: provider {provider} tidak ada di llm.providers")
         models[alias] = {"provider": provider, "model": model}
+        # Ambang kompresi khusus model ini (opsional; tanpa ini → scale.*). Model berjendela konteks besar
+        # boleh dipangkas lebih jarang: tiap pemangkasan menulis ulang riwayat dan memutus prompt cache.
+        for key in MODEL_COMPRESSION_KEYS:
+            if block.get(key) is not None:
+                models[alias][key] = _int(block[key], f"llm.models.{alias}.{key}", 1)
+        threshold, prune = (models[alias].get(k) for k in MODEL_COMPRESSION_KEYS)
+        if threshold and prune and prune >= threshold:
+            raise TeamError(f"llm.models.{alias}.proactive_prune_tokens ({prune}) harus lebih kecil dari "
+                            f"compression_threshold_tokens ({threshold})")
     if not models:
         raise TeamError("llm.models: minimal satu model")
     out = {"providers": providers, "models": models}
@@ -536,10 +619,7 @@ def load_team(team_path: Path, members_path: Optional[Path] = None) -> dict:
         raise TeamError("threads: harus mapping (personal, admin)")
     team["threads"] = {"personal": _bool(threads.get("personal"), "threads.personal", True),
                        "admin": _bool(threads.get("admin"), "threads.admin", False)}
-    usage = raw.get("usage") or {}
-    if not isinstance(usage, dict):
-        raise TeamError("usage: harus mapping (timezone)")
-    team["usage"] = {"timezone": str(usage.get("timezone") or "").strip()}
+    team["usage"] = _load_usage(raw.get("usage"))
     prefix = str(raw.get("profile_prefix", "be-"))
     team["prefix"] = prefix
     team["template"] = _profile(str(raw.get("template_profile") or f"{prefix}template"), "template_profile")
@@ -556,7 +636,7 @@ def load_team(team_path: Path, members_path: Optional[Path] = None) -> dict:
     team["sandbox"] = {
         "image": str(sandbox.get("image") or "").strip(),
         "cpu": _number(sandbox.get("cpu", 1), "sandbox.cpu"),
-        "memory_mb": _int(sandbox.get("memory_mb", 2048), "sandbox.memory_mb", 64),
+        "memory_mb": _int(sandbox.get("memory_mb", SANDBOX_DEFAULT_MEMORY_MB), "sandbox.memory_mb", 64),
         "network": str(sandbox.get("network") or "").strip(),
         "http_proxy": str(sandbox.get("http_proxy") or "").strip(),
         "no_proxy": str(sandbox.get("no_proxy") or "localhost,127.0.0.1,::1"),
@@ -574,6 +654,7 @@ def load_team(team_path: Path, members_path: Optional[Path] = None) -> dict:
     if scale["busy_input_mode"] not in ("queue", "interrupt", "steer"):
         raise TeamError("scale.busy_input_mode harus queue, interrupt, atau steer")
     team["scale"] = scale
+    _validate_model_compression(team)
     secrets = copy.deepcopy(SECRETS_DEFAULTS)
     secrets.update({k: v for k, v in (raw.get("secrets") or {}).items() if k in SECRETS_DEFAULTS})
     for key, default in SECRETS_DEFAULTS.items():
@@ -623,7 +704,26 @@ def load_team(team_path: Path, members_path: Optional[Path] = None) -> dict:
         "team_dir": str(team_dir), "state_dir": str(team_dir / "state"),
     }
     _validate_unique(team)
+    report_channel = team["usage"]["report_channel_id"]
+    owner = next((m for m in team["members"] if m["channel_id"] == report_channel), None) if report_channel else None
+    if owner is not None:
+        raise TeamError(f"usage.report_channel_id: {report_channel} adalah channel pribadi anggota '{owner['name']}'. "
+                        "Laporan pemakaian memuat angka semua orang; pakai channel admin atau channel khusus.")
     return team
+
+
+def _validate_model_compression(team: dict) -> None:
+    """Model yang hanya mengisi SATU dari dua ambang memakai `scale` untuk pasangannya; hasil akhirnya
+    tetap harus pangkas < kompresi (0 di `scale` = fitur itu mati, tidak diperiksa)."""
+    for alias, block in ((team["llm"] or {}).get("models") or {}).items():
+        if not any(key in block for key in MODEL_COMPRESSION_KEYS):
+            continue
+        threshold, prune = compression_limits(team, alias)
+        if threshold and prune and prune >= threshold:
+            mine = next(key for key in MODEL_COMPRESSION_KEYS if key in block)
+            raise TeamError(f"llm.models.{alias}.{mine}: hasil akhirnya pangkas {prune} ≥ kompresi {threshold} "
+                            "(pasangannya diambil dari scale). Isi kedua ambang untuk model ini; "
+                            "proactive_prune_tokens harus lebih kecil dari compression_threshold_tokens.")
 
 
 def _load_onboarding(raw: Any) -> dict:
@@ -666,6 +766,8 @@ def _load_member(m: Any, i: int, team: dict) -> dict:
         "model": model,
         "active": _bool(m.get("active"), f"{where}.active", True),
         "forward_env": [str(e) for e in (m.get("forward_env") or [])],
+        # Pengecualian batas sandbox untuk orang ini; key yang tidak diisi mengikuti team.yaml → sandbox.
+        "sandbox": _sandbox_override(m.get("sandbox"), f"{where}.sandbox"),
     }
 
 
@@ -703,13 +805,15 @@ def save_members(team: dict) -> None:
             row["active"] = False
         if m.get("forward_env"):
             row["forward_env"] = list(m["forward_env"])
+        if m.get("sandbox"):
+            row["sandbox"] = dict(m["sandbox"])
         rows.append(row)
     body = {"members": rows}
     if team.get("model_overrides"):
         body["models"] = dict(team["model_overrides"])
     header = ("# members.yaml — anggota tim Hermes dan model AI per orang.\n"
               "# Boleh diedit manual, lalu jalankan: python3 hermes_team.py apply\n"
-              "# Juga ditulis oleh tool admin di #hermes-admin dan `hermes_team.py add-member/set-model`.\n")
+              "# Juga ditulis oleh tool admin di #hermes-admin dan `hermes_team.py add-member/set-model/set-sandbox`.\n")
     atomic_write(path, header + dump_yaml(body), mode=0o600)
 
 
@@ -802,6 +906,64 @@ def model_settings(team: dict, alias: str) -> list[tuple[str, object]]:
     chain = [llm["models"][a] for a in llm["fallback"] if a != alias]
     settings.append(("fallback_providers", [{"provider": c["provider"], "model": c["model"]} for c in chain]))
     return settings
+
+
+def compression_limits(team: dict, alias: Optional[str] = None) -> tuple[int, int]:
+    """(ambang kompresi, ambang pangkas) untuk model `alias`: nilai di llm.models.<alias> bila ada,
+    selain itu `scale.*`."""
+    scale = team["scale"]
+    block = ((team.get("llm") or {}).get("models") or {}).get(alias or "", {})
+    return (int(block.get("compression_threshold_tokens") or scale["compression_threshold_tokens"]),
+            int(block.get("proactive_prune_tokens") or scale["proactive_prune_tokens"]))
+
+
+def compression_settings(team: dict, alias: Optional[str] = None) -> list[tuple[str, object]]:
+    """Ambang kompresi profile mengikuti MODEL utamanya (ditulis per profile, bukan di managed config)."""
+    threshold, prune = compression_limits(team, alias)
+    return [("compression.threshold_tokens", threshold), ("compression.proactive_prune_tokens", prune)]
+
+
+def sandbox_limits(team: dict, member: Optional[dict] = None) -> tuple[Any, int]:
+    """(cpu, memory_mb) sandbox satu profile: pengecualian anggota bila ada, selain itu bawaan tim."""
+    override = (member or {}).get("sandbox") or {}
+    return (override.get("cpu", team["sandbox"]["cpu"]),
+            int(override.get("memory_mb", team["sandbox"]["memory_mb"])))
+
+
+def sandbox_settings(team: dict, member: Optional[dict] = None) -> list[tuple[str, object]]:
+    cpu, memory = sandbox_limits(team, member)
+    return [("terminal.container_cpu", cpu), ("terminal.container_memory", memory)]
+
+
+def scoped_settings(team: dict, role: str, member: Optional[dict] = None) -> list[tuple[str, object]]:
+    """Setelan PROFILE_SCOPED_KEYS untuk satu profile (role: member/template/shared/admin/lobby)."""
+    alias = model_alias(team, "member" if role == "template" else role, member) if team["llm"] else None
+    return sandbox_settings(team, member if role == "member" else None) + compression_settings(team, alias)
+
+
+def host_memory_mb(path: Optional[Path] = None) -> Optional[int]:
+    """RAM host dalam MB dari /proc/meminfo; None bila tidak bisa dibaca (macOS, container tanpa /proc)."""
+    try:
+        text = Path(path or MEMINFO_PATH).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    match = re.search(r"^MemTotal:\s+(\d+)\s*kB", text, re.MULTILINE)
+    return int(match.group(1)) // 1024 if match else None
+
+
+def sandbox_worst_case_mb(team: dict) -> int:
+    """Plafon RAM bila SEMUA sandbox penuh sekaligus: anggota aktif + shared + admin."""
+    return (sum(sandbox_limits(team, m)[1] for m in active_members(team))
+            + 2 * sandbox_limits(team)[1])
+
+
+def sandbox_warnings(team: dict) -> list[str]:
+    total, host = sandbox_worst_case_mb(team), host_memory_mb()
+    if host is None or total <= host:
+        return []
+    return [f"Plafon RAM sandbox terburuk {total} MB melebihi RAM server {host} MB. Batas itu plafon, bukan "
+            "cadangan, tetapi bila banyak sandbox penuh bersamaan server bisa kehabisan memori. Turunkan "
+            "sandbox.memory_mb / pengecualian per anggota (set-sandbox), atau tambah RAM."]
 
 
 def used_model_aliases(team: dict) -> list[str]:
@@ -910,6 +1072,7 @@ def host_settings(team: dict) -> list[tuple[str, object]]:
         ]
     if team["llm"]:
         settings += model_settings(team, model_alias(team, "lobby"))
+    settings += scoped_settings(team, "lobby")
     settings += plugin_settings(team)
     return settings
 
@@ -963,6 +1126,7 @@ def profile_settings(team: dict, role: str, member: Optional[dict] = None, *,
         raise ValueError(role)
     if team["llm"]:
         settings += model_settings(team, model_alias(team, "member" if role == "template" else role, member))
+    settings += scoped_settings(team, role, member)
     settings += plugin_settings(team)
     return settings
 
@@ -973,11 +1137,18 @@ def managed_config(team: dict) -> dict:
         "backend": "docker",                     # terminal/file/execute_code di container per profile
         "docker_mount_cwd_to_workspace": False,  # jangan pernah mount direktori host ke /workspace
         "container_persistent": True,            # /workspace tiap orang bertahan antar sesi
-        "container_cpu": sandbox["cpu"],
-        "container_memory": sandbox["memory_mb"],
         "docker_volumes": [],                    # tidak ada mount host tambahan
         "docker_extra_args": [],                 # tidak ada --privileged dan sejenisnya
     }
+    # container_cpu / container_memory dan dua ambang kompresi (PROFILE_SCOPED_KEYS) SENGAJA tidak dipin di
+    # sini. Key yang ada di managed config menang atas semua profile dan tidak bisa dibedakan per profile,
+    # padahal batas RAM perlu pengecualian per orang dan ambang kompresi mengikuti model tiap profile.
+    # Keduanya ditulis `apply` ke config.yaml tiap profile (profile_settings / host_settings).
+    # Tetap aman terhadap ANGGOTA: agent bekerja di sandbox Docker tanpa akses ke ~/.hermes (tidak ada
+    # mount host: docker_volumes, docker_extra_args, dan mount cwd tetap dipin di bawah), dan perintah slash
+    # yang mengubah config hanya untuk admin (user_allowed_commands). Yang hilang: jaminan dari root.
+    # Operator dengan shell sebagai user Hermes kini bisa mengubah empat nilai ini langsung di config.yaml
+    # profile (dulu hanya root lewat /etc/hermes); `apply` berikutnya mengembalikannya ke nilai tim.
     if sandbox["image"]:
         terminal["docker_image"] = sandbox["image"]
     if sandbox["network"]:
@@ -994,11 +1165,8 @@ def managed_config(team: dict) -> dict:
         "agent": {"max_turns": int(scale["agent_max_turns"]), "budget_warning_ratio": 0.8},
         "goals": {"max_turns": int(scale["goals_max_turns"])},
         "delegation": {"max_concurrent_children": int(scale["delegation_max_children"]), "max_spawn_depth": 1},
-        "compression": {
-            "threshold_tokens": int(scale["compression_threshold_tokens"]),
-            "proactive_prune_tokens": int(scale["proactive_prune_tokens"]),
-            "idle_compact_after_seconds": int(scale["idle_compact_after_seconds"]),
-        },
+        # Ambang threshold_tokens / proactive_prune_tokens: per profile, mengikuti modelnya (lihat di atas).
+        "compression": {"idle_compact_after_seconds": int(scale["idle_compact_after_seconds"])},
     }
     # Cron: satu job pada satu waktu per profile (tiap job = percakapan LLM di luar antrean team-guard).
     policy["cron"] = {"max_parallel_jobs": 1}
@@ -1126,6 +1294,11 @@ def _same(key: str, current: Any, desired: Any) -> bool:
         return True
     if isinstance(desired, bool) or isinstance(current, bool):
         return current is desired or current == desired
+    if isinstance(desired, (int, float)) and isinstance(current, str):
+        try:                      # "0.5" yang tersimpan sebagai teks tetap sama dengan 0.5
+            return float(current) == float(desired)
+        except ValueError:
+            return False
     return current == desired
 
 
@@ -1161,6 +1334,8 @@ class Hermes:
         self.failures: list[str] = []
         self.log: list[str] = []
         self.changed_keys: dict[str, set] = {}
+        self.managed_blocked: set = set()          # key per-profile yang dilewati karena masih dipin managed
+        self._managed_pins: Optional[set] = None
 
     def say(self, line: str) -> None:
         self.log.append(line)
@@ -1233,10 +1408,27 @@ class Hermes:
         except OSError:
             return {}
 
+    def managed_pins(self) -> set:
+        """PROFILE_SCOPED_KEYS yang MASIH dipin managed config terpasang (file dari kit versi lama).
+        Hermes menolak `config set` untuk key yang dipin, dan nilai managed tetap menang, jadi key itu
+        dilewati (bukan kegagalan) sampai admin memasang ulang /etc/hermes/config.yaml."""
+        if self._managed_pins is None:
+            override = os.environ.get("HERMES_MANAGED_DIR", "").strip()
+            folder = Path(override) if override and Path(override).is_dir() else Path("/etc/hermes")
+            try:
+                data = yaml.safe_load((folder / "config.yaml").read_text(encoding="utf-8"))
+            except (OSError, yaml.YAMLError):
+                data = None
+            self._managed_pins = {k for k in PROFILE_SCOPED_KEYS if _get_nested(data, k) is not None}
+        return self._managed_pins
+
     def config_set(self, profile: str, settings: Iterable[tuple[str, object]]) -> int:
         cfg, env = self.read_config(profile), self.read_env(profile)
         changed = attempted = 0
         for key, value in settings:
+            if key in PROFILE_SCOPED_KEYS and key in self.managed_pins():
+                self.managed_blocked.add(key)
+                continue
             if key.isupper():
                 same = env.get(key) == cli_value(key, value)
             else:
@@ -1448,6 +1640,8 @@ RESTART_KEYS = {
     "unauthorized_dm_behavior", "gateway.unauthorized_dm_decline_message", "max_concurrent_sessions",
     "plugins.enabled", "mcp_servers.teamctl",
 }
+# PROFILE_SCOPED_KEYS (batas sandbox, ambang kompresi) sengaja TIDAK di sini: ambang kompresi dibaca saat
+# sesi dibuat (berlaku di sesi baru), batas sandbox saat container profile itu dibuat.
 # Bagian yang diterapkan plugin team-guard ke gateway yang sedang jalan (dari roster.json → gateway).
 LIVE_KEYS = {"gateway.profile_routes", "discord.allowed_channels", "discord.free_response_channels"}
 
@@ -2221,12 +2415,53 @@ def _set_model(team: dict, hermes: Hermes, target: str, alias: str) -> dict:
     for role, profile, member in touched:
         if member is not None and not member.get("active", True):
             continue
-        if role == "lobby":
-            hermes.config_set("default", model_settings(team, alias))
-        else:
-            hermes.config_set(profile, model_settings(team, alias))
+        # Ambang kompresi mengikuti model (llm.models.<alias>), jadi ikut ditulis ulang saat model berganti.
+        settings = model_settings(team, alias) + compression_settings(team, alias)
+        hermes.config_set("default" if role == "lobby" else profile, settings)
     write_roster(team, hermes)
     return {"target": target, "model": alias, "profiles": [p for _, p, _ in touched], "failures": list(hermes.failures)}
+
+
+def set_sandbox(team: dict, hermes: Hermes, name: str, *, memory_mb: Any = None, cpu: Any = None,
+                reset: bool = False) -> dict:
+    """Batas sandbox khusus satu anggota: tulis members.yaml (di bawah kunci tim) lalu terapkan ke profile-nya.
+    `reset` menghapus pengecualian (kembali ke team.yaml → sandbox); bisa digabung dengan nilai baru."""
+    with team_lock(team):
+        return _set_sandbox(team, hermes, name, memory_mb=memory_mb, cpu=cpu, reset=reset)
+
+
+def _set_sandbox(team: dict, hermes: Hermes, name: str, *, memory_mb: Any, cpu: Any, reset: bool) -> dict:
+    if memory_mb is None and cpu is None and not reset:
+        raise TeamError("set-sandbox: isi --memory-mb dan/atau --cpu, atau --reset untuk kembali ke bawaan tim")
+    name = (name or "").strip().lower()
+    change = _sandbox_override({k: v for k, v in (("memory_mb", memory_mb), ("cpu", cpu)) if v is not None},
+                               "set-sandbox")
+    with members_lock(Path(team["paths"]["team_file"])):
+        fresh = load_team(Path(team["paths"]["team_file"]), Path(team["paths"]["members_file"]))
+        member = next((m for m in fresh["members"] if m["name"] == name), None)
+        if member is None:
+            raise TeamError(f"anggota '{name}' tidak ada (yang ada: "
+                            f"{', '.join(sorted(m['name'] for m in fresh['members'])) or '-'})")
+        override = {} if reset else dict(member.get("sandbox") or {})
+        override.update(change)
+        # Nilai yang sama dengan bawaan tim tidak disimpan sebagai pengecualian.
+        default_cpu, default_memory = sandbox_limits(fresh)
+        if override.get("memory_mb") == default_memory:
+            override.pop("memory_mb")
+        if "cpu" in override and float(override["cpu"]) == float(default_cpu):
+            override.pop("cpu")
+        member["sandbox"] = override
+        if not hermes.dry_run:
+            save_members(fresh)
+    team.clear()
+    team.update(fresh)
+    active = member.get("active", True)
+    if active:   # anggota nonaktif: profile-nya diparkir; nilainya diterapkan `apply` saat ia aktif lagi
+        hermes.config_set(member["profile"], sandbox_settings(team, member))
+    cpu_now, memory_now = sandbox_limits(team, member)
+    return {"name": name, "profile": member["profile"], "memory_mb": memory_now, "cpu": cpu_now,
+            "override": dict(override), "applied": bool(active), "worst_case_mb": sandbox_worst_case_mb(team),
+            "managed_blocked": sorted(hermes.managed_blocked), "failures": list(hermes.failures)}
 
 
 def set_member_active(team: dict, hermes: Hermes, name: str, active: bool) -> dict:
@@ -2727,6 +2962,16 @@ def describe(team: dict, hermes: Optional[Hermes] = None) -> str:
               f"cron anggota {'boleh' if s['allow_member_cron'] else 'mati'}, "
               f"/goal {'boleh' if s['allow_goals'] else 'mati'}, "
               f"retensi sesi {str(s['session_retention_days']) + ' hari' if s['session_retention_days'] else 'tidak diatur'}"]
+    default_cpu, default_memory = sandbox_limits(team)
+    total, host = sandbox_worst_case_mb(team), host_memory_mb()
+    lines.append(f"Sandbox: {default_memory} MB, {default_cpu} CPU per profile; plafon RAM terburuk {total} MB "
+                 f"({len(active_members(team))} anggota aktif + shared + admin)"
+                 + (f" dari RAM server {host} MB" + (" — MELEBIHI" if total > host else "") if host else ""))
+    for m in team["members"]:
+        if m.get("sandbox"):
+            cpu, memory = sandbox_limits(team, m)
+            lines.append(f"         {m['name']}: {memory} MB, {cpu} CPU (pengecualian)"
+                         + ("" if m["active"] else "  [NONAKTIF, tidak dihitung]"))
     ob = team["onboarding"]
     if ob["enabled"]:
         entry = f"role entry {team['entry_role']}" if team["entry_role"] else "tanpa role entry"
@@ -2829,6 +3074,11 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     p = sub.add_parser("set-model", parents=[common], help="ganti model")
     p.add_argument("target", help="nama anggota | all | shared | admin | lobby")
     p.add_argument("model", help="alias di llm.models")
+    p = sub.add_parser("set-sandbox", parents=[common], help="batas RAM/CPU sandbox khusus satu anggota")
+    p.add_argument("member", help="nama anggota")
+    p.add_argument("--memory-mb", default=None, help="RAM sandbox dalam MB (256..65536)")
+    p.add_argument("--cpu", default=None, help="jumlah CPU (0.25..64)")
+    p.add_argument("--reset", action="store_true", help="hapus pengecualian (kembali ke team.yaml → sandbox)")
     p = sub.add_parser("set-active", parents=[common], help="aktif/nonaktifkan anggota")
     p.add_argument("name")
     p.add_argument("state", choices=["on", "off"])
@@ -2908,6 +3158,19 @@ def _run(args: argparse.Namespace, events: bool) -> None:
             result = set_model(team, hermes, args.target, args.model)
             print(f"Model {result['target']} → {result['model']} ({', '.join(result['profiles'])}). "
                   "Berlaku untuk sesi baru (/new).")
+            _print_warnings(team, hermes)
+        elif args.command == "set-sandbox":
+            result = set_sandbox(team, hermes, args.member, memory_mb=args.memory_mb, cpu=args.cpu,
+                                 reset=args.reset)
+            kind = "pengecualian" if result["override"] else "bawaan tim"
+            print(f"Sandbox {result['name']} ({result['profile']}): {result['memory_mb']} MB, {result['cpu']} CPU "
+                  f"({kind}). Plafon RAM terburuk tim: {result['worst_case_mb']} MB.")
+            if not result["applied"]:
+                print("Anggota ini nonaktif: tersimpan di members.yaml, diterapkan saat ia diaktifkan lagi.")
+            else:
+                print("Berlaku saat container sandbox profile itu dibuat lagi; container yang sudah ada tetap "
+                      "memakai batas lama sampai dihapus (docker rm) — /workspace tersimpan di volume.")
+            _print_warnings(team, hermes)
         elif args.command == "set-active":
             result = set_member_active(team, hermes, args.name, args.state == "on")
             _print_apply_tail(team, hermes, result)
@@ -3058,9 +3321,19 @@ def _cmd_llm_key(team: dict, hermes: Hermes, who: str, *, use_stdin: bool = Fals
     print(f"✓ {key_env} disimpan di {path}. Ingat: nilai di /etc/hermes/.env (kalau ada) selalu menang.")
 
 
-def _print_warnings(team: dict) -> None:
+def managed_blocked_warning(hermes: Hermes) -> list[str]:
+    if not hermes.managed_blocked:
+        return []
+    return [f"/etc/hermes/config.yaml masih mem-pin {', '.join(sorted(hermes.managed_blocked))} (file dari kit "
+            "versi lama), jadi nilai per profile BELUM berlaku. Pasang ulang managed config "
+            "(`hermes_team.py managed` → sudo install), lalu jalankan `apply` sekali lagi."]
+
+
+def _print_warnings(team: dict, hermes: Optional[Hermes] = None) -> None:
     """Peringatan konfigurasi (tidak menggagalkan `check`/`apply`)."""
-    warnings = fallback_warnings(team)
+    warnings = fallback_warnings(team) + sandbox_warnings(team)
+    if hermes is not None:
+        warnings += managed_blocked_warning(hermes)
     if warnings:
         print("\n⚠️  Peringatan:")
         for line in warnings:
@@ -3071,7 +3344,7 @@ def _print_apply_tail(team: dict, hermes: Hermes, result: dict) -> None:
     print("\nSelesai." if not hermes.failures else f"\nSelesai dengan {len(hermes.failures)} kegagalan:")
     for failure in hermes.failures:
         print(f"  ✗ {failure}")
-    _print_warnings(team)
+    _print_warnings(team, hermes)
     known = {m["profile"] for m in team["members"]} | {team["template"]}
     profiles_dir = hermes.root / "profiles"
     stale = sorted(d.name for d in profiles_dir.iterdir()

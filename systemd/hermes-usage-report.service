@@ -1,0 +1,25 @@
+# Kirim laporan pemakaian LLM terjadwal ke channel Discord (tools/usage_post.py), tanpa LLM: angka
+# langsung dari buku besar. Tiap jalan hanya mengirim laporan yang jatuh tempo dan belum terkirim
+# (catatan: ~/.hermes-team/state/usage_posted.json), jadi aman dijalankan tiap 15 menit.
+#
+# Atur dulu di ~/.hermes-team/team.yaml (jam di dalam tanda kutip, zona waktu usage.timezone):
+#   usage:
+#     report_channel_id: "<ID channel teks di server tim>"
+#     reports: {daily: "08:00", weekly: "08:05", monthly: "08:10"}
+# report_channel_id kosong = unit ini tidak mengirim apa pun. Token bot dibaca dari ~/.hermes/.env.
+#
+# Unit USER milik user hermes:
+#   mkdir -p ~/.config/systemd/user && cp /opt/hermes-team/systemd/hermes-usage-report.* ~/.config/systemd/user/
+#   systemctl --user daemon-reload && systemctl --user enable --now hermes-usage-report.timer
+#   python3 /opt/hermes-team/tools/usage_post.py --list       # jadwal, jatuh tempo berikutnya, terakhir terkirim
+#   python3 /opt/hermes-team/tools/usage_post.py --dry-run    # lihat isi pesan tanpa mengirim
+#   journalctl --user -u hermes-usage-report.service          # riwayat pengiriman
+# Supaya timer user tetap jalan tanpa login: sudo loginctl enable-linger hermes
+[Unit]
+Description=Hermes team kit: kirim laporan pemakaian LLM terjadwal ke Discord
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /opt/hermes-team/tools/usage_post.py
+Nice=10

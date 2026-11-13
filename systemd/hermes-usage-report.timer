@@ -1,0 +1,13 @@
+# Lihat cara pasang di hermes-usage-report.service.
+[Unit]
+Description=Hermes team kit: periksa laporan pemakaian yang jatuh tempo tiap 15 menit
+
+[Timer]
+# Dua menit setelah pemotret (hermes-usage-collect, *:0/15) supaya tidak berebut kunci buku besar.
+OnCalendar=*:2/15
+# Server mati saat jadwal → jalan segera setelah hidup; usage_post.py menyusulkan satu periode terbaru.
+Persistent=true
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target

@@ -97,6 +97,8 @@ if argv[:2] == ["config", "set"] and len(argv) == 4:
         value = json.loads(raw)
     elif re.fullmatch(r"-?[0-9]+", raw):
         value = int(raw)            # seperti YAML: deretan digit jadi int
+    elif re.fullmatch(r"-?[0-9]+\.[0-9]+", raw):
+        value = float(raw)          # upstream set_config_value: bool/int/float
     else:
         value = raw
     path = os.path.join(home, "config.yaml")
@@ -297,6 +299,11 @@ def kit(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_TEAM_DIR", str(k.team_dir))
     monkeypatch.setenv("FAKE_HERMES_LOG", str(k.log))
     monkeypatch.setenv("HERMES_BIN", str(k.bin))
+    # Managed config milik server tempat tes berjalan tidak boleh ikut terbaca (kit melewati key yang dipin).
+    managed = tmp_path / "managed"
+    managed.mkdir()
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed))
+    k.managed_dir = managed
     for name in ("DISCORD_BOT_TOKEN", "PYTHONPATH", "HERMES_TEAM_DEBUG", "FAKE_HERMES_FAIL_KEYS",
                  "FAKE_HERMES_FAIL_CREATE"):
         monkeypatch.delenv(name, raising=False)
