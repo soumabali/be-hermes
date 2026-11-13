@@ -1909,14 +1909,20 @@ class Verify(Step):
                 extra["HERMES_PYTHON"] = python
             if source:
                 extra["PYTHONPATH"] = source
+                extra["HERMES_SRC"] = source
             ctx.say("  (keluaran muncul setelah uji selesai)")
             test = ctx.run(["bash", str(ctx.kit_dir / "tests" / "selftest.sh")], as_user=True, check=False,
                            extra_env=extra, timeout=3600)
             text = (test.out + "\n" + test.err).strip()
             for line in text.splitlines()[:3] + text.splitlines()[3:][-25:]:
                 ctx.say(f"    {line}")
-            integrated = "Hermes terdeteksi" in text and "DILEWATI" not in text
-            if test.rc == 2:
+            # selftest.sh: 0 = lulus dengan integrasi, 3 = unit lulus tetapi integrasi DILEWATI, 2 = prasyarat kurang.
+            integrated = test.rc == 0 and "Uji integrasi: DIJALANKAN" in text
+            if test.rc == 3:
+                ctx.warn("selftest: uji unit lulus, tetapi uji integrasi DILEWATI (alasannya tercetak di atas). Kecocokan kit "
+                         "dengan versi Hermes ini BELUM terbukti. Ulangi dengan HERMES_PYTHON=<python venv Hermes> dan "
+                         "HERMES_SRC=<direktori sumber Hermes>.")
+            elif test.rc == 2:
                 ctx.warn("selftest belum bisa jalan: pytest/PyYAML belum ada di Python yang dipakai (perintah pasangnya tercetak di atas)")
             elif not test.ok:
                 ctx.warn(f"selftest gagal (kode {test.rc}); kecocokan kit dengan versi Hermes ini belum terbukti")

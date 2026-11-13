@@ -9,12 +9,12 @@ secret (`.env`), sesi, dan sandbox Docker tiap orang terpisah.
 > Yang **belum pernah dijalankan**: gateway Hermes yang hidup, server Discord sungguhan, sandbox Docker,
 > dan endpoint LLM. Ikuti panduan ini di server uji dulu, dan jalankan `tests/selftest.sh` (Langkah 9).
 
-**Isi:** [Gambaran sistem](#gambaran-sistem) · [Instalasi dari nol](#panduan-instalasi-dari-nol) ·
-[Bila ada yang tidak jalan](#bila-ada-yang-tidak-jalan) · [Upgrade](#upgrade-dari-v30) · [Fitur](#fitur) ·
+**Isi:** [Gambaran sistem](#gambaran-sistem) · [Instalasi manual](#panduan-instalasi-manual-rujukan) ·
+[Instalasi cepat](#instalasi-cepat-satu-perintah) · [Bila ada yang tidak jalan](#bila-ada-yang-tidak-jalan) · [Upgrade](#upgrade-dari-v30) · [Fitur](#fitur) ·
 [Isi kit](#isi-kit) · [Onboarding](#5-onboarding-otomatis) · [Tool admin](#6-tool-admin-di-hermes-admin) ·
 [Secret](#8-secret-pribadi-anggota) · [Thread & memory](#9-konteks--memory-tidak-campur-aduk) ·
 [Skala](#10-skala-20-orang) · [Pemakaian token](#10b-pencatatan-pemakaian-token-dan-request) ·
-[Operasional](#12-operasional) · [Batasan](#13-batasan)
+[Operasional](#12-operasional) · [Operasi harian](#12a-operasi-harian) · [Batasan](#13-batasan)
 
 ## Gambaran sistem
 
@@ -83,9 +83,56 @@ stateDiagram-v2
 
 ---
 
-# Panduan instalasi dari nol
+# Instalasi cepat: satu perintah
 
-Ikuti berurutan. Perkiraan waktu: 1–2 jam untuk pertama kali.
+Di server Ubuntu/Debian baru:
+
+```bash
+git clone https://github.com/soumabali/be-hermes.git
+cd be-hermes
+sudo bash setup.sh
+```
+
+Wizard menjalankan 14 langkah berurutan, menjelaskan tiap langkah sebelum mengerjakannya, dan bisa
+dilanjutkan bila terhenti (jalankan lagi perintah yang sama).
+
+| # | Langkah | Otomatis? |
+|---|---|---|
+| 1–3 | Periksa server, pasang Docker/git, buat user `hermes` | Ya |
+| 4 | Sambungkan bot Discord | **Sebagian**: kamu membuat aplikasi bot di Developer Portal dan mengklik tautan undangan; wizard memberi instruksi, memeriksa token dan intent, lalu menunggu bot masuk server |
+| 5 | Buat role `entry`/`backend`/`hermes-admin`, kategori, `#hermes-shared`, `#hermes-admin`; catat semua ID | Ya (tidak ada lagi salin-tempel ID) |
+| 6 | Endpoint LLM dan API key (diuji dengan satu permintaan kecil) | Ya, kamu mengetik URL dan key |
+| 7 | Zona waktu, thread, channel laporan pemakaian | Ya |
+| 8–9 | Pasang Hermes (tanpa menyalakan gateway) dan kit | Ya |
+| 10–11 | Tulis `team.yaml`, `/etc/hermes/.env`, `apply`, kebijakan managed | Ya |
+| 12 | Opsional: image sandbox, timer pemakaian dan laporan | Ya |
+| 13–14 | Jalankan gateway, `doctor`, ringkasan dan daftar uji | Ya |
+
+Perintah yang berguna:
+
+```bash
+sudo bash setup.sh --list       # status tiap langkah
+sudo bash setup.sh --dry-run    # tampilkan yang akan dilakukan, tanpa mengubah apa pun
+sudo bash setup.sh --from llm   # ulangi mulai langkah tertentu
+sudo bash setup.sh --reset      # lupakan kemajuan (tidak menghapus yang sudah terpasang)
+```
+
+Tanpa tanya-jawab (mis. untuk server kedua): `HERMES_SETUP_BOT_TOKEN=… HERMES_SETUP_LLM_KEY=… sudo -E bash
+setup.sh --non-interactive --answers jawaban.yaml`. Token dan key hanya dibaca dari variabel lingkungan;
+berkas jawaban yang memuatnya ditolak.
+
+Token bot dan API key tidak pernah ditulis ke berkas state wizard (`/var/lib/hermes-team-setup/state.json`),
+log, atau argumen perintah.
+
+> Wizard ini diuji terhadap Discord tiruan dan perintah tiruan (57 uji). Ia **belum pernah dijalankan di
+> server sungguhan**. Pakai di server uji dulu; bila satu langkah gagal, pesan galatnya menyebut penyebab
+> yang paling mungkin dan cara melanjutkan. Panduan manual di bawah menjelaskan apa yang dikerjakan tiap langkah.
+
+---
+
+# Panduan instalasi manual (rujukan)
+
+Sama dengan yang dikerjakan wizard, langkah demi langkah. Perkiraan waktu: 1–2 jam.
 
 ```mermaid
 flowchart TD
@@ -207,27 +254,26 @@ Urutan di atas (kiri = paling tinggi) adalah susunan yang aman: role bot di atas
 Masuk sebagai user `hermes` (`sudo -iu hermes`).
 
 ```bash
-curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
+curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash -s -- --non-interactive --skip-setup
 exec $SHELL -l           # muat ulang PATH
 hermes --version
 ```
 
-Hermes terbaru berjalan di Python 3.14; installer menyiapkannya sendiri.
+`--skip-setup` penting: tanpa itu installer menjalankan `hermes setup` dan memasang layanan gateway,
+sehingga gateway bisa menyala **sebelum** konfigurasi tim diterapkan. Hermes terbaru berjalan di
+Python 3.14; installer menyiapkannya sendiri.
 
-Sambungkan bot:
-
-```bash
-hermes gateway setup     # pilih Discord, tempel token bot dari Langkah 3
-```
-
-Token tersimpan di `~/.hermes/.env` sebagai `DISCORD_BOT_TOKEN`. Pastikan modenya ketat:
+Sambungkan bot dengan menulis token langsung ke berkasnya (jangan pakai `hermes gateway setup`: wizard
+itu diakhiri tawaran menyalakan gateway):
 
 ```bash
+umask 077; mkdir -p ~/.hermes
+read -rsp "Token bot: " T && printf 'DISCORD_BOT_TOKEN=%s\n' "$T" >> ~/.hermes/.env; unset T; echo
 chmod 600 ~/.hermes/.env
 hermes doctor
 ```
 
-Jangan menjalankan gateway dulu; konfigurasi tim belum diterapkan.
+Gateway baru dijalankan di Langkah 10.
 
 ## Langkah 5 — Pasang kit
 
@@ -246,7 +292,7 @@ Pakai branch atau tag yang sudah kamu tinjau (`git -C /opt/hermes-team checkout 
 # sebagai user hermes
 mkdir -p ~/.hermes-team && chmod 700 ~/.hermes-team
 cp /opt/hermes-team/team.example.yaml    ~/.hermes-team/team.yaml
-cp /opt/hermes-team/members.example.yaml ~/.hermes-team/members.yaml
+cp /opt/hermes-team/members.example.yaml ~/.hermes-team/members.yaml   # berisi `members: []`
 ```
 
 ## Langkah 6 — Isi `team.yaml` dan `members.yaml`
@@ -290,6 +336,13 @@ usage:
 - **Mulai kosong** (`members: []`) bila semua orang akan masuk lewat onboarding otomatis (beri role
   `backend` di Langkah 11). Ini cara yang disarankan.
 - Atau isi anggota yang channel pribadinya sudah ada (lihat contoh di berkasnya).
+
+Aturan yang perlu diketahui:
+- Berkas yang dipakai: `--config` bila diberikan, kalau tidak `$HERMES_TEAM_DIR/team.yaml`, kalau tidak
+  `~/.hermes-team/team.yaml`. `./team.yaml` di folder kerja **tidak** dipakai otomatis.
+- `check` gagal dan `apply` menolak selama masih ada ID contoh (`1000…`, `2000…`, dst.).
+- Kunci yang salah ketik tidak lagi diabaikan diam-diam: `check`, `apply`, dan `status` mencetak
+  peringatan beserta saran nama yang benar.
 
 Validasi sebelum lanjut:
 
@@ -362,23 +415,26 @@ python3 $H apply                  # pertama kali: beberapa menit
 Pasang kebijakan *managed* (dipin untuk semua profile, tidak bisa diubah anggota):
 
 ```bash
-python3 $H managed > /tmp/hermes-managed.yaml
-sudo install -D -m 0644 -o root -g root /tmp/hermes-managed.yaml /etc/hermes/config.yaml
+sudo python3 /opt/hermes-team/hermes_team.py managed --install --config ~hermes/.hermes-team/team.yaml
+python3 $H apply                  # sekali lagi: empat setelan pindah dari managed ke tiap profile
+python3 $H managed --diff         # kapan saja: apakah berkas terpasang masih sama dengan team.yaml?
 ```
 
 Jalankan uji kit terhadap Hermes di server ini. Uji ini memakai HOME sementara dan Discord tiruan,
 jadi tidak menyentuh server Discord maupun `~/.hermes`:
 
 ```bash
-# sekali: pasang pytest ke Python milik Hermes (selftest.sh memberi tahu perintah persisnya bila belum ada)
 bash /opt/hermes-team/tests/selftest.sh
 ```
 
-Perhatikan baris awalnya. "Hermes terdeteksi" berarti uji integrasi (resolver rute, loader plugin,
-daftar toolset) ikut jalan. Bila tertulis uji integrasi **dilewati**, kecocokan kit dengan versi
-Hermes-mu belum terbukti.
+Skrip membuat venv sementara sendiri (tidak memasang apa pun ke Python sistem) dan mencari Python serta
+sumber Hermes dari launcher `hermes`. Baris terakhirnya menyatakan apakah uji integrasi **dijalankan**
+atau **dilewati**. Kode keluar 3 berarti uji unit lulus tetapi integrasi dilewati, jadi kecocokan kit
+dengan versi Hermes-mu belum terbukti; tunjukkan lokasinya dengan `HERMES_PYTHON=…` dan `HERMES_SRC=…`.
 
-Terakhir, periksa konsistensi (rute, profile, channel, izin berkas, buku besar pemakaian):
+Terakhir, sebelum menyalakan gateway, periksa semuanya. Dengan `--discord`, doctor memeriksa token bot,
+keanggotaan server, role dan urutannya, kategori, channel bersama/admin, dan izin bot, selain rute,
+profile, berkas managed, `/etc/hermes/.env`, linger, timer, dan buku besar pemakaian:
 
 ```bash
 python3 /opt/hermes-team/kit_doctor.py --discord
@@ -473,8 +529,8 @@ Setelah perbaikan apa pun: `python3 /opt/hermes-team/kit_doctor.py --discord`.
 1. Perbarui kit: `sudo git -C /opt/hermes-team pull` (atau salin versi baru), pemilik tetap root.
 2. Tambahkan blok `threads` dan `usage`, serta setelan `scale` baru, dari `team.example.yaml` ke `team.yaml`-mu.
    Perhatikan: cron dan `/goal` untuk anggota mati secara bawaan (§10).
-3. `python3 /opt/hermes-team/hermes_team.py apply`, pasang ulang `/etc/hermes/config.yaml` (`managed`), lalu
-   `apply` **sekali lagi** (empat setelan pindah dari managed ke tiap profile; lihat §10).
+3. `python3 /opt/hermes-team/hermes_team.py apply`, lalu `sudo python3 /opt/hermes-team/hermes_team.py managed
+   --install --config ~hermes/.hermes-team/team.yaml`, lalu `apply` **sekali lagi** (empat setelan pindah dari managed ke tiap profile; lihat §10).
 4. Pasang timer pemakaian dan, bila dipakai, timer laporan terjadwal (§10b).
 5. `/restart` **sekali**, lalu `python3 /opt/hermes-team/kit_doctor.py --discord`.
 
@@ -525,6 +581,9 @@ Satu-satunya bagian yang dipasang terpisah adalah timer pemakaian (§10b); `kit_
 
 | File | Fungsi |
 |---|---|
+| `setup.sh`, `kit_setup.py` | Wizard instalasi 14 langkah (lihat [Instalasi cepat](#instalasi-cepat-satu-perintah)). |
+| `kit_paths.py` | Satu tempat penentu lokasi `team.yaml`, state, dan buku besar. |
+| `CHANGELOG.md` | Perubahan per versi. |
 | `kit_base.py`, `kit_discord.py` | Dasar (versi, `TeamError`, tokenizer `.env`) dan klien Discord REST ringan; diimpor `hermes_team.py` dan tetap terlihat sebagai `hermes_team.DiscordAPI` dst. |
 | `hermes_team.py` | CLI provisioning & operasi (check, apply, managed, add-member, onboard, offboard, set-model, share-skill, …). Juga dipakai plugin dan tool admin. |
 | `teamctl_mcp.py` | Server MCP 27 tool: admin tim, kelola server Discord, dan `usage_report`; dipasang otomatis hanya di profile `team-admin`. |
@@ -708,8 +767,9 @@ Jejak semua aksi (tanpa nilai secret): `~/.hermes-team/state/audit.log` dan audi
   admin (`/whoami` menampilkan level akses).
 - Agent tidak bisa mengubah konfigurasinya sendiri: terminal & file berjalan di sandbox Docker
   tanpa akses ke `~/.hermes`.
-- Provider, model auxiliary, sandbox, dan batas skala dipin di `/etc/hermes/config.yaml`;
-  `hermes config set` menolak mengubahnya.
+- Provider, model auxiliary, dan sebagian besar setelan sandbox serta skala dipin di
+  `/etc/hermes/config.yaml`; `hermes config set` menolak mengubahnya. Batas CPU/RAM sandbox dan ambang
+  kompresi ditulis per profile (§10) supaya bisa berbeda per orang.
 - Bila model utama error atau kena throttle, Hermes otomatis pindah ke `llm.fallback`.
 
 ## 8. Secret pribadi anggota
@@ -720,9 +780,13 @@ Di channel pribadimu (atau thread di dalamnya):
 - `/env-list` → daftar nama secret (tanpa nilai). `/env-unset key:<nama>` → hapus.
 - Di chat cukup sebut namanya: "clone repo pakai `$GH_PAT`". AI memakai `$GH_PAT` di perintah
   sandbox tanpa pernah melihat nilainya.
-- Nama yang dipakai Hermes atau sistem ditolak beserta sarannya. Contoh: `GITHUB_TOKEN` dipakai
-  Hermes sebagai kredensial provider Copilot, jadi pakai `GH_PAT`, lalu di sandbox
-  `GH_TOKEN=$GH_PAT gh pr list`.
+- Nama yang dibaca Hermes atau sistem ditolak beserta sarannya, karena `.env` profile juga dibaca Hermes
+  sebagai konfigurasi. Itu mencakup semua namespace platform dan provider (`NTFY_*`, `OPENAI_*`, `AWS_*`,
+  `GITHUB_*`, …) dan nama berbentuk setelan (`*_BASE_URL`, `*_HOST`, `*_ENABLED`, `*_ALLOWED_USERS`, …).
+  Pakai nama sendiri, paling aman berawalan `MY_`, lalu petakan saat dipakai:
+  `GH_TOKEN=$GH_PAT gh pr list`, `AWS_ACCESS_KEY_ID=$MY_AWS_KEY_ID aws s3 ls`. `/env-list` menandai nama
+  lama yang kini ditolak beserta saran gantinya; tidak ada yang dihapus. Admin bisa membuka nama tertentu
+  lewat `secrets.allow_names`.
 - Nilai multi-baris (private key) simpan sebagai base64 dengan nama berakhiran `_B64`.
 
 Lapisan perlindungan:
@@ -863,6 +927,10 @@ Container yang sudah ada tetap memakai batas lama sampai dibuat ulang.
 
 ### Yang perlu diketahui
 
+- **Hanya perintah kontrol yang bebas pembatas:** `/stop`, `/approve`, `/deny`, `/status`, `/context`,
+  `/usage`, `/help`, `/commands`, `/whoami`, `/new`, `/reset`, `/title`, `/sessions`. Perintah lain yang
+  memulai giliran AI (`/btw`, `/retry`, `/plan`, pemanggilan skill) dan teks apa pun berawalan `/` kena
+  anggaran, rate limit, dan antrean seperti pesan biasa.
 - **RAM bawaan sandbox turun dari 2 GB ke 1 GB.** Build Java/Maven atau Node yang besar bisa kehabisan
   memori; naikkan per orang dengan `set-sandbox` atau ubah `sandbox.memory_mb`.
 - **Empat setelan tidak lagi dipin root:** batas CPU/RAM sandbox dan dua ambang kompresi kini ditulis di
@@ -1013,12 +1081,65 @@ Lihat daftar periksa di [Langkah 11](#langkah-11--uji-end-to-end-di-discord).
 | Onboarding ditahan / gagal | "status onboarding" → "lanjutkan onboarding @x"; detail di audit.log |
 | Ganti model | Chat atau `set-model`; berlaku di sesi baru |
 | Ubah batas skala / sandbox / provider | Edit `team.yaml` → `apply` → `managed` → pasang ulang `/etc/hermes/config.yaml` → `/restart` |
-| Update kit | Salin versi baru ke `/opt/hermes-team` → `apply` → `/restart` |
+| Update kit | Lihat [Upgrade](#upgrade-dari-v30): perbarui `/opt/hermes-team` → `apply` → `managed --install` → `apply` → `/restart`; perubahan ada di `CHANGELOG.md` |
+| Hapus anggota permanen | Nonaktifkan dulu, lalu `hermes_team.py remove-member <nama> --delete-profile --delete-channel` (`--dry-run` untuk melihat dulu) |
+| Cek berkas managed | `hermes_team.py managed --diff` |
+| Versi kit | `hermes_team.py --version` |
 | Update Hermes | `/update` (admin) atau `hermes update`; lalu `bash tests/selftest.sh` (memeriksa live reload) |
 | Periksa konsistensi | `python3 /opt/hermes-team/kit_doctor.py [--discord]` (members ↔ profile ↔ rute ↔ channel) |
 | Pemakaian token & request per orang | `python3 /opt/hermes-team/usage_ledger.py report --period week` atau tanya di #hermes-admin (§10b) |
 | Log | `hermes logs -f`; cari `team-guard` |
 | Audit | `~/.hermes-team/state/audit.log`, `onboarding.json` |
+
+## 12a. Operasi harian
+
+**Backup.** Empat lokasi memuat semua keadaan; cadangkan bersama, saat gateway berhenti atau lewat snapshot:
+
+| Lokasi | Isi |
+|---|---|
+| `~hermes/.hermes/` | profile, memory, skill, sesi (`state.db`), `.env` tiap profile, token bot |
+| `~hermes/.hermes-team/` | `team.yaml`, `members.yaml`, `state/` (roster, audit, buku besar pemakaian) |
+| `/etc/hermes/` | kebijakan managed dan API key LLM |
+| volume Docker sandbox | `/workspace` tiap anggota (`docker volume ls`, label `hermes-profile`) |
+
+```bash
+sudo -iu hermes hermes gateway stop
+sudo tar --numeric-owner -czf hermes-backup-$(date +%F).tgz /home/hermes/.hermes /home/hermes/.hermes-team /etc/hermes
+sudo -iu hermes hermes gateway start
+```
+
+Arsip itu berisi secret; simpan terenkripsi. Pemulihan: bentangkan ke lokasi yang sama, `apply`, lalu
+`kit_doctor.py --discord`. Prosedur ini belum pernah diuji pulih; coba sekali di server percobaan.
+
+**Rotasi token bot.** Reset di Developer Portal → ganti baris `DISCORD_BOT_TOKEN` di `~hermes/.hermes/.env`
+→ `hermes gateway restart`. Tidak ada berkas kit lain yang menyimpan token.
+
+**Rotasi API key LLM.** `sudoedit /etc/hermes/.env` → `hermes gateway restart`. Dengan `llm.per_user_keys`,
+pakai `hermes_team.py llm-key <nama>`.
+
+**Menghapus anggota permanen.** Cabut role `backend` (atau "nonaktifkan <nama>"), lalu:
+
+```bash
+python3 /opt/hermes-team/hermes_team.py remove-member budi --delete-profile --delete-channel --dry-run
+python3 /opt/hermes-team/hermes_team.py remove-member budi --delete-profile --delete-channel
+```
+
+Perintah itu mencetak apa yang tidak ikut dihapus (container dan volume sandbox) beserta perintah Docker-nya.
+
+**Banyak anggota sekaligus.** `hermes_team.py onboard-batch --file anggota.yaml`, dengan isi:
+
+```yaml
+- {user_id: "500000000000000011", username: dodi}
+- {user_id: "500000000000000012", username: eka, model: td-normal}
+```
+
+**Pindah server.** Pulihkan backup di server baru, pasang Hermes dan kit (`setup.sh --from hermes_install`
+akan melewati langkah yang sudah beres), jalankan `apply`, lalu matikan gateway lama **sebelum** menyalakan
+yang baru: satu token bot tidak boleh dipakai dua gateway.
+
+**Rollback kit.** `/opt/hermes-team` adalah salinan repo; kembali ke commit atau tag sebelumnya, `apply`,
+`managed --install`, `apply`, `/restart`. Profile dan data tidak tersentuh. Perubahan tiap versi ada di
+`CHANGELOG.md`.
 
 ## 12b. Perubahan perilaku v3.1 (hasil audit)
 
@@ -1052,7 +1173,7 @@ Yang perlu diketahui admin saat naik dari v3.0:
 - Profile `team-admin` kini membaca skill bawaan kit dari `/opt/hermes-team/skills` (hanya-baca, milik root).
 - Plugin 3.1.0 butuh `plugins.isolation: in_process` (bawaan Hermes). Satu salinan modul dimuat per profile,
   jadi status lintas-profile disimpan di entri `sys.modules` sintetis (`shared.py`).
-- `hold_stream` (opsional, default mati): menahan jawaban AI sampai disamarkan; tanpa itu balasan yang
+- `hold_stream` (opsional, default mati; setel dengan `hermes -p <profile> config set plugins.entries.team-guard.settings.hold_stream true`): menahan jawaban AI sampai disamarkan; tanpa itu balasan yang
   mengandung secret bisa terlihat sesaat saat streaming.
 
 > **Batas pembuktian.** Uji memakai Discord tiruan dan stub API plugin; uji integrasi di CI memakai kode
