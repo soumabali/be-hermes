@@ -727,3 +727,57 @@ def test_main_discord_runs_preflight_before_gateway_and_with_no_members(env, ser
     # tanpa token sama sekali: satu error yang jelas, bukan traceback
     assert kd.main(argv, run=run) == 1
     assert "DISCORD_BOT_TOKEN" in capsys.readouterr().out
+
+
+# ----------------------------------------------------------------------------- capabilities.json (plugin)
+def _caps(team, payload):
+    state = Path(team["paths"]["state_dir"])
+    state.mkdir(parents=True, exist_ok=True)
+    (state / "capabilities.json").write_text(payload if isinstance(payload, str) else json.dumps(payload))
+
+
+def test_capabilities_missing_is_info_only(env):
+    team, *_ = env
+    rep = kd.Report()
+    kd.check_capabilities(team, rep)
+    assert rep.errors == 0 and [i["level"] for i in rep.items] == [kd.INFO]
+
+
+def test_capabilities_unavailable_feature_warns_with_reason(env):
+    team, *_ = env
+    _caps(team, {"schema": 1, "hermes_version": "9.9", "generated_at": "2027-01-15T08:00:00Z",
+                 "capabilities": {"live_reload.rescan": {"available": False, "reason": "simbol hilang"},
+                                  "dispatch.get_command": {"available": True, "reason": ""}}})
+    rep = kd.Report()
+    kd.check_capabilities(team, rep, now=1_800_000_100)
+    warns = [i for i in rep.items if i["level"] == kd.WARN]
+    assert len(warns) == 1 and "live_reload.rescan" in warns[0]["message"] and "simbol hilang" in warns[0]["message"]
+
+
+def test_capabilities_all_available_is_a_positive_info(env):
+    team, *_ = env
+    _caps(team, {"schema": 1, "hermes_version": "9.9", "generated_at": "2027-01-15T08:00:00Z",
+                 "capabilities": {"a": {"available": True, "reason": ""}, "b": {"available": True, "reason": ""}}})
+    rep = kd.Report()
+    kd.check_capabilities(team, rep, now=1_800_000_100)
+    assert [i["level"] for i in rep.items] == [kd.INFO] and "semua 2 API" in rep.items[0]["message"]
+
+
+@pytest.mark.parametrize("payload", ["bukan json", "[]", json.dumps({"capabilities": "salah"})])
+def test_capabilities_garbage_never_crashes(env, payload):
+    team, *_ = env
+    _caps(team, payload)
+    rep = kd.Report()
+    kd.check_capabilities(team, rep)
+    assert rep.errors == 0 and rep.items and rep.items[0]["level"] == kd.WARN
+
+
+def test_capabilities_stale_file_is_noted_using_the_real_timestamp_format(env):
+    import calendar
+    import time as _t
+    team, *_ = env
+    _caps(team, {"schema": 1, "hermes_version": "9.9", "generated_at": "2026-01-01T00:00:00Z",
+                 "capabilities": {"a": {"available": True, "reason": ""}}})
+    rep = kd.Report()
+    kd.check_capabilities(team, rep, now=calendar.timegm(_t.strptime("2026-03-01", "%Y-%m-%d")))
+    assert any("berumur 59 hari" in i["message"] for i in rep.items)

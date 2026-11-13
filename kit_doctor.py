@@ -37,8 +37,15 @@ import re
 import stat
 import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Optional
+
+# Folder skrip harus ada di sys.path walau Python dijalankan dengan -I / PYTHONSAFEPATH (launcher tertentu
+# memakainya); modul kit lain (kit_*, kit/, teamctl/) berada di folder yang sama.
+_HERE = os.path.dirname(os.path.realpath(__file__))
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
 
 import yaml
 
@@ -157,6 +164,7 @@ def check_local(team: dict, root: Path, rep: Report, ht: Any) -> None:
             if alias not in llm["models"]:
                 rep.add(ERROR, "model", f"{m['name']} memakai model '{alias}' yang tidak ada di katalog")
     check_usage(team, rep)
+    check_capabilities(team, rep)
 
 
 def check_usage(team: dict, rep: Report, now: Optional[float] = None) -> None:
@@ -184,6 +192,41 @@ def check_usage(team: dict, rep: Report, now: Optional[float] = None) -> None:
     if age is None or age > 3600:
         last = "belum pernah" if age is None else f"{int(age // 60)} menit lalu"
         rep.add(WARN, "pemakaian", f"potret pemakaian terakhir: {last} (seharusnya tiap 15 menit)", fix)
+
+
+def check_capabilities(team: dict, rep: Report, now: Optional[float] = None) -> None:
+    """`capabilities.json` ditulis plugin team-guard saat start: fitur mana yang benar-benar aktif di Hermes
+    ini. Belum ada = gateway belum pernah menyala dengan plugin; fitur tak tersedia = Hermes berubah dan plugin
+    jatuh ke jalur cadangan (live reload → restart halus, antrean nonaktif, dst.)."""
+    import time
+    path = Path(team["paths"]["state_dir"]) / "capabilities.json"
+    if not path.exists():
+        rep.add(INFO, "plugin", "capabilities.json belum ada (gateway belum pernah dijalankan dengan plugin team-guard)")
+        return
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        caps = data["capabilities"]
+        if not isinstance(caps, dict):
+            raise ValueError("capabilities bukan pemetaan")
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        rep.add(WARN, "plugin", f"capabilities.json tidak terbaca ({type(exc).__name__}); jalankan ulang gateway")
+        return
+    missing = sorted(k for k, v in caps.items() if isinstance(v, dict) and v.get("available") is False)
+    for name in missing:
+        reason = str(caps[name].get("reason") or "tidak tersedia")[:160]
+        rep.add(WARN, "plugin", f"fitur plugin tidak aktif: {name} ({reason})",
+                "biasanya Hermes berubah; jalankan tests/selftest.sh dan lihat docs/BATASAN.md")
+    ver = data.get("hermes_version")
+    if ver and not missing:
+        rep.add(INFO, "plugin", f"semua {len(caps)} API Hermes yang dipakai plugin tersedia (Hermes {ver})")
+    stamp = data.get("generated_at")        # plugin menulis teks ISO UTC, mis. 2026-11-13T15:00:00Z
+    try:
+        written = datetime.strptime(str(stamp), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp()
+    except ValueError:
+        return
+    age = (time.time() if now is None else now) - written
+    if age > 14 * 86400:
+        rep.add(INFO, "plugin", f"capabilities.json berumur {int(age // 86400)} hari; ditulis ulang tiap gateway start")
 
 
 KIT_DIR = Path(__file__).resolve().parent

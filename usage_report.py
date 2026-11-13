@@ -26,6 +26,12 @@ import time
 from pathlib import Path
 from typing import Optional
 
+# Folder skrip harus ada di sys.path walau Python dijalankan dengan -I / PYTHONSAFEPATH (launcher tertentu
+# memakainya); modul kit lain (kit_*, kit/, teamctl/) berada di folder yang sama.
+_HERE = os.path.dirname(os.path.realpath(__file__))
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
+
 import kit_paths
 import usage_ledger
 

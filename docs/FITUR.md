@@ -41,11 +41,14 @@ Satu-satunya bagian yang dipasang terpisah adalah timer pemakaian ([Pemakaian](P
 |---|---|
 | `setup.sh`, `kit_setup.py` | Wizard instalasi 14 langkah (lihat [Instalasi cepat](../README.md#instalasi-cepat-satu-perintah)). |
 | `kit_paths.py` | Satu tempat penentu lokasi `team.yaml`, state, dan buku besar. |
+| `kit_config.py`, `kit_contracts.py` | Skema konfigurasi deklaratif (tabel `FIELDS`) dan bentuk berkas kontrak antar komponen ([Kontrak](KONTRAK.md)). |
+| `kit/` | Logika kit per tanggung jawab: `derive`, `provision`, `membership`, `skills`, `cli`, … ([Panduan pengembang](PENGEMBANGAN.md)). |
+| `VERSION` | Satu-satunya sumber nomor versi kit. |
 | `CHANGELOG.md` | Perubahan per versi. |
 | `kit_base.py`, `kit_discord.py` | Dasar (versi, `TeamError`, tokenizer `.env`) dan klien Discord REST ringan; diimpor `hermes_team.py` dan tetap terlihat sebagai `hermes_team.DiscordAPI` dst. |
-| `hermes_team.py` | CLI provisioning & operasi (check, apply, managed, add-member, onboard, offboard, set-model, share-skill, …). Juga dipakai plugin dan tool admin. |
-| `teamctl_mcp.py` | Server MCP 27 tool: admin tim, kelola server Discord, dan `usage_report`; dipasang otomatis hanya di profile `team-admin`. |
-| `plugins/team-guard/` (v3.1.0, modul kecil: `onboarding`, `livereload`, `secrets`, `guard`, `redact`, `ratelimit`, …) | Plugin Hermes: `/env-set`, penyamaran secret, guard perintah, rate limit & antrean, **onboarding otomatis, live reload rute**. Dipasang ke semua profile. |
+| `hermes_team.py` | Titik masuk CLI dan fasad (check, apply, managed, add-member, onboard, offboard, remove-member, set-model, set-sandbox, share-skill, config-doc, …); logikanya ada di `kit/`. Juga dipakai plugin (lewat subprocess) dan tool admin. |
+| `teamctl_mcp.py`, `teamctl/` | Server MCP 27 tool (admin tim, kelola server Discord, `usage_report`, anggaran); tool didaftarkan dengan dekorator `@tool`. Dipasang otomatis hanya di profile `team-admin`. |
+| `plugins/team-guard/` (modul kecil: `onboarding`, `livereload`, `secrets`, `guard`, `redact`, `limiters`, `upstream`, …; versinya di `plugin.yaml`) | Plugin Hermes: `/env-set`, penyamaran secret, guard perintah, rate limit & antrean, **onboarding otomatis, live reload rute**. Dipasang ke semua profile. |
 | `team.example.yaml` | Setelan tim (guild, role, admin, channel, model, sandbox, thread, skala, pemakaian, secret, onboarding, kelola server). |
 | `members.example.yaml` | Anggota + model per orang (juga ditulis otomatis oleh onboarding). |
 | `kit_doctor.py` | `doctor`: membandingkan members.yaml ↔ profile di disk ↔ rute gateway ↔ channel Discord (`--discord`) ↔ buku besar pemakaian; hanya membaca. |
@@ -55,7 +58,7 @@ Satu-satunya bagian yang dipasang terpisah adalah timer pemakaian ([Pemakaian](P
 | `usage_report.py` | Laporan sekali-jalan langsung dari `state.db` (tanpa buku besar). |
 | `tools/` | `probe_llm.py` (ukur kapasitas endpoint LLM), `usage_post.py` (laporan pemakaian terjadwal ke channel), `metrics_export.py` (metrik untuk Prometheus), `sandbox_idle.py` (laporkan/hentikan sandbox menganggur). |
 | `tests/loadtest/` | Simulasi 20 pengguna dan server LLM tiruan untuk uji beban. |
-| `docs/RENCANA-SKALA.md` | Rencana skala beserta status tiap butir. |
+| `docs/` | Dokumentasi per topik ([indeks](../README.md#dokumentasi)); `KONFIGURASI.md` dibangkitkan dari skema. |
 | `docker/sandbox/` | Dockerfile image sandbox tim (PHP, Go, Java, Node, Python, klien DB, `gh`). |
 | `.github/workflows/ci.yml` | CI: uji unit + uji integrasi terhadap Hermes yang dipin dan `main` (mingguan). |
 | `tests/` | `selftest.sh` menguji seluruh kit memakai Python milik Hermes di server ini (HOME sementara, Discord tiruan). Uji integrasi (resolver rute, loader plugin) dilewati bila Hermes tidak bisa di-import. |

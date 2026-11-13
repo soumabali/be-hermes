@@ -135,5 +135,8 @@ log, atau argumen perintah.
 | [Operasional](docs/OPERASI.md) | Tabel operasi, backup, rotasi token dan key, hapus anggota, pindah server, rollback |
 | [Perubahan perilaku v3.1](docs/PERUBAHAN-V3.1.md) | Yang berbeda dari v3.0 dan perlu diketahui admin |
 | [Batasan](docs/BATASAN.md) | Yang belum atau tidak bisa dilakukan kit |
+| [Referensi konfigurasi](docs/KONFIGURASI.md) | Semua key `team.yaml`: tipe, bawaan, arti (dibangkitkan dari skema) |
+| [Panduan pengembang](docs/PENGEMBANGAN.md) | Peta kode; cara menambah setelan, tool admin, pembatas, jenis profile; uji dan rilis |
+| [Kontrak antar komponen](docs/KONTRAK.md) | Berkas dan baris yang dipertukarkan kit, plugin, teamctl, dan tools |
 | [Rencana skala](docs/RENCANA-SKALA.md) | Celah skala yang diketahui dan status perbaikannya |
 | [CHANGELOG](CHANGELOG.md) | Perubahan per versi |

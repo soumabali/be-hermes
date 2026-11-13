@@ -60,6 +60,7 @@ if str(KIT) not in sys.path:
     sys.path.insert(0, str(KIT))
 
 import kit_discord  # noqa: E402
+import kit_paths  # noqa: E402
 import usage_ledger  # noqa: E402
 from kit_base import TeamError  # noqa: E402
 
@@ -92,30 +93,18 @@ def parse_hhmm(value: Any, where: str) -> Optional[tuple]:
 
 
 def load_config(team_file: Path) -> dict:
-    """Baca bagian yang diperlukan dari team.yaml. → {guild_id, timezone, channel_id, schedule}."""
+    """Bagian yang diperlukan dari team.yaml → {guild_id, timezone, channel_id, schedule}. Validasi `usage.*`
+    memakai skema kit (kit_config) lewat kit_paths, jadi aturannya SAMA dengan `check`/`apply` (mis. jam harus
+    "HH:MM" di dalam kutip); tidak ada pemeriksa kedua di sini."""
     try:
-        import yaml
-    except ImportError:
-        raise ConfigError("PyYAML tidak terpasang (pip install pyyaml)")
-    try:
-        data = yaml.safe_load(Path(team_file).read_text(encoding="utf-8")) or {}
-    except OSError as exc:
-        raise ConfigError(f"{team_file} tidak terbaca ({type(exc).__name__})")
-    except yaml.YAMLError as exc:
-        raise ConfigError(f"{team_file} bukan YAML yang valid ({type(exc).__name__})")
-    if not isinstance(data, dict):
-        raise ConfigError(f"{team_file}: isi harus berupa pemetaan")
-    usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
-    channel = str(usage.get("report_channel_id") or "").strip()
-    if channel and not channel.isdigit():
-        raise ConfigError("usage.report_channel_id harus ID channel Discord (angka, di dalam tanda kutip)")
-    reports = usage.get("reports") if isinstance(usage.get("reports"), dict) else {}
-    unknown = sorted(str(k) for k in reports if k not in KINDS)
-    if unknown:
-        raise ConfigError(f"usage.reports: jenis tidak dikenal: {', '.join(unknown)} (daily, weekly, monthly)")
+        data = kit_paths.load_raw(team_file, strict=True)
+        view = kit_paths.usage_view(raw=data)
+    except TeamError as exc:
+        raise ConfigError(str(exc))
+    reports = view.get("reports") or {}
     schedule = {kind: parse_hhmm(reports.get(kind), f"usage.reports.{kind}") for kind in KINDS}
-    return {"guild_id": str(data.get("guild_id") or "").strip(), "timezone": str(usage.get("timezone") or "").strip(),
-            "channel_id": channel, "schedule": schedule}
+    return {"guild_id": str(data.get("guild_id") or "").strip(), "timezone": view.get("timezone") or "",
+            "channel_id": view.get("report_channel_id") or "", "schedule": schedule}
 
 
 def usage_tz(name: str):

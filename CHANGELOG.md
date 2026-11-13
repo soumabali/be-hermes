@@ -1,9 +1,37 @@
 # Catatan perubahan
 
 Format mengikuti [Keep a Changelog](https://keepachangelog.com/id-ID/1.1.0/). Nomor versi kit hanya ada di
-satu tempat: `KIT_VERSION` di `kit_base.py` (lihat dengan `python3 hermes_team.py --version`).
+satu tempat: berkas `VERSION` (dibaca `kit_base.KIT_VERSION`; lihat dengan `python3 hermes_team.py --version`).
+Versi plugin (`plugins/team-guard/plugin.yaml`) dan `pyproject.toml` mengikutinya; `tests/test_release.py` menjaganya.
 
 ## [Belum dirilis]
+
+### Struktur dan kemudahan dikembangkan (hasil audit arsitektur)
+- **`hermes_team.py` (3.700 baris) dipecah** menjadi paket `kit/` (`constants`, `templates`, `profiles`, `util`,
+  `config`, `derive`, `hermes_cli`, `skills`, `provision`, `membership`, `cli`); `hermes_team.py` tinggal titik
+  masuk 111 baris dan fasad yang mempertahankan semua nama lama. Teks SOUL ada di `kit/templates/*.md`.
+- **`teamctl_mcp.py` (2.500 baris) dipecah** menjadi paket `teamctl/` dengan dekorator `@tool`: satu fungsi
+  satu dekorator = satu tool, dan tool yang mengubah sesuatu TIDAK bisa melewatkan konfirmasi (dipaksa lewat
+  `Plan`). `tools/list` identik byte demi byte; nama dan skema tool dipin uji (`PINNED_TOOLS_SHA256`).
+- **`kit_config.py`: skema konfigurasi deklaratif.** Menambah setelan yang ditegakkan plugin = satu baris
+  `FIELDS`. Validasi, bawaan, peringatan salah ketik, `roster["settings"]`, dan `hermes_team.py config-doc`
+  diturunkan dari tabel itu; uji menjaga `team.example.yaml` tetap mencakup semua field.
+- `PROFILE_KINDS` (`kit/profiles.py`) menggantikan percabangan member/shared/admin/lobby yang berulang.
+- Kontrak antar komponen: `kit_contracts.py` (`ROSTER_SCHEMA = 1`, TypedDict) dan `docs/KONTRAK.md`;
+  `roster.json`, `metrics.json`, `capabilities.json`, `onboarding.json` memuat `"schema": 1`; plugin memberi
+  peringatan bila roster lebih baru dari yang ia pahami.
+- Plugin: `upstream.py` (`HermesGateway`) satu-satunya modul yang menyentuh internal Hermes, menulis
+  `capabilities.json` (fitur mana yang aktif); protokol `Limiter` (`limiters.py`) menggantikan urutan
+  pembatas yang ditulis tangan. `kit_doctor.py` membaca `capabilities.json`.
+- `VERSION` sebagai satu sumber versi; `pyproject.toml`.
+- Titik masuk (`hermes_team.py`, `teamctl_mcp.py`, `kit_doctor.py`, `usage_*.py`, `kit_setup.py`) jalan dari
+  salinan di folder lain, juga dengan `python -I` / `PYTHONSAFEPATH` (`tests/test_entrypoints.py`).
+- `tools/usage_post.py` memvalidasi `usage.*` dengan skema kit (jam tanpa kutip kini ditolak, sama dengan `check`).
+
+### Keamanan
+- **PERILAKU BERUBAH:** `/env-set` memakai allowlist nama: berawalan `MY_`, salah satu dari 27 nama alat dev
+  umum (`GH_PAT`, `NPM_TOKEN`, …), atau `secrets.allow_names`. Daftar tolak lama tetap sebagai lapis kedua.
+  Alasan: nama bebas bisa bentrok dengan konfigurasi Hermes; pemindaian statis terus melewatkan nama baru.
 
 Hasil audit kepraktisan operator. Yang bertanda **PERILAKU BERUBAH** terasa oleh instalasi yang sudah jalan.
 

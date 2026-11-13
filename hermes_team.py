@@ -73,6 +73,12 @@ from datetime import datetime, timezone  # noqa: F401
 from pathlib import Path  # noqa: F401
 from typing import Any, Callable, Iterable, Optional  # noqa: F401
 
+# Folder skrip harus ada di sys.path walau Python dijalankan dengan -I / PYTHONSAFEPATH (launcher tertentu
+# memakainya); modul kit lain (kit_*, kit/, teamctl/) berada di folder yang sama.
+_HERE = os.path.dirname(os.path.realpath(__file__))
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
+
 import kit_paths  # noqa: F401
 from kit_base import (ID_RE, KIT_VERSION, TeamError, _closing_quote, _env_entries, _id,  # noqa: F401
                       _unquote_double, parse_env_text, rewrite_env_text)

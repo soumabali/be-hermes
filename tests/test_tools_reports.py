@@ -591,3 +591,40 @@ def test_export_output_file_atomic_0644_and_default_input(tmp_path, monkeypatch,
     # folder tujuan tidak ada → kode 1, pesan jelas, tidak crash
     assert export.main(["--output", str(tmp_path / "tidak-ada" / "x.prom")]) == 1
     assert "tidak bisa ditulis" in capsys.readouterr().err
+
+
+# ----------------------------------------------------------------------------- satu sumber validasi usage.*
+def _team_yaml(tmp_path, usage_block):
+    path = tmp_path / "team.yaml"
+    path.write_text(f"guild_id: '100000000000000001'\nusage:\n{usage_block}", encoding="utf-8")
+    return path
+
+
+def test_load_config_uses_the_kit_schema(tmp_path):
+    team = _team_yaml(tmp_path, "  timezone: Asia/Makassar\n  report_channel_id: '700000000000000001'\n"
+                                "  reports: {daily: '08:00', weekly: '8:30'}\n")
+    cfg = post.load_config(team)
+    assert cfg["channel_id"] == "700000000000000001" and cfg["timezone"] == "Asia/Makassar"
+    assert cfg["schedule"] == {"daily": (8, 0), "weekly": (8, 30), "monthly": None}
+
+
+def test_load_config_rejects_unquoted_times_like_check_does(tmp_path):
+    team = _team_yaml(tmp_path, "  report_channel_id: '700000000000000001'\n  reports: {daily: 21:30}\n")
+    with pytest.raises(post.ConfigError, match="kutip"):
+        post.load_config(team)
+
+
+def test_load_config_rejects_unknown_report_kind_and_bad_channel(tmp_path):
+    with pytest.raises(post.ConfigError):
+        post.load_config(_team_yaml(tmp_path, "  report_channel_id: '7000000000000000x'\n"))
+    with pytest.raises(post.ConfigError):
+        post.load_config(_team_yaml(tmp_path, "  reports: {hourly: '08:00'}\n"))
+
+
+def test_load_config_missing_or_broken_file_is_a_config_error(tmp_path):
+    with pytest.raises(post.ConfigError):
+        post.load_config(tmp_path / "tidak-ada.yaml")
+    bad = tmp_path / "rusak.yaml"
+    bad.write_text("usage: [", encoding="utf-8")
+    with pytest.raises(post.ConfigError):
+        post.load_config(bad)

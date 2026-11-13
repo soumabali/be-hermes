@@ -19,3 +19,6 @@ SOUL_ADMIN = _read("soul_admin.md")
 SOUL_LOBBY = _read("soul_lobby.md")
 DEFAULT_WELCOME = _read("welcome.md")
 DEFAULT_WELCOME_BACK = _read("welcome_back.md")
+
+
+del _read, _DIR     # pembantu impor saja; tidak ikut diekspor lewat fasad hermes_team

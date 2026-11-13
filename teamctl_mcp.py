@@ -78,6 +78,12 @@ from pathlib import Path
 from typing import Any, Callable, Optional, Union  # noqa: F401
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+# Folder skrip harus ada di sys.path walau Python dijalankan dengan -I / PYTHONSAFEPATH (launcher tertentu
+# memakainya); modul kit lain (kit_*, kit/, teamctl/) berada di folder yang sama.
+_HERE = os.path.dirname(os.path.realpath(__file__))
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
+
 import hermes_team as ht  # noqa: E402
 from teamctl import tools_discord, tools_team, tools_usage  # noqa: E402,F401  (mendaftarkan semua @tool)
 from teamctl.confirm import (GuardMixin, Plan, PlanFn, Planner, _clean, _clean_message, _INVISIBLE, _name,  # noqa: E402,F401

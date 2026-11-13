@@ -64,6 +64,11 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import yaml
 
+# Folder skrip harus ada di sys.path walau Python dijalankan dengan -I / PYTHONSAFEPATH.
+_HERE = os.path.dirname(os.path.realpath(__file__))
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
+
 from kit_base import ID_RE, KIT_VERSION, TeamError, parse_env_text, rewrite_env_text
 from kit_discord import BOT_ALLOW, MEMBER_ALLOW, PERM, DiscordAPI, DiscordHTTPError, permission_bits, permission_names
 

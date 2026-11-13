@@ -446,7 +446,7 @@ def onboard_member(ctl, args: dict) -> PlanFn:
         if model and team["llm"] and model not in team["llm"]["models"]:
             raise ToolError(f"model {_q(model, 60)} tidak ada; pilihan: {', '.join(team['llm']['models'])}")
         if name:
-            ht._check_new_name(team, name)
+            ht.check_new_name(team, name)
         label = srv.member_label(member)
         existing = next((m for m in team["members"] if m["user_id"] == uid), None)
         has_role = team["member_role"] in (member.get("roles") or [])
@@ -460,7 +460,7 @@ def onboard_member(ctl, args: dict) -> PlanFn:
                     f"profile {existing['profile']} dengan memory & secret lamanya.")
         else:
             preview_name = name or ht.derive_member_name(str(user.get("username") or ""), uid,
-                                                         ht._taken_names(team, ctl.hermes()))
+                                                         ht.taken_names(team, ctl.hermes()))
             effective = model or (team["llm"]["default_model"] if team["llm"] else "-")
             what = (f"Jadikan {label} anggota: channel privat #{team['channel_prefix']}{preview_name} (hanya dia + "
                     f"bot), profile {team['prefix']}{preview_name} (memory, .env, sandbox sendiri), model {effective}.")
