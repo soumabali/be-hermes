@@ -254,6 +254,39 @@ class TestEntryRole:
 
 # ============================================================================= @backend dari pemberi tepercaya
 class TestTrustedGrant:
+    @pytest.mark.parametrize("display", ["-keren-", "--model=mahal", "-_-", "- spasi ok", "--events", "-c /etc/x"])
+    def test_display_name_starting_with_dash_is_never_read_as_a_flag(self, env, display):
+        """Regresi: nama tampilan Discord yang diawali "-" dibaca argparse kit sebagai opsi → onboarding gagal
+        (atau opsi lain terisi). Nilai harus selalu lewat sebagai `--opsi=nilai`."""
+        env.member(S.U_DODI, "-dodi", (S.ROLE_ENTRY,), display_name=display)
+
+        async def body(bridge):
+            await env.grant(S.U_DODI, S.ADMIN)
+            await S.settle(bridge)
+
+        scenario(env, body)
+        (call,) = onboard_calls(env)
+        assert (call["user_id"], call["username"], call["display_name"]) == (S.U_DODI, "-dodi", display)
+        assert S.U_DODI in env.reload()["users"]                              # onboarding selesai
+
+    def test_kit_arguments_use_the_equals_form(self, env):
+        seen = []
+
+        async def body(bridge):
+            real = bridge.onboarder.kit
+
+            async def spy(roster, command, args, on_event=None):
+                seen.append((command, list(args)))
+                return await real(roster, command, args, on_event)
+
+            bridge.onboarder.kit = spy
+            await env.grant(S.U_DODI, S.ADMIN)
+            await S.settle(bridge)
+
+        scenario(env, body)
+        assert seen == [("onboard", [f"--user-id={S.U_DODI}", "--username=dodi.pratama",
+                                     "--display-name=Dodi Pratama"])]
+
     def test_full_flow(self, env):
         async def body(bridge):
             await env.grant(S.U_DODI, S.ADMIN)

@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""hermes_team.py — provisioning & operasi Hermes Agent untuk satu tim di Discord (kit v3).
+"""hermes_team.py — provisioning & operasi Hermes Agent untuk satu tim di Discord.
 
 Satu instalasi Hermes, satu bot Discord, satu gateway (multiplex), satu profile per orang.
 
-File (default di ~/.hermes-team/, atau folder tempat team.yaml berada):
+File (di $HERMES_TEAM_DIR, bawaan ~/.hermes-team/; atau folder team.yaml yang ditunjuk --config.
+./team.yaml di direktori kerja TIDAK dipakai diam-diam):
   team.yaml     setelan tim, ditulis manusia: guild, role, admin, channel bersama/admin,
                 katalog model, sandbox, batas skala, kebijakan secret, onboarding.
   members.yaml  daftar anggota + model per orang. Ditulis manusia ATAU otomatis: onboarding
@@ -14,7 +15,8 @@ Perintah:
   check          validasi + peta channel → profile → model
   apply          buat/perbarui profile, plugin team-guard, MCP admin, setelan gateway, roster
                  (--only andi,budi untuk sebagian anggota; --host-only untuk gateway saja)
-  managed        cetak /etc/hermes/config.yaml (kebijakan global yang tidak bisa diubah user)
+  managed        cetak /etc/hermes/config.yaml (kebijakan global yang tidak bisa diubah user);
+                 --diff bandingkan dengan yang terpasang, --install pasang (sebagai root)
   host-yaml      cetak setelan gateway sebagai YAML (untuk dicek / ditempel manual)
   add-member     tambah anggota (opsional: buat channel Discord privat otomatis)
   onboard        anggota dari user Discord: channel privat + profile + rute (idempoten; dipanggil
@@ -23,6 +25,8 @@ Perintah:
   set-model      ganti model AI anggota / shared / admin / lobby
   set-sandbox    batas RAM/CPU sandbox khusus satu anggota (--memory-mb, --cpu, --reset)
   set-active     aktif/nonaktifkan anggota berdasarkan nama
+  remove-member  hapus PERMANEN anggota yang sudah nonaktif dari members.yaml
+                 (--delete-profile, --delete-channel, --yes)
   list-skills    daftar skill milik seorang anggota
   share-skill    bagikan skill seorang anggota ke anggota lain atau semua anggota (ditolak bila pemindai
                  keamanan Hermes tidak memberi verdict "safe"; --allow-unscanned bila pemindai tidak ada)
@@ -42,6 +46,7 @@ import argparse
 import base64
 import contextlib
 import copy
+import difflib
 import getpass
 import hashlib
 import http.client
@@ -64,6 +69,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Optional
 
+import kit_paths
 from kit_base import (ID_RE, KIT_VERSION, TeamError, _closing_quote, _env_entries, _id,  # noqa: F401
                       _unquote_double, parse_env_text, rewrite_env_text)
 from kit_discord import (PERMISSIONS, PERMISSION_ALIASES, ELEVATED_PERMISSIONS, PERM, MEMBER_ALLOW, BOT_ALLOW, ELEVATED_MASK, permission_bits, permission_names, DiscordHTTPError, discord_token, private_overwrites, MemberList, DiscordAPI)  # noqa: F401
@@ -84,7 +90,7 @@ PLUGIN_NAME = "team-guard"
 PLUGIN_SRC = KIT_DIR / "plugins" / PLUGIN_NAME
 TEAMCTL = KIT_DIR / "teamctl_mcp.py"
 KIT_SKILLS = KIT_DIR / "skills"
-DEFAULT_TEAM_DIR = Path(os.environ.get("HERMES_TEAM_DIR") or "~/.hermes-team").expanduser()
+DEFAULT_TEAM_DIR = kit_paths.team_dir()     # nilai saat impor; pakai kit_paths.team_dir() untuk nilai terkini
 
 PROFILE_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")     # aturan nama profile Hermes
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,40}$")         # nama anggota
@@ -359,8 +365,16 @@ def dump_yaml(data: Any) -> str:
 
 # --------------------------------------------------------------------------- muat team.yaml + members.yaml
 def default_team_file() -> Path:
-    local = Path("team.yaml")
-    return local if local.exists() else DEFAULT_TEAM_DIR / "team.yaml"
+    """team.yaml bawaan: $HERMES_TEAM_DIR/team.yaml, kalau tidak ~/.hermes-team/team.yaml (kit_paths).
+    `./team.yaml` di direktori kerja TIDAK dipakai diam-diam (dulu menang, dan state ikut folder itu
+    sementara unit systemd selalu memakai ~/.hermes-team → state terbelah)."""
+    return kit_paths.team_file()
+
+
+def managed_dir() -> Path:
+    """Folder managed scope Hermes: env HERMES_MANAGED_DIR (uji / instalasi tak lazim) atau /etc/hermes."""
+    override = os.environ.get("HERMES_MANAGED_DIR", "").strip()
+    return Path(override).expanduser() if override else Path("/etc/hermes")
 
 
 def _read_yaml_file(path: Path, what: str) -> dict:
@@ -591,9 +605,106 @@ def default_user_commands(scale: dict) -> list[str]:
     return [c for c in DEFAULT_USER_COMMANDS if c not in GOAL_COMMANDS]
 
 
+# Key yang dikenal di team.yaml (teratas dan per bagian) dan members.yaml. Key lain TIDAK menggagalkan
+# pemuatan (kecuali yang sejak dulu ditolak: onboarding.*, usage.reports.*, sandbox per anggota) tetapi
+# dikumpulkan ke team["warnings"]: salah ketik seperti scale.max_concurent_sessions dulu hilang diam-diam.
+TOP_LEVEL_KEYS = (
+    "team_name", "guild_id", "roles", "admins", "category_id", "channel_prefix", "profile_prefix",
+    "template_profile", "shared", "admin", "team_skills_dir", "team_skills_in_personal",
+    "strict_personal_routes", "strict_admin_routes", "lobby_restrict", "threads", "allow_browser", "llm",
+    "sandbox", "scale", "usage", "secrets", "onboarding", "live_reload", "restart_fallback", "server_admin",
+    "user_allowed_commands", "extra_routes", "members")
+ROLE_KEYS = ("member", "admin", "entry")
+SYSTEM_PROFILE_KEYS = ("profile", "channel_id", "auto_skills")
+THREAD_KEYS = ("personal", "admin")
+SANDBOX_KEYS = ("image", "cpu", "memory_mb", "network", "http_proxy", "no_proxy")
+USAGE_KEYS = ("timezone", "report_channel_id", "reports")
+LLM_KEYS = ("providers", "models", "default_model", "admin_model", "shared_model", "lobby_model", "aux_model",
+            "fallback", "per_user_keys")
+LLM_MODEL_KEYS = ("provider", "model", "compression_threshold_tokens", "proactive_prune_tokens")
+MEMBERS_FILE_KEYS = ("members", "models")
+MEMBER_KEYS = ("name", "display_name", "discord_user_id", "channel_id", "model", "active", "forward_env",
+               "sandbox")
+
+
+def _unknown_keys(block: Any, known: Iterable[str], where: str, source: str, warnings: list[str]) -> None:
+    """Catat key di `block` yang tidak ada di `known`, dengan saran "maksudnya …?" (difflib)."""
+    if not isinstance(block, dict):
+        return
+    known = [str(k) for k in known]
+    for key in block:
+        if str(key) in known:
+            continue
+        label = f"{where}.{key}" if where else str(key)
+        near = difflib.get_close_matches(str(key), known, n=1, cutoff=0.6)
+        hint = f"maksudnya '{near[0]}'?" if near else "pilihan: " + ", ".join(sorted(known))
+        warnings.append(f"{source}: key '{label}' tidak dikenal dan DIABAIKAN ({hint})")
+
+
+def _team_unknown_keys(raw: dict) -> list[str]:
+    warnings: list[str] = []
+    src = "team.yaml"
+    _unknown_keys(raw, TOP_LEVEL_KEYS, "", src, warnings)
+    for section, known in (("roles", ROLE_KEYS), ("shared", SYSTEM_PROFILE_KEYS), ("admin", SYSTEM_PROFILE_KEYS),
+                           ("threads", THREAD_KEYS), ("sandbox", SANDBOX_KEYS), ("scale", SCALE_DEFAULTS),
+                           ("usage", USAGE_KEYS), ("secrets", SECRETS_DEFAULTS),
+                           ("server_admin", SERVER_ADMIN_DEFAULTS), ("llm", LLM_KEYS)):
+        _unknown_keys(raw.get(section), known, section, src, warnings)
+    llm = raw.get("llm")
+    if isinstance(llm, dict) and isinstance(llm.get("models"), dict):
+        for alias, block in llm["models"].items():
+            _unknown_keys(block, LLM_MODEL_KEYS, f"llm.models.{alias}", src, warnings)
+    return warnings
+
+
+def _members_unknown_keys(mraw: dict) -> list[str]:
+    warnings: list[str] = []
+    src = "members.yaml"
+    _unknown_keys(mraw, MEMBERS_FILE_KEYS, "", src, warnings)
+    for i, entry in enumerate(mraw.get("members") or []):
+        if isinstance(entry, dict):
+            _unknown_keys(entry, MEMBER_KEYS, f"members[{i}]" + (f" ({entry['name']})" if entry.get("name") else ""),
+                          src, warnings)
+    return warnings
+
+
+# ID contoh dari team.example.yaml / members.example.yaml: satu digit, deretan nol, lalu 1–2 digit
+# (100000000000000001, 200000000000000002, 400000000000000009, …). Snowflake Discord asli tidak berbentuk begitu.
+PLACEHOLDER_ID_RE = re.compile(r"^[1-9]0{10,}[0-9]{1,2}\Z")
+ALLOW_PLACEHOLDERS_ENV = "HERMES_TEAM_ALLOW_PLACEHOLDERS"     # khusus uji otomatis (ID tiruan)
+
+
+def placeholder_ids(team: dict) -> list[str]:
+    """Key yang masih berisi ID contoh, sebagai "key (nilai)". `load_team` tetap memuatnya (contoh & uji
+    memakainya); `check` gagal dan `apply` menolak bila daftar ini tidak kosong."""
+    pairs: list[tuple[str, str]] = [
+        ("guild_id", team["guild_id"]), ("roles.member", team["member_role"]), ("roles.admin", team["admin_role"]),
+        ("roles.entry", team["entry_role"]), ("category_id", team["category_id"]),
+        ("shared.channel_id", team["shared"]["channel_id"]), ("admin.channel_id", team["admin"]["channel_id"]),
+        ("usage.report_channel_id", team["usage"]["report_channel_id"])]
+    pairs += [(f"admins[{i}]", a) for i, a in enumerate(team["admins"])]
+    pairs += [(f"onboarding.trusted_actor_ids[{i}]", a)
+              for i, a in enumerate(team["onboarding"].get("trusted_actor_ids") or [])]
+    for m in team["members"]:
+        pairs += [(f"members.yaml {m['name']}.discord_user_id", m["user_id"]),
+                  (f"members.yaml {m['name']}.channel_id", m["channel_id"])]
+    return [f"{key} ({value})" for key, value in pairs if value and PLACEHOLDER_ID_RE.match(str(value))]
+
+
+def placeholders_allowed(flag: bool = False) -> bool:
+    return bool(flag) or os.environ.get(ALLOW_PLACEHOLDERS_ENV, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def placeholder_message(found: list[str]) -> str:
+    return ("konfigurasi masih memakai ID contoh dari team.example.yaml / members.example.yaml:\n"
+            + "\n".join(f"  • {item}" for item in found)
+            + "\nGanti dengan ID asli (Discord → Developer Mode → klik kanan → Copy ID), lalu jalankan `check` lagi.")
+
+
 def load_team(team_path: Path, members_path: Optional[Path] = None) -> dict:
     team_path = Path(team_path).expanduser()
     raw = _read_yaml_file(team_path, "team")
+    warnings = _team_unknown_keys(raw)
     team_dir = team_path.parent.resolve()
     team: dict = {"team_name": str(raw.get("team_name") or "Backend")}
     team["guild_id"] = _id(raw.get("guild_id"), "guild_id")
@@ -690,6 +801,9 @@ def load_team(team_path: Path, members_path: Optional[Path] = None) -> dict:
         mraw = {"members": raw.get("members"), "models": {}}
     else:
         mraw = {"members": [], "models": {}}
+    if members_file.exists():
+        warnings += _members_unknown_keys(mraw)
+    team["warnings"] = warnings
     team["members"] = [_load_member(m, i, team) for i, m in enumerate(mraw.get("members") or [])]
     overrides = {}
     for key, alias in (mraw.get("models") or {}).items():
@@ -1193,6 +1307,88 @@ def managed_yaml(team: dict) -> str:
             + dump_yaml(managed_config(team)))
 
 
+def _flatten(data: Any, trail: str = "") -> dict:
+    """Mapping bersarang → {"a.b.c": nilai}. Daftar dan mapping kosong dihitung sebagai nilai."""
+    if isinstance(data, dict) and data:
+        out: dict = {}
+        for key, value in data.items():
+            out.update(_flatten(value, f"{trail}.{key}" if trail else str(key)))
+        return out
+    return {trail: data} if trail else {}
+
+
+def managed_diff(team: dict, path: Optional[Path] = None) -> dict:
+    """Bandingkan `managed_config(team)` dengan berkas managed yang TERPASANG (hanya membaca).
+
+    Kembalikan {path, missing_file, unreadable, missing, changed, extra, moved}:
+      missing  key yang diinginkan kit tetapi belum ada di berkas terpasang
+      changed  key yang nilainya berbeda
+      extra    key di berkas terpasang yang tidak (lagi) dipin kit — nilainya tetap menang atas semua profile
+      moved    bagian dari `extra`: PROFILE_SCOPED_KEYS, yang sekarang ditulis `apply` per profile
+    """
+    path = Path(path) if path else managed_dir() / "config.yaml"
+    result: dict = {"path": str(path), "missing_file": False, "unreadable": "", "missing": [], "changed": [],
+                    "extra": [], "moved": []}
+    try:
+        installed = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        result["missing_file"] = True
+        return result
+    except (OSError, yaml.YAMLError) as exc:
+        result["unreadable"] = f"{type(exc).__name__}: {exc}"
+        return result
+    want = _flatten(yaml.safe_load(dump_yaml(managed_config(team))))
+    have = _flatten(installed if isinstance(installed, dict) else {})
+    result["missing"] = sorted(k for k in want if k not in have)
+    result["changed"] = sorted(k for k in want if k in have and have[k] != want[k])
+    result["moved"] = sorted(k for k in PROFILE_SCOPED_KEYS if _get_nested(installed, k) is not None)
+    result["extra"] = sorted(k for k in have if k not in want)
+    return result
+
+
+def managed_diff_clean(diff: dict) -> bool:
+    return not (diff["missing_file"] or diff["unreadable"] or diff["missing"] or diff["changed"] or diff["extra"])
+
+
+def managed_install_command(team: dict) -> str:
+    """Perintah sudo persis untuk memasang managed config (team.yaml disebut eksplisit: HOME root berbeda)."""
+    cmd = ["sudo", sys.executable or "python3", str(Path(__file__).resolve()), "managed", "--install",
+           "-c", team["paths"]["team_file"]]
+    if os.environ.get("HERMES_MANAGED_DIR", "").strip():
+        cmd[1:1] = ["env", f"HERMES_MANAGED_DIR={managed_dir()}"]
+    return shlex.join(cmd)
+
+
+def managed_diff_lines(diff: dict) -> list[str]:
+    path = diff["path"]
+    if diff["missing_file"]:
+        return [f"{path} belum ada"]
+    if diff["unreadable"]:
+        return [f"{path} tidak terbaca ({diff['unreadable']})"]
+    lines = [f"kurang (belum dipin): {key}" for key in diff["missing"]]
+    lines += [f"berbeda: {key}" for key in diff["changed"]]
+    for key in diff["extra"]:
+        note = (" — sudah dipindah kit ke config per profile; selama masih dipin di sini nilai per profile "
+                "TIDAK berlaku") if key in diff["moved"] else " — tidak dipin kit (bila sengaja ditambah manual, abaikan)"
+        lines.append(f"berlebih: {key}{note}")
+    return lines
+
+
+def install_managed(team: dict, *, target_dir: Optional[Path] = None, euid: Optional[int] = None,
+                    dry_run: bool = False) -> Path:
+    """Tulis managed config secara atomik (0644). Harus root; kalau bukan → TeamError berisi perintah sudo."""
+    euid = os.geteuid() if euid is None else euid
+    target = Path(target_dir) if target_dir else managed_dir()
+    path = target / "config.yaml"
+    if euid != 0:
+        raise TeamError(f"memasang {path} harus sebagai root. Jalankan persis:\n  {managed_install_command(team)}")
+    if dry_run:
+        return path
+    target.mkdir(parents=True, exist_ok=True)
+    atomic_write(path, managed_yaml(team), mode=0o644)
+    return path
+
+
 def roster_data(team: dict, hermes_root: Path, hermes_bin: str) -> dict:
     channels: dict = {}
     users: dict = {}
@@ -1413,10 +1609,8 @@ class Hermes:
         Hermes menolak `config set` untuk key yang dipin, dan nilai managed tetap menang, jadi key itu
         dilewati (bukan kegagalan) sampai admin memasang ulang /etc/hermes/config.yaml."""
         if self._managed_pins is None:
-            override = os.environ.get("HERMES_MANAGED_DIR", "").strip()
-            folder = Path(override) if override and Path(override).is_dir() else Path("/etc/hermes")
             try:
-                data = yaml.safe_load((folder / "config.yaml").read_text(encoding="utf-8"))
+                data = yaml.safe_load((managed_dir() / "config.yaml").read_text(encoding="utf-8"))
             except (OSError, yaml.YAMLError):
                 data = None
             self._managed_pins = {k for k in PROFILE_SCOPED_KEYS if _get_nested(data, k) is not None}
@@ -2499,6 +2693,108 @@ def set_member_active(team: dict, hermes: Hermes, name: str, active: bool) -> di
         return {"member": name, "active": active, "notes": notes, **result}
 
 
+def _sandbox_cleanup_commands(profile: str) -> list[str]:
+    """Perintah docker untuk sandbox satu profile. Kit TIDAK menjalankannya (volume = isi /workspace)."""
+    return [f'docker ps -a --filter "label=hermes-profile={profile}" --format "{{{{.ID}}}} {{{{.Names}}}} {{{{.Mounts}}}}"'
+            "    # lihat container & volume-nya",
+            f'docker rm -f $(docker ps -aq --filter "label=hermes-profile={profile}")    # hapus container',
+            "docker volume rm <nama-volume-dari-kolom-Mounts>    # hapus /workspace (PERMANEN)"]
+
+
+def remove_member_plan(team: dict, hermes: Hermes, name: str, *, delete_profile: bool = False,
+                       delete_channel: bool = False) -> dict:
+    """Apa saja yang akan dihapus / dibiarkan oleh `remove-member` (tidak mengubah apa pun)."""
+    member = next((m for m in team["members"] if m["name"] == name), None)
+    if member is None:
+        raise TeamError(f"anggota '{name}' tidak ada di members.yaml")
+    if member.get("active", True):
+        raise TeamError(f"anggota '{name}' masih AKTIF. Offboard dulu: `hermes_team.py set-active {name} off` "
+                        f"(atau `offboard --user-id {member['user_id']}`), lalu ulangi remove-member.")
+    profile = member["profile"]
+    registry = shared_skill_registry(team)["skills"]
+    origin = sorted(s for s, e in registry.items()
+                    if e.get("origin_member") == name or e.get("origin_profile") == profile)
+    targeted = sorted(s for s, e in registry.items() if name in (e.get("targets") or []) and s not in origin)
+    will = [f"entri '{name}' di {team['paths']['members_file']}"]
+    if targeted:
+        will.append(f"nama '{name}' dari daftar penerima skill bersama: {', '.join(targeted)}")
+    if origin:
+        will.append(f"skill bersama kiriman '{name}' ditarik dari semua penerima berikut arsipnya: {', '.join(origin)}")
+    keep: list[str] = []
+    home = hermes.home(profile)
+    if delete_profile:
+        will.append(f"profile {profile} ({home}: memory, .env/secret, skill, riwayat sesi) lewat `hermes profile delete`"
+                    if hermes.dir_exists(profile) else f"profile {profile}: sudah tidak ada di disk (dilewati)")
+    elif hermes.dir_exists(profile):
+        keep.append(f"profile {profile} di {home} (hapus: tambah --delete-profile, atau `hermes profile delete {profile}`)")
+    if delete_channel:
+        will.append(f"channel Discord {member['channel_id']} berikut seluruh riwayat pesannya")
+    else:
+        keep.append(f"channel Discord {member['channel_id']} (hapus: tambah --delete-channel, atau hapus di Discord)")
+    keep.append(f"container & volume sandbox profile {profile} (kit tidak menghapusnya):")
+    keep += ["    " + line for line in _sandbox_cleanup_commands(profile)]
+    keep.append("angka pemakaian lama di buku besar (state/usage.db) — tetap tersimpan sebagai riwayat")
+    return {"member": member, "will_delete": will, "kept": keep, "origin_skills": origin, "target_skills": targeted}
+
+
+def remove_member(team: dict, hermes: Hermes, name: str, *, delete_profile: bool = False,
+                  delete_channel: bool = False, api: Optional[DiscordAPI] = None) -> dict:
+    """Hapus PERMANEN anggota yang sudah nonaktif: entri members.yaml + rujukan di registry skill bersama;
+    opsional profile (`hermes profile delete`) dan channel Discord. Sandbox Docker tidak disentuh.
+    Di bawah kunci tim. Dengan dry-run hanya mengembalikan rencana."""
+    with team_lock(team):
+        reload_team(team)
+        plan = remove_member_plan(team, hermes, name, delete_profile=delete_profile, delete_channel=delete_channel)
+        member, done, notes = plan["member"], [], []
+        if hermes.dry_run:
+            return {**plan, "done": done, "notes": ["dry-run: tidak ada yang dihapus"], "dry_run": True}
+        # 1) skill bersama: tarik kiriman orang ini selagi ia masih dikenal, lalu lepas namanya dari daftar penerima.
+        for skill in plan["origin_skills"]:
+            try:
+                _unshare_skill(team, hermes, skill, ("all",))
+                done.append(f"skill bersama '{skill}' ditarik dari semua penerima")
+            except (TeamError, OSError) as exc:
+                notes.append(f"skill bersama '{skill}' tidak bisa ditarik ({exc})")
+        registry = shared_skill_registry(team)
+        touched = False
+        for entry in registry["skills"].values():
+            if name in (entry.get("targets") or []):
+                entry["targets"] = [t for t in entry["targets"] if t != name]
+                touched = True
+        if touched:
+            _save_registry(team, registry)
+            done.append(f"'{name}' dilepas dari daftar penerima skill bersama")
+        # 2) members.yaml
+        with members_lock(Path(team["paths"]["team_file"])):
+            fresh = load_team(Path(team["paths"]["team_file"]), Path(team["paths"]["members_file"]))
+            fresh["members"] = [m for m in fresh["members"] if m["name"] != name]
+            save_members(fresh)
+        team.clear()
+        team.update(fresh)
+        done.append(f"entri '{name}' dihapus dari members.yaml")
+        # 3) roster & rute diselaraskan (anggota nonaktif memang sudah tanpa rute; roster memuat daftar nonaktif).
+        result = cmd_apply(team, hermes, only=[], host_only=True)
+        # 4) profile
+        if delete_profile and hermes.dir_exists(member["profile"]):
+            if hermes.run("profile", "delete", member["profile"], "--yes"):
+                done.append(f"profile {member['profile']} dihapus (`hermes profile delete`)")
+            else:
+                notes.append(f"profile {member['profile']} GAGAL dihapus — jalankan sendiri: "
+                             f"hermes profile delete {member['profile']}")
+        # 5) channel
+        if delete_channel:
+            try:
+                client = _discord(hermes, api)
+                if client.get_channel(member["channel_id"]) is None:
+                    notes.append(f"channel {member['channel_id']} sudah tidak ada")
+                else:
+                    client.delete_channel(member["channel_id"], reason=f"Hermes: anggota {name} dihapus permanen")
+                    done.append(f"channel Discord {member['channel_id']} dihapus")
+            except TeamError as exc:
+                notes.append(f"channel {member['channel_id']} TIDAK terhapus ({exc}); hapus manual di Discord")
+        return {**plan, "done": done, "notes": notes, "dry_run": False, **result}
+
+
 # --------------------------------------------------------------------------- skill
 _SKIP_DIRS = {".hub", ".archive", ".git", "__pycache__", ".scan-cache", "node_modules"}
 SHARED_CATEGORY = "shared"
@@ -2997,12 +3293,16 @@ def describe(team: dict, hermes: Optional[Hermes] = None) -> str:
 # --------------------------------------------------------------------------- main
 def _common_args() -> argparse.ArgumentParser:
     common = argparse.ArgumentParser(add_help=False)
-    common.add_argument("-c", "--config", default=None, help="team.yaml (default: ./team.yaml atau ~/.hermes-team/team.yaml)")
+    common.add_argument("-c", "--config", default=None,
+                        help="team.yaml (default: $HERMES_TEAM_DIR/team.yaml, kalau tidak ~/.hermes-team/team.yaml; "
+                             "./team.yaml TIDAK dipakai otomatis)")
     common.add_argument("--members", default=None, help="members.yaml (default: di samping team.yaml)")
     common.add_argument("--hermes-bin", default=None)
     common.add_argument("--hermes-root", default=os.environ.get("HERMES_HOME") or os.path.expanduser("~/.hermes"),
                         help="home profile default (default: ~/.hermes)")
     common.add_argument("--dry-run", action="store_true", help="tampilkan langkah tanpa menjalankannya")
+    common.add_argument("--allow-placeholders", action="store_true",
+                        help="check/apply: terima ID contoh dari *.example.yaml (hanya untuk uji; JANGAN di server)")
     common.add_argument("--allow-root", action="store_true",
                         help="izinkan jalan sebagai root (hanya kalau Hermes memang dipasang di user root)")
     return common
@@ -3039,14 +3339,21 @@ def _fail(message: str, events: bool, code: int) -> None:
 
 def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     common = _common_args()
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser = argparse.ArgumentParser(description=f"{__doc__}\nVersi kit: {KIT_VERSION}",
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--version", action="version", version=f"hermes-team-kit {KIT_VERSION}")
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("check", parents=[common], help="validasi konfigurasi")
     p = sub.add_parser("apply", parents=[common], help="terapkan konfigurasi ke Hermes")
     p.add_argument("--only", default="", help="nama anggota dipisah koma")
     p.add_argument("--host-only", action="store_true")
     p.add_argument("--force-soul", action="store_true", help="timpa SOUL.md yang sudah ada (backup .bak)")
-    sub.add_parser("managed", parents=[common], help="cetak /etc/hermes/config.yaml")
+    p = sub.add_parser("managed", parents=[common], help="cetak / bandingkan / pasang /etc/hermes/config.yaml")
+    mode = p.add_mutually_exclusive_group()
+    mode.add_argument("--diff", action="store_true",
+                      help="bandingkan dengan berkas yang terpasang; exit 1 bila ada beda")
+    mode.add_argument("--install", action="store_true",
+                      help="tulis berkasnya secara atomik (0644); harus root — tanpa root mencetak perintah sudo persisnya")
     sub.add_parser("host-yaml", parents=[common], help="cetak setelan gateway sebagai YAML")
     sub.add_parser("status", parents=[common], help="ringkasan kondisi")
     p = sub.add_parser("add-member", parents=[common], help="tambah anggota")
@@ -3082,6 +3389,13 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     p = sub.add_parser("set-active", parents=[common], help="aktif/nonaktifkan anggota")
     p.add_argument("name")
     p.add_argument("state", choices=["on", "off"])
+    p = sub.add_parser("remove-member", parents=[common],
+                       help="hapus PERMANEN anggota yang sudah nonaktif (lihat juga --dry-run)")
+    p.add_argument("name")
+    p.add_argument("--delete-profile", action="store_true",
+                   help="hapus juga profile Hermes-nya (memory, secret, sesi) lewat `hermes profile delete`")
+    p.add_argument("--delete-channel", action="store_true", help="hapus juga channel Discord pribadinya")
+    p.add_argument("--yes", action="store_true", help="jangan minta konfirmasi")
     p = sub.add_parser("list-skills", parents=[common], help="daftar skill anggota")
     p.add_argument("member")
     p = sub.add_parser("share-skill", parents=[common], help="bagikan skill")
@@ -3102,28 +3416,37 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
 
 
 def _run(args: argparse.Namespace, events: bool) -> None:
-    team_file = Path(args.config).expanduser() if args.config else default_team_file()
+    team_file = kit_paths.team_file(args.config)
+    notice = None if args.config else kit_paths.cwd_notice(team_file)
+    if notice:
+        print(notice, file=sys.stderr)      # stderr: stdout dipakai `managed`, `host-yaml`, dan --events
     try:
         team = load_team(team_file, Path(args.members).expanduser() if args.members else None)
     except TeamError as exc:
         _fail(f"konfigurasi: {exc}", events, code=1)
     hermes_bin = resolve_hermes_bin(args.hermes_bin)
     hermes = Hermes(hermes_bin, Path(args.hermes_root), dry_run=args.dry_run, quiet=events)
+    placeholders = [] if placeholders_allowed(args.allow_placeholders) else placeholder_ids(team)
 
     if args.command == "check":
         print(describe(team))
         _print_warnings(team)
+        if placeholders:
+            sys.exit("\nKonfigurasi BELUM siap: " + placeholder_message(placeholders))
         print("\nKonfigurasi valid.")
         return
     if args.command == "managed":
-        print(managed_yaml(team), end="")
+        _cmd_managed(team, args)
         return
     if args.command == "host-yaml":
         print(nested_yaml(host_settings(team)), end="")
         return
     if args.command == "status":
         print(describe(team, hermes))
+        _print_warnings(team)
         return
+    if args.command == "apply" and placeholders:
+        sys.exit("apply ditolak: " + placeholder_message(placeholders))
     if args.command == "list-skills":
         member = next((m for m in team["members"] if m["name"] == args.member), None)
         if member is None:
@@ -3174,6 +3497,8 @@ def _run(args: argparse.Namespace, events: bool) -> None:
         elif args.command == "set-active":
             result = set_member_active(team, hermes, args.name, args.state == "on")
             _print_apply_tail(team, hermes, result)
+        elif args.command == "remove-member":
+            _cmd_remove_member(team, hermes, args)
         elif args.command == "share-skill":
             result = share_skill(team, hermes, args.skill, args.from_member, args.to.split(","), args.overwrite,
                                  allow_unscanned=args.allow_unscanned)
@@ -3187,6 +3512,63 @@ def _run(args: argparse.Namespace, events: bool) -> None:
         sys.exit(f"gagal: {exc}")
     if hermes.failures:
         sys.exit(1)
+
+
+def _cmd_managed(team: dict, args: argparse.Namespace) -> None:
+    if args.diff:
+        diff = managed_diff(team)
+        if managed_diff_clean(diff):
+            print(f"✓ {diff['path']} sama dengan kebijakan dari team.yaml.")
+            return
+        print(f"{diff['path']} BERBEDA dari kebijakan team.yaml:")
+        for line in managed_diff_lines(diff):
+            print(f"  • {line}")
+        print(f"Pasang ulang:\n  {managed_install_command(team)}")
+        if diff["moved"]:
+            print("Urutan untuk key yang dipindah ke config per profile: apply → managed --install → apply.")
+        sys.exit(1)
+    if args.install:
+        try:
+            path = install_managed(team, dry_run=args.dry_run)
+        except TeamError as exc:
+            sys.exit(str(exc))
+        if args.dry_run:
+            print(f"(dry-run) akan menulis {path} (0644)")
+            return
+        print(f"✓ {path} ditulis (0644). Sebagai user Hermes: `hermes_team.py apply` lalu `hermes gateway restart` "
+              "(atau /restart di Discord).")
+        return
+    print(managed_yaml(team), end="")
+
+
+def _cmd_remove_member(team: dict, hermes: Hermes, args: argparse.Namespace) -> None:
+    opts = {"delete_profile": args.delete_profile, "delete_channel": args.delete_channel}
+    plan = remove_member_plan(team, hermes, args.name, **opts)
+    member = plan["member"]
+    print(f"Hapus permanen anggota {member['name']} ({member['display_name']}, user {member['user_id']}):")
+    print("  AKAN DIHAPUS:")
+    for line in plan["will_delete"]:
+        print(f"    - {line}")
+    print("  TIDAK dihapus:")
+    for line in plan["kept"]:
+        print(f"    - {line}")
+    if hermes.dry_run:
+        print("\n(dry-run) tidak ada yang diubah.")
+        return
+    if not args.yes:
+        if not sys.stdin or not sys.stdin.isatty():
+            raise TeamError("butuh konfirmasi: jalankan interaktif, atau tambah --yes")
+        if input(f"Ketik nama anggota ({member['name']}) untuk melanjutkan: ").strip() != member["name"]:
+            raise TeamError("dibatalkan (nama tidak cocok)")
+    result = remove_member(team, hermes, args.name, **opts)
+    print("\nSudah dilakukan:")
+    for line in result["done"]:
+        print(f"  ✓ {line}")
+    for line in result["notes"]:
+        print(f"  ! {line}")
+    print("Masih ada (tidak dihapus):")
+    for line in result["kept"]:
+        print(f"  - {line}")
 
 
 def _cmd_membership(team: dict, hermes: Hermes, args: argparse.Namespace, events: bool) -> None:
@@ -3326,12 +3708,13 @@ def managed_blocked_warning(hermes: Hermes) -> list[str]:
         return []
     return [f"/etc/hermes/config.yaml masih mem-pin {', '.join(sorted(hermes.managed_blocked))} (file dari kit "
             "versi lama), jadi nilai per profile BELUM berlaku. Pasang ulang managed config "
-            "(`hermes_team.py managed` → sudo install), lalu jalankan `apply` sekali lagi."]
+            "(`sudo … hermes_team.py managed --install`; perintah persisnya: `hermes_team.py managed --diff`), "
+            "lalu jalankan `apply` sekali lagi."]
 
 
 def _print_warnings(team: dict, hermes: Optional[Hermes] = None) -> None:
     """Peringatan konfigurasi (tidak menggagalkan `check`/`apply`)."""
-    warnings = fallback_warnings(team) + sandbox_warnings(team)
+    warnings = list(team.get("warnings") or []) + fallback_warnings(team) + sandbox_warnings(team)
     if hermes is not None:
         warnings += managed_blocked_warning(hermes)
     if warnings:
@@ -3359,8 +3742,8 @@ def _print_apply_tail(team: dict, hermes: Hermes, result: dict) -> None:
         print("\nRute/channel baru diterapkan plugin team-guard ke gateway yang sedang jalan dalam beberapa detik "
               "(live reload; kabar muncul di channel admin). Gateway belum jalan? Cukup start seperti biasa.")
     print("\nKalau kebijakan global berubah (model, sandbox, skala):\n"
-          "  python3 hermes_team.py managed > hermes-managed.yaml\n"
-          "  sudo install -D -m 0644 -o root -g root hermes-managed.yaml /etc/hermes/config.yaml")
+          "  python3 hermes_team.py managed --diff       # beda dengan /etc/hermes/config.yaml yang terpasang\n"
+          f"  {managed_install_command(team)}")
 
 
 if __name__ == "__main__":

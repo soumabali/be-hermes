@@ -222,7 +222,8 @@ TOOLS: list[dict] = [
         "name": "set_usage_budget_extra",
         "description": ("Tambah jatah token HARI INI untuk satu anggota di atas scale.daily_token_budget (mis. "
                         "\"tambah kuota budi 2 juta token\" → extra_tokens=2000000). Menggantikan tambahan hari ini "
-                        "yang sudah ada (bukan menjumlahkan) dan hangus sendiri saat hari berganti. Butuh konfirmasi."),
+                        "yang sudah ada (bukan menjumlahkan) dan hangus sendiri saat hari berganti. Hanya menaikkan batas "
+                        "orang itu; anggaran harian tim (team_daily_token_budget) TIDAK ikut naik. Butuh konfirmasi."),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1702,6 +1703,14 @@ class TeamCtl:
                 data[user_id] = {"day": day, "extra_tokens": int(extra)}
             ht.atomic_write(path, json.dumps(data, indent=2, sort_keys=True) + "\n", mode=0o600)
 
+    def _require_same_day(self, team: dict, day: str) -> None:
+        """Dipanggil tepat sebelum menulis: tanggal pemakaian SAAT EKSEKUSI harus sama dengan yang ada di
+        ringkasan yang disetujui. Kalau tengah malam baru saja lewat, tidak ada yang ditulis."""
+        today = self._usage_day(team)
+        if today != day:
+            raise ToolError(f"hari sudah berganti sejak ringkasan disetujui (ringkasan: {day}, sekarang: {today}); "
+                            "tidak ada yang ditulis — ulangi permintaannya untuk tanggal yang baru")
+
     def tool_set_usage_budget_extra(self, args: dict) -> str:
         extra = args.get("extra_tokens")
         if isinstance(extra, bool) or not isinstance(extra, int) or not 1 <= extra <= MAX_BUDGET_EXTRA:
@@ -1714,24 +1723,33 @@ class TeamCtl:
             if not base:
                 raise ToolError("anggaran per orang tidak aktif (team.yaml → scale.daily_token_budget = 0), jadi "
                                 "tidak ada batas yang perlu dilonggarkan")
+            # `day` dihitung tiap kali rencana disusun: sekali untuk ringkasan, sekali lagi SETELAH disetujui.
+            # Kalau tengah malam lewat di antaranya, ringkasan kedua memuat tanggal lain → tidak dijalankan
+            # (lihat _guarded); `run` memeriksanya sekali lagi tepat sebelum menulis.
             day = self._usage_day(team)
+            per_team = int(team["scale"]["team_daily_token_budget"])
             current = self._read_overrides(team).get(member["user_id"])
             previous = current["extra_tokens"] if current and current["day"] == day else 0
             who = f"{_q(member['display_name'], 64)} ({member['name']}, Discord user {member['user_id']})"
             if previous == extra:
                 return f"{who} sudah punya tambahan {_tokens(extra)} token untuk {day}; tidak ada yang diubah."
-            preview = (f"Tambah jatah token HARI INI ({day}"
-                       + (f", zona {_clean(team['usage']['timezone'], 40)}" if team["usage"]["timezone"] else "")
-                       + f") untuk {who}: +{_tokens(extra)} token di atas batas harian {_tokens(base)} → batas "
-                       f"hari ini {_tokens(base + extra)}."
+            preview = (f"Tambah jatah token untuk tanggal {day}"
+                       + (f" (zona {_clean(team['usage']['timezone'], 40)})" if team["usage"]["timezone"] else "")
+                       + f" bagi {who}: +{_tokens(extra)} token di atas batas harian {_tokens(base)} → batas "
+                       f"orang ini pada {day} menjadi {_tokens(base + extra)}."
                        + (f" Menggantikan tambahan sebelumnya (+{_tokens(previous)})." if previous else "")
-                       + " Hangus sendiri saat hari berganti; batas tim tidak berubah.")
+                       + f" Hanya berlaku untuk tanggal {day} (hangus saat hari berganti). HANYA batas orang ini "
+                       "yang naik: " + (f"anggaran harian tim tetap {_tokens(per_team)} dan tetap batas keras — "
+                                        "kalau tim sudah mencapainya, tambahan ini tidak membuka apa-apa."
+                                        if per_team else "anggaran tim tidak aktif dan tidak diubah."))
 
             def run() -> str:
+                self._require_same_day(team, day)
                 self._write_override(team, member["user_id"], day, extra)
-                return (f"Jatah token {member['display_name']} hari ini ({day}) sekarang "
+                return (f"Jatah token {member['display_name']} untuk {day} sekarang "
                         f"{_tokens(base + extra)} (batas harian {_tokens(base)} + tambahan {_tokens(extra)}). "
-                        "Plugin membacanya dalam ±1 menit; besok kembali ke batas harian.")
+                        "Plugin membacanya dalam ±1 menit; hari berikutnya kembali ke batas harian. "
+                        "Anggaran tim tidak berubah.")
 
             return Plan(team, preview, run, member=member["name"], user=member["user_id"], day=day,
                         extra_tokens=extra, previous_extra=previous)
@@ -1753,6 +1771,7 @@ class TeamCtl:
                        f"batas hari ini kembali {_tokens(base) if base else 'tanpa batas'}.")
 
             def run() -> str:
+                self._require_same_day(team, day)
                 self._write_override(team, member["user_id"], day, None)
                 return (f"Tambahan jatah token {member['display_name']} untuk {day} dicabut "
                         f"(sebelumnya +{_tokens(previous)}).")

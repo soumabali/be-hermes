@@ -1405,7 +1405,7 @@ def test_set_usage_budget_extra_confirms_writes_and_audits(tc):
     assert len(ctl.previews) == 1
     preview = ctl.previews[0]
     assert f'"Budi" (budi, Discord user {BUDI})' in preview and day in preview and "Asia/Makassar" in preview
-    assert "+2.000.000 token di atas batas harian 3.000.000 → batas hari ini 5.000.000" in preview
+    assert "+2.000.000 token di atas batas harian 3.000.000 → batas orang ini pada " + day + " menjadi 5.000.000" in preview
     assert "5.000.000" in out
     assert _overrides(tc) == {BUDI: {"day": day, "extra_tokens": 2000000}}
     path = tc.team_dir / "state" / "budget_overrides.json"
@@ -1479,6 +1479,66 @@ def test_budget_extra_is_stale_if_changed_between_confirm_and_run(tc):
     out = ctl.call("set_usage_budget_extra", user="budi", extra_tokens=5)
     assert "keadaan berubah" in out and _overrides(tc)[BUDI]["extra_tokens"] == 777
     assert tc.audit()[-1]["event"] == "usage-budget-extra-stale"
+
+
+def test_budget_extra_preview_says_only_this_user_is_raised_and_team_cap_stays(tc):
+    """Ringkasan konfirmasi harus cocok dengan perilaku plugin: tambahan per orang tidak menaikkan plafon tim."""
+    tc.patch_team(scale={"daily_token_budget": 1000, "team_daily_token_budget": 50000})
+    ctl = tc.ctl()
+    day = tm.TeamCtl._usage_day(ctl.team())
+    out = ctl.call("set_usage_budget_extra", user="budi", extra_tokens=500)
+    preview = ctl.previews[0]
+    assert f"untuk tanggal {day}" in preview and "HANYA batas orang ini yang naik" in preview
+    assert "anggaran harian tim tetap 50.000 dan tetap batas keras" in preview
+    assert "batas tim tidak berubah" not in preview                           # kalimat lama yang menyesatkan
+    assert "Anggaran tim tidak berubah" in out and day in out
+    tc.patch_team(scale={"daily_token_budget": 1000, "team_daily_token_budget": 0})
+    ctl = tc.ctl()
+    ctl.call("set_usage_budget_extra", user="budi", extra_tokens=700)
+    assert "anggaran tim tidak aktif" in ctl.previews[0]
+    desc = next(t for t in tm.TOOLS if t["name"] == "set_usage_budget_extra")["description"]
+    assert "TIDAK ikut naik" in desc
+
+
+def _fake_days(monkeypatch, days):
+    """`_usage_day` mengembalikan `days` berurutan (yang terakhir diulang) — meniru pergantian hari."""
+    seq = list(days)
+    monkeypatch.setattr(tm.TeamCtl, "_usage_day", staticmethod(lambda _team: seq.pop(0) if len(seq) > 1 else seq[0]))
+
+
+def test_budget_extra_confirmed_after_midnight_writes_nothing(tc, monkeypatch):
+    """Admin menyetujui setelah tengah malam: tanggal dihitung ulang saat eksekusi, bukan memakai tanggal
+    kemarin dari ringkasan."""
+    tc.patch_team(scale={"daily_token_budget": 1000})
+    _fake_days(monkeypatch, ["2027-01-15", "2027-01-16"])                     # ringkasan kemarin, eksekusi hari ini
+    ctl = tc.ctl()
+    out = ctl.call("set_usage_budget_extra", user="budi", extra_tokens=5)
+    assert "2027-01-15" in ctl.previews[0]
+    assert "keadaan berubah" in out and _overrides(tc) is None
+    assert tc.audit()[-1]["event"] == "usage-budget-extra-stale"
+
+
+def test_budget_extra_day_is_rechecked_right_before_writing(tc, monkeypatch):
+    """Regresi: hari berganti di antara penyusunan ulang rencana dan penulisan → dulu tanggal kemarin ditulis
+    dan dilaporkan sebagai "hari ini"."""
+    tc.patch_team(scale={"daily_token_budget": 1000})
+    _fake_days(monkeypatch, ["2027-01-15", "2027-01-15", "2027-01-16"])       # ringkasan, susun ulang, eksekusi
+    ctl = tc.ctl()
+    with pytest.raises(tm.ToolError, match="hari sudah berganti.*2027-01-15.*2027-01-16"):
+        ctl.call("set_usage_budget_extra", user="budi", extra_tokens=5)
+    assert _overrides(tc) is None
+    assert (tc.audit()[-1]["event"], tc.audit()[-1]["outcome"]) == ("usage-budget-extra", "failed")
+
+
+def test_budget_extra_clear_day_is_rechecked_right_before_writing(tc, monkeypatch):
+    tc.patch_team(scale={"daily_token_budget": 1000})
+    path = tc.team_dir / "state" / "budget_overrides.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({BUDI: {"day": "2027-01-15", "extra_tokens": 9}}), encoding="utf-8")
+    _fake_days(monkeypatch, ["2027-01-15", "2027-01-15", "2027-01-16"])
+    with pytest.raises(tm.ToolError, match="hari sudah berganti"):
+        tc.ctl().call("clear_usage_budget_extra", user="budi")
+    assert _overrides(tc) == {BUDI: {"day": "2027-01-15", "extra_tokens": 9}}
 
 
 def test_clear_usage_budget_extra_and_stale_days_are_dropped(tc):

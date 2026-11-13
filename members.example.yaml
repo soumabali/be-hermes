@@ -1,26 +1,36 @@
 # members.yaml — anggota tim Hermes dan model AI per orang.
-# Boleh diedit manual lalu jalankan `python3 hermes_team.py apply`; juga ditulis oleh tool admin
-# di #hermes-admin ("tambahkan Citra…", "ganti model be1 ke td-normal") dan oleh
-# `hermes_team.py add-member` / `set-model` / `set-sandbox`.
+# MULAI KOSONG: salin berkas ini apa adanya. Anggota ditambahkan otomatis saat role @backend diberikan
+# (onboarding), oleh tool admin di #hermes-admin ("tambahkan Citra…", "ganti model andi ke td-normal"),
+# atau oleh `hermes_team.py add-member` / `set-model` / `set-sandbox`. Boleh juga diedit manual lalu
+# jalankan `python3 hermes_team.py apply`.
+#
+# JANGAN menghapus tanda komentar contoh di bawah tanpa mengganti ID-nya: `check` menolak ID contoh
+# (5000…/6000…), dan `apply` akan membuat profile untuk SETIAP entri yang ada di sini.
+# Key yang salah ketik tidak menggagalkan pemuatan tetapi dilaporkan `check` sebagai peringatan.
 
-members:
-  - name: be1                           # huruf kecil/angka/-/_  → profile be-be1, channel #hermes-be1
-    display_name: BE1
-    discord_user_id: "500000000000000001"
-    channel_id: "600000000000000001"    # #hermes-be1 (privat: BE1 + bot)
-    model: td-normal                    # model khusus; tanpa baris ini → llm.default_model (td-simple)
-  - name: budi
-    display_name: Budi
-    discord_user_id: "500000000000000002"
-    channel_id: "600000000000000002"
-    # Opsional — batas sandbox khusus orang ini (tanpa ini → team.yaml: sandbox.memory_mb / sandbox.cpu).
-    # memory_mb 256..65536, cpu 0.25..64. Lewat CLI:  hermes_team.py set-sandbox budi --memory-mb 4096 --cpu 2
-    # sandbox: {memory_mb: 4096, cpu: 2}
-  # - name: citra
-  #   display_name: Citra
-  #   discord_user_id: "500000000000000003"
-  #   channel_id: "600000000000000003"
-  #   active: false                     # nonaktif: rute dicabut, data tetap disimpan
+members: []
+
+# Contoh entri (ganti `members: []` di atas dengan `members:` lalu isi seperti ini):
+#
+# members:
+#   - name: andi                          # huruf kecil/angka/-/_  → profile be-andi, channel #hermes-andi
+#     display_name: Andi
+#     discord_user_id: "500000000000000001"   # klik kanan user → Copy ID
+#     channel_id: "600000000000000001"        # #hermes-andi (privat: Andi + bot)
+#     model: td-normal                    # model khusus; tanpa baris ini → llm.default_model (td-simple)
+#   - name: budi
+#     display_name: Budi
+#     discord_user_id: "500000000000000002"
+#     channel_id: "600000000000000002"
+#     # Opsional — batas sandbox khusus orang ini (tanpa ini → team.yaml: sandbox.memory_mb / sandbox.cpu).
+#     # memory_mb 256..65536, cpu 0.25..64. Lewat CLI:  hermes_team.py set-sandbox budi --memory-mb 4096 --cpu 2
+#     sandbox: {memory_mb: 4096, cpu: 2}
+#   - name: citra
+#     display_name: Citra
+#     discord_user_id: "500000000000000003"
+#     channel_id: "600000000000000003"
+#     active: false                       # nonaktif: rute dicabut, data tetap disimpan
+#                                         # (hapus permanen: hermes_team.py remove-member citra)
 
 # Opsional — model untuk profile bukan anggota (menimpa team.yaml).
 # models:

@@ -1,5 +1,8 @@
-# team.yaml — setelan tim Hermes (kit v3). Anggota ada di members.yaml.
+# team.yaml — setelan tim Hermes. Anggota ada di members.yaml.
+# Versi kit: `python3 hermes_team.py --version` (satu sumber: KIT_VERSION di kit_base.py; riwayat: CHANGELOG.md).
 # Salin ke ~/.hermes-team/team.yaml, isi semua ID, lalu:  python3 hermes_team.py check
+# Semua ID di berkas ini (1000…, 2000…, 3000…, 4000…) adalah CONTOH: `check` gagal dan `apply` menolak
+# selama masih ada yang belum diganti. Key yang salah ketik dilaporkan `check` sebagai peringatan.
 #
 # Cara ambil ID: Discord → Settings → Advanced → Developer Mode ON, lalu klik kanan
 # server / kategori / channel / user / role → "Copy ID". Tulis ID dalam tanda kutip.

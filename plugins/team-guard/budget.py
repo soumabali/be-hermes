@@ -6,6 +6,12 @@ kolektor kit dijalankan sebagai subprocess lepas paling sering tiap `COLLECT_EVE
 
 Gagal-terbuka: buku besar yang belum ada / tidak terbaca mematikan penegakan anggaran dengan SATU baris
 log — pesan anggota tetap dilayani. Itu disengaja: gangguan pencatatan tidak boleh menghentikan tim.
+Supaya tidak diam-diam: bila potret terakhir kolektor (`meta.last_collect`) lebih tua dari `STALE_AFTER`
+(atau buku besar tidak terbaca selama itu), admin dikabari sekali sehari dan metrics.json memuat
+`budget.stale: true`.
+
+Jatah tambahan per orang (`budget_overrides.json`) HANYA menaikkan batas orang itu; plafon tim tetap
+seperti di konfigurasi (batas keras).
 """
 from __future__ import annotations
 
@@ -25,6 +31,14 @@ from .shared import log_once
 CACHE_TTL = 60.0            # hasil baca buku besar dipakai ulang selama ini
 COLLECT_EVERY = 120.0       # jeda minimal antar kolektor
 WARN_RATIO = 0.8
+STALE_AFTER = 1800.0        # potret kolektor lebih tua dari ini → anggaran dianggap tidak ditegakkan
+
+ADMIN_BUDGET_STALE = ("⚠️ Anggaran tidak ditegakkan: buku besar basi sejak {since} (kolektor pemakaian "
+                      "`usage_ledger.py collect` gagal atau tidak jalan). Pesan anggota tetap dilayani dengan "
+                      "angka lama; periksa kolektor di server.")
+ADMIN_BUDGET_UNREADABLE = ("⚠️ Anggaran tidak ditegakkan: buku besar pemakaian tidak terbaca / belum pernah diisi "
+                           "kolektor sejak {since}. Pesan anggota tetap dilayani tanpa batas token; periksa "
+                           "`usage_ledger.py collect` di server.")
 
 
 def spawn_detached(argv: list[str], env: dict) -> Any:
@@ -74,8 +88,9 @@ def day_of(ts: float, tz: Any) -> str:
     return stamp.date().isoformat()
 
 
-def read_usage(ledger: str, day: str) -> dict[str, int]:
-    """user_key → token (input + output) pada `day`. Baca-saja; melempar sqlite3.Error/OSError bila gagal."""
+def read_ledger(ledger: str, day: str) -> tuple[dict[str, int], Optional[float]]:
+    """(user_key → token (input + output) pada `day`, waktu `meta.last_collect` atau None bila tidak ada).
+    Baca-saja; melempar sqlite3.Error/OSError bila gagal."""
     path = Path(ledger).expanduser()
     if not path.is_file():
         raise FileNotFoundError(str(path))
@@ -83,14 +98,24 @@ def read_usage(ledger: str, day: str) -> dict[str, int]:
     try:
         rows = con.execute("SELECT user_key, SUM(input_tokens + output_tokens) FROM daily WHERE day = ? "
                            "GROUP BY user_key", (day,)).fetchall()
+        try:
+            found = con.execute("SELECT value FROM meta WHERE key = 'last_collect'").fetchone()
+            last = float(found[0]) if found else None
+        except (sqlite3.Error, TypeError, ValueError):
+            last = None                           # buku besar lama tanpa tabel meta
     finally:
         con.close()
-    return {str(key): int(total or 0) for key, total in rows}
+    return {str(key): int(total or 0) for key, total in rows}, last
+
+
+def read_usage(ledger: str, day: str) -> dict[str, int]:
+    """user_key → token (input + output) pada `day`. Baca-saja; melempar sqlite3.Error/OSError bila gagal."""
+    return read_ledger(ledger, day)[0]
 
 
 class Verdict:
     """Hasil pemeriksaan satu pesan. `state`: ok | warn | over | team_over."""
-    __slots__ = ("state", "used", "limit", "team_used", "team_limit", "first", "team_warn")
+    __slots__ = ("state", "used", "limit", "team_used", "team_limit", "first", "team_warn", "stale_notice")
 
     def __init__(self, state: str = "ok", used: int = 0, limit: int = 0, team_used: int = 0, team_limit: int = 0,
                  first: bool = False, team_warn: bool = False):
@@ -98,6 +123,7 @@ class Verdict:
         self.team_used, self.team_limit = team_used, team_limit
         self.first = first              # pertama kali hari ini untuk orang ini (→ kabari admin / peringatkan)
         self.team_warn = team_warn      # tim baru saja melewati 80% (→ kabari admin sekali sehari)
+        self.stale_notice = ""          # buku besar basi (→ kabari admin; terisi paling banyak sekali sehari)
 
     @property
     def refused(self) -> bool:
@@ -115,6 +141,8 @@ class Budget:
         self._collected = -1e18
         self._proc: Any = None
         self._told: set[tuple[str, str, str]] = set()                           # (hari, jenis, uid)
+        self._last_collect: Optional[float] = None      # meta.last_collect dari pembacaan terakhir yang berhasil
+        self._since: Optional[float] = None             # pertama kali anggaran diperiksa (acuan bila belum ada potret)
 
     # ------------------------------------------------------------------ sumber data
     def today(self, roster: Any) -> str:
@@ -134,7 +162,7 @@ class Budget:
             if cached is not None and cached[1] == day and cached[2] == ledger and 0 <= now - cached[0] < CACHE_TTL:
                 return cached[3]
             try:
-                used = read_usage(ledger, day)
+                used, self._last_collect = read_ledger(ledger, day)
             except (OSError, sqlite3.Error, ValueError) as exc:
                 if cached is not None and cached[1] == day and cached[2] == ledger:
                     return cached[3]              # sedang ditulis kolektor: pakai angka terakhir hari ini
@@ -198,6 +226,33 @@ class Budget:
                      "angka terakhir di buku besar", type(exc).__name__, exc)
             return False
 
+    def staleness(self, roster: Any) -> tuple[bool, Optional[float]]:
+        """(basi?, acuan waktunya). Basi = potret kolektor terakhir lebih tua dari STALE_AFTER; bila belum
+        pernah ada potret (buku besar tidak terbaca / belum diisi), acuannya saat anggaran pertama diperiksa."""
+        if not usage_config(roster)["ledger"]:
+            return False, None
+        now = self.wall()
+        with self._lock:
+            if self._since is None:
+                self._since = now
+            reference = self._last_collect if self._last_collect is not None else self._since
+        return now - reference > STALE_AFTER, reference
+
+    def _stale_notice(self, roster: Any, day: str) -> str:
+        """Teks untuk #hermes-admin (paling banyak sekali sehari) + satu baris log; "" bila tidak basi."""
+        stale, reference = self.staleness(roster)
+        if not stale or reference is None:
+            return ""
+        tz = resolve_tz(usage_config(roster)["timezone"])
+        stamp = datetime.fromtimestamp(reference, tz) if tz is not None else datetime.fromtimestamp(reference)
+        since = stamp.strftime("%Y-%m-%d %H:%M")
+        log_once("budget-stale", "anggaran tidak ditegakkan: buku besar basi sejak %s (kolektor pemakaian gagal "
+                 "atau tidak jalan)", since)
+        if not self._once(day, "stale", ""):
+            return ""
+        template = ADMIN_BUDGET_STALE if self._last_collect is not None else ADMIN_BUDGET_UNREADABLE
+        return template.format(since=since)
+
     # ------------------------------------------------------------------ keputusan
     def _once(self, day: str, kind: str, uid: str) -> bool:
         key = (day, kind, uid)
@@ -225,17 +280,21 @@ class Budget:
             return Verdict()
         self.refresh(roster)
         used_map = self.usage(roster)
-        if used_map is None:
-            return Verdict()
         day = self.today(roster)
+        stale_notice = self._stale_notice(roster, day)
+        if used_map is None:
+            verdict = Verdict()
+            verdict.stale_notice = stale_notice
+            return verdict
         extras = self.overrides(day)
         used = int(used_map.get(uid, 0))
         limit = per_user + extras.get(uid, 0) if per_user > 0 else 0
         team_used = sum(used_map.values())
-        # Jatah tambahan yang diberikan admin hari ini ikut menaikkan plafon tim, supaya orang yang baru
-        # diberi kuota tidak langsung tertahan anggaran tim.
-        team_limit = per_team + sum(extras.values()) if per_team > 0 else 0
+        # Jatah tambahan per orang TIDAK menaikkan plafon tim: anggaran tim adalah batas keras. (Dulu ikut
+        # dijumlahkan, sehingga tambahan untuk satu orang melonggarkan batas semua orang.)
+        team_limit = per_team if per_team > 0 else 0
         verdict = Verdict("ok", used, limit, team_used, team_limit)
+        verdict.stale_notice = stale_notice
         if team_limit > 0 and team_used >= WARN_RATIO * team_limit and team_used < team_limit:
             verdict.team_warn = self._once(day, "team-warn", "")
         if limit > 0 and used >= limit:
@@ -255,7 +314,14 @@ class Budget:
             used = self.usage(roster, quiet=True) or {}
         except Exception:
             day, used = "", {}
-        return {"day": day, "used_by_user": dict(used), "team_used": sum(used.values())}
+        try:
+            stale = self.staleness(roster)[0]
+        except Exception:
+            stale = False
+        # `stale: true` = potret kolektor terlalu tua → angka di atas BUKAN keadaan sekarang dan anggaran
+        # praktis tidak ditegakkan. `last_collect` = waktu potret terakhir (epoch) atau null.
+        return {"day": day, "used_by_user": dict(used), "team_used": sum(used.values()), "stale": bool(stale),
+                "last_collect": self._last_collect}
 
 
 def _int(value: Any) -> int:

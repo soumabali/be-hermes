@@ -383,8 +383,10 @@ class Onboarder:
                 await self.notify(f"⏳ Menyiapkan <@{uid}>: channel <#{event['channel_id']}> {what}; membuat "
                                   "profile, rute, dan sandbox…")
 
-        args = ["--user-id", uid, "--username", str(getattr(member, "name", "") or ""),
-                "--display-name", str(getattr(member, "display_name", "") or getattr(member, "name", "") or "")]
+        # Nilai dari Discord (nama tampilan bebas diisi user) selalu ditempel sebagai `--opsi=nilai`, supaya
+        # nama yang diawali "-" (mis. "-keren-", "--model=mahal") tidak pernah terbaca sebagai opsi kit.
+        args = [f"--user-id={uid}", f"--username={getattr(member, 'name', '') or ''}",
+                f"--display-name={getattr(member, 'display_name', '') or getattr(member, 'name', '') or ''}"]
         outcome = await self.kit(roster, "onboard", args, on_event)
         if not outcome.ok:
             reason = outcome.describe()
@@ -464,7 +466,7 @@ class Onboarder:
             return                            # role sudah diberikan lagi sebelum giliran ini
         if uid in roster.users and conf.get("enabled", True) and conf.get("offboard_on_role_remove", True):
             started = self.clock()
-            args = ["--user-id", uid] + ([] if conf.get("hide_channel_on_offboard", True)
+            args = [f"--user-id={uid}"] + ([] if conf.get("hide_channel_on_offboard", True)
                                          else ["--keep-channel-access"])
             outcome = await self.kit(roster, "offboard", args, None)
             if not outcome.ok:

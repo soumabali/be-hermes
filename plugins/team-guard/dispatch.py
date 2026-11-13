@@ -7,6 +7,7 @@ Hook ini didokumentasikan boleh `async` dan TIDAK dibatasi plugins.hook_callback
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 from typing import Any, Callable, Optional
 
@@ -17,6 +18,56 @@ from .shared import log, log_once
 
 REFUSE_WAIT = 45.0          # tunggu rate limit lebih lama dari ini → ditolak sopan
 NOTICE_EVERY = 60.0         # jeda minimal antar pemberitahuan sejenis ke orang yang sama
+RESERVE_GRACE = 60.0        # reservasi pesan biasa hidup sampai queue_max_wait + ini (atau gilirannya mulai)
+
+# Perintah kendali yang TIDAK PERNAH memulai giliran LLM → bebas anggaran, rate limit, batas per orang, dan
+# antrean. Daftar izin eksplisit, diperiksa satu per satu terhadap Hermes hulu (commit 5d87ea2):
+#   stop                → gateway/slash_commands.py::_handle_stop_command (hanya menginterupsi)
+#   approve, deny       → ::_handle_approve_command/_handle_deny_command (melanjutkan giliran yang menunggu)
+#   status, context/ctx, usage → gateway/slash_commands_status.py (hanya membaca)
+#   help, commands, whoami     → gateway/slash_commands.py (katalog / info akses)
+#   new/reset           → gateway/run_inbound.py::_hm_cmd_new → _handle_reset_command (sesi baru, tanpa giliran)
+#   title, sessions     → gateway/slash_commands_session.py (judul / daftar / pindah sesi)
+# SENGAJA TIDAK masuk: queue/q, steer, btw, bg, retry, undo, plan, goal, subgoal, loop, heartbeat, moa,
+# learn, init, blueprint, refine, review, compress, /<skill>, /<bundle>, quick command — semuanya memulai
+# (atau menjadwalkan) panggilan LLM. Perintah lain yang tidak dikenal di sini juga lewat gerbang biasa.
+EXEMPT_COMMANDS = frozenset({
+    "stop", "approve", "deny", "status", "context", "ctx", "usage", "help", "commands", "whoami",
+    "new", "reset", "title", "sessions",
+})
+# Sama dengan gateway/platforms/event.py::_ATTACHMENT_REF_RE (awalan lampiran Desktop sebelum teks).
+_ATTACHMENT_REF_RE = re.compile(r"^(?:@(?:image|file|url):[^\n]+\n?)+", re.IGNORECASE)
+
+
+def parse_command(text: Any, allow_control: bool = True) -> Optional[str]:
+    """Nama perintah slash seperti `MessageEvent.get_command()` di Hermes hulu: token pertama tanpa "/",
+    huruf kecil, tanpa "@bot"; None bila bukan perintah (termasuk path berkas seperti "/tmp/a").
+    "/ kerjakan X" → "" (bukan perintah yang dikenal)."""
+    if not allow_control or not isinstance(text, str):
+        return None
+    body = _ATTACHMENT_REF_RE.sub("", text.lstrip()).lstrip()
+    if not body.startswith("/"):
+        return None
+    raw = body.split(maxsplit=1)[0][1:].lower().split("@", 1)[0]
+    return None if "/" in raw else raw
+
+
+def event_command(event: Any, text: Any = None) -> Optional[str]:
+    """Perintah slash pada `event`: `event.get_command()` milik Hermes bila ada, kalau tidak pengurai setara.
+    Gagal → None (diperlakukan sebagai pesan biasa, yaitu lewat semua gerbang)."""
+    getter = getattr(event, "get_command", None)
+    if callable(getter):
+        try:
+            got = getter()
+            return got if got is None or isinstance(got, str) else None
+        except Exception:
+            return None
+    return parse_command(getattr(event, "text", None) if text is None else text,
+                         bool(getattr(event, "allow_gateway_control", True)))
+
+
+def is_exempt_command(event: Any, text: Any = None) -> bool:
+    return (event_command(event, text) or "") in EXEMPT_COMMANDS
 
 MSG_HELD = ("⏸️ <@{uid}> onboarding-mu masih menunggu persetujuan admin tim, jadi Hermes belum bisa melayanimu. "
             "Admin sudah diberi tahu.")
@@ -113,14 +164,18 @@ class Dispatcher:
 
     # ------------------------------------------------------------------ hook
     async def handle(self, event: Any = None, gateway: Any = None, **_kwargs: Any) -> Optional[dict]:
+        carry: dict = {}
         try:
-            return await self._handle(event, gateway)
+            return await self._handle(event, gateway, carry)
         except Exception as exc:  # hook kebijakan tidak boleh menjatuhkan dispatch
-            log.warning("team-guard: pre_gateway_dispatch gagal (%s: %s); pesan diteruskan apa adanya",
-                        type(exc).__name__, exc)
-            return None
+            # Penyamaran token yang sudah dihitung TETAP dikembalikan: galat di tahap sesudahnya (anggaran,
+            # rate limit, antrean) tidak boleh membuat token asli sampai ke AI.
+            result = carry.get("result")
+            log.warning("team-guard: pre_gateway_dispatch gagal (%s: %s); pesan diteruskan %s",
+                        type(exc).__name__, exc, "dengan token tersamar" if result else "apa adanya")
+            return result
 
-    async def _handle(self, event: Any, gateway: Any) -> Optional[dict]:
+    async def _handle(self, event: Any, gateway: Any, carry: Optional[dict] = None) -> Optional[dict]:
         source = getattr(event, "source", None)
         if source is None or getattr(event, "internal", False) or platform_name(source) != "discord":
             return None
@@ -156,16 +211,20 @@ class Dispatcher:
             new, kinds = scrub_tokens(text)
             if kinds:
                 rewritten = new
+                if carry is not None:         # dicatat SEBELUM tahap lain, supaya galat apa pun tetap menyamarkan
+                    carry["result"] = {"action": "rewrite", "text": new}
                 deleted = bool(settings.get("delete_secret_messages")) and await self._delete(event)
                 await self._say(gateway, source, "scrub", MSG_SCRUB.format(
                     uid=uid, kinds=", ".join(sorted(set(kinds))),
                     deleted=" dan pesan aslinya dihapus" if deleted else ""))
         result = {"action": "rewrite", "text": rewritten} if rewritten is not None else None
 
-        # D. Skala. Admin dan perintah slash (/stop, /approve, …) tidak pernah ditunda.
-        is_command = isinstance(text, str) and text.lstrip().startswith("/")
-        if admin or is_command:
+        # D. Skala. Admin dan perintah kendali di daftar izin (/stop, /approve, …) tidak pernah ditunda.
+        # Teks lain yang diawali "/" (termasuk "/ kerjakan X", "/tmp/a jelaskan", /btw, /<skill>) adalah
+        # pesan/giliran biasa bagi Hermes, jadi lewat anggaran dan pembatas seperti pesan lain.
+        if admin or is_exempt_command(event):
             return result
+        slash = bool(event_command(event))
         if not await self._within_budget(uid, source, gateway, roster):
             self.rt.metrics.refuse("budget")
             return {"action": "skip", "reason": "team-guard: anggaran token habis"}
@@ -178,7 +237,7 @@ class Dispatcher:
             return {"action": "skip", "reason": "team-guard: rate limit"}
         if wait > 0:
             await self.sleep(wait)
-        refused = await self._admit(uid, source, gateway, settings)
+        refused = await self._admit(uid, source, gateway, settings, slash=slash)
         if refused:
             return {"action": "skip", "reason": f"team-guard: {refused}"}
         return result
@@ -205,6 +264,8 @@ class Dispatcher:
     async def _within_budget(self, uid: str, source: Any, gateway: Any, roster: Any) -> bool:
         """False → pesan ditolak (jatah orang ini atau jatah tim habis). Buku besar tidak terbaca → True."""
         verdict = self.rt.budget.check(roster, uid)
+        if verdict.stale_notice:
+            await self._notify_admin(gateway, verdict.stale_notice)
         if verdict.team_warn:
             await self._notify_admin(gateway, ADMIN_BUDGET_TEAM_WARN.format(
                 pct=int(100 * verdict.team_used / max(1, verdict.team_limit)), used=_n(verdict.team_used),
@@ -237,24 +298,41 @@ class Dispatcher:
                 return None
         return None
 
+    def _sweep(self, gateway: Any, now: float) -> None:
+        """Perbarui reservasi dari sisi gateway (sesi yang sudah berjalan / sudah selesai)."""
+        probe = getattr(gateway, "_is_session_running", None)
+        self.rt.turns.sweep(now, probe if callable(probe) else None)
+
     def user_load(self, uid: str, gateway: Any, now: float) -> int:
         """Sesi orang ini yang berjalan + yang baru diloloskan. Hitungan berjalan berasal dari hook
-        (`pre_llm_call` membawa `sender_id`), jadi hanya dipakai setelah hook terbukti hidup, dan tidak
-        pernah melebihi jumlah sesi gateway (mengoreksi hook yang bocor)."""
+        (`pre_llm_call` membawa `sender_id`) dan dipercaya begitu SATU giliran terlihat mulai — sesudah
+        restart gateway tidak ada sesi lama, jadi hitungan dari nol itu benar tanpa menunggu
+        `on_session_end` pertama. Hitungan hook tidak pernah melebihi jumlah sesi gateway (mengoreksi hook
+        yang bocor). Sebelum hook terlihat, yang dihitung reservasi: pesan yang diloloskan dan belum mulai,
+        ditambah yang sesinya terlihat berjalan di gateway (`_is_session_running`) sampai sesi itu selesai."""
         turns = self.rt.turns
+        self._sweep(gateway, now)
         running = 0
-        if turns.trusted():
+        if turns.starts > 0:
             running = turns.user_active(uid, now)
             total = self._runner_count(gateway)
             if total is not None:
                 running = min(running, total)
-        elif turns.starts > 0:
-            log_once("user-limit-unproven", "batas sesi per orang baru aktif penuh setelah hook on_session_end "
-                     "terlihat sekali; sampai itu hanya pesan yang baru diloloskan yang dihitung",
-                     level=20)
         return running + turns.user_reserved(uid, now)
 
-    async def _admit(self, uid: str, source: Any, gateway: Any, settings: dict) -> str:
+    def _reserve_ttl(self, gateway: Any, max_wait: float, slash: bool) -> float:
+        """Pesan biasa: reservasi bertahan sampai gilirannya mulai, paling lama queue_max_wait + 60 detik
+        (giliran yang lambat mulai tidak boleh memberi slot tambahan). TTL panjang hanya dipakai bila ada
+        cara mengakhirinya lebih awal (hook giliran pernah terlihat, atau gateway bisa ditanya); perintah
+        slash di luar daftar izin belum tentu memulai giliran, jadi memakai TTL pendek."""
+        turns = self.rt.turns
+        if slash:
+            return turns.reserve_ttl
+        if turns.starts <= 0 and not callable(getattr(gateway, "_is_session_running", None)):
+            return turns.reserve_ttl
+        return max(turns.reserve_ttl, max(0.0, max_wait) + RESERVE_GRACE)
+
+    async def _admit(self, uid: str, source: Any, gateway: Any, settings: dict, slash: bool = False) -> str:
         """"" = lolos; selain itu alasan penolakan (untuk `reason` hook)."""
         try:
             max_active = int(settings.get("max_active") or 0)
@@ -272,19 +350,23 @@ class Dispatcher:
         # "pesan susulan" memakai thread bila ada. (Urutan pembuatan thread vs hook ini tidak terkonfirmasi
         # dari sumber; tanpa thread_id perilakunya sama seperti sebelumnya: per channel.)
         chat = str(getattr(source, "thread_id", None) or getattr(source, "chat_id", "") or "")
+        self._sweep(gateway, self.clock())
         if turns.holds(uid, chat, self.clock()):
             return ""                         # pesan beruntun ke sesi yang baru saja diloloskan
 
         def free() -> Optional[bool]:
             now = self.clock()
-            reserved = turns.reserved(now)
-            if llm_max > 0 and self.rt.llm.inflight(now) + reserved >= llm_max:
+            self._sweep(gateway, now)
+            if llm_max > 0 and self.rt.llm.inflight(now) + turns.reserved(now) >= llm_max:
                 return False                  # panggilan LLM paralel (termasuk cron, /goal, subagent) penuh
             if max_active <= 0:
                 return True
             load = self.probe(gateway, now)
             if load is None:
                 return True                   # beban sesi tidak terukur → hanya gerbang lain yang berlaku
+            # Reservasi yang sesinya sudah berjalan di gateway sudah ada di hitungan gateway; hanya saat
+            # beban diambil dari hook (yang bisa tertinggal sesaat) reservasi itu tetap ditambahkan.
+            reserved = turns.reserved(now, include_seen=turns.trusted())
             return load + reserved < effective_max_active(self.rt, settings)
 
         def blocked(who: str) -> bool:
@@ -303,7 +385,12 @@ class Dispatcher:
                                            sleep=self.sleep, on_wait=on_wait, blocked=blocked)
             if admitted:
                 now = self.clock()
-                turns.reserve(uid, now, chat)
+                try:
+                    session_key = str(gateway._session_key_for_source(source) or "")
+                except Exception:
+                    session_key = ""
+                turns.reserve(uid, now, chat, ttl=self._reserve_ttl(gateway, max_wait, slash),
+                              session_key=session_key)
                 metrics.observe_wait(now, now - ticket.t0)
                 return ""
             if ticket.cancelled:

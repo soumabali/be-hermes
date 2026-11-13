@@ -4,7 +4,9 @@
 Hanya membaca. Mengembalikan kode keluar 0 bila tidak ada masalah ber-level "error", 1 bila ada.
 
   python3 kit_doctor.py                    # cek lokal (tanpa Discord)
-  python3 kit_doctor.py --discord          # sekaligus cek channel di Discord (butuh token bot)
+  python3 kit_doctor.py --discord          # + preflight Discord (token, server, role, izin bot, channel
+                                           #   bersama/admin) dan channel tiap anggota; bisa dijalankan
+                                           #   SEBELUM gateway dinyalakan (hanya butuh token bot)
   python3 kit_doctor.py --docker           # sandbox per profile: status & RAM container, ukuran state.db
   python3 kit_doctor.py --format json
 
@@ -13,7 +15,15 @@ Yang diperiksa:
   rute         rute di config host dan roster.json sama dengan yang diturunkan dari team.yaml
   parkir       profile aktif tidak berpenanda gateway.parked; profile nonaktif sebaiknya tidak dirutekan
   berkas       .env profile bermode 0600; plugin team-guard terpasang di tiap profile
-  discord      channel ada, di server yang benar, bertipe teks, @everyone tidak bisa melihat (opsional)
+  konfigurasi  key tak dikenal / salah ketik di team.yaml & members.yaml; ID contoh yang belum diganti
+  managed      /etc/hermes/config.yaml ada dan sama dengan `hermes_team.py managed`; key yang sudah dipindah
+               kit ke config per profile tidak lagi dipin; /etc/hermes/.env ada, tidak terbaca semua orang,
+               dan memuat tiap `key_env` di llm.providers (hanya NAMA yang diperiksa, nilai tidak dicetak)
+  systemd      linger user aktif (gateway tetap hidup setelah logout); timer hermes-usage-collect,
+               hermes-usage-report (bila laporan terjadwal diisi), hermes-sandbox-idle
+  discord      (--discord) preflight tim: token bot, bot ada di server, role member/admin/entry, urutan role
+               bot, kategori (< 50 channel), channel bersama & admin, izin bot, channel laporan; lalu
+               channel tiap anggota: ada, di server yang benar, bertipe teks, @everyone tidak bisa melihat
   sandbox      (--docker) container berlabel hermes-profile: status dan RAM per profile, total RAM sandbox
                terhadap RAM server (peringatan di atas 80%), ukuran state.db tiap profile (peringatan di
                atas 500 MB). Hanya menjalankan `docker ps` dan `docker stats --no-stream`.
@@ -31,6 +41,8 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 import yaml
+
+import kit_paths
 
 ERROR, WARN, INFO = "error", "warn", "info"
 SYSTEM_PROFILES_KEYS = ("shared", "admin")
@@ -152,8 +164,7 @@ def check_usage(team: dict, rep: Report, now: Optional[float] = None) -> None:
     import sqlite3
     import time
     ledger = Path(team["paths"]["state_dir"]) / "usage.db"
-    fix = ("pasang timer: cp /opt/hermes-team/systemd/hermes-usage-collect.* ~/.config/systemd/user/ && "
-           "systemctl --user daemon-reload && systemctl --user enable --now hermes-usage-collect.timer")
+    fix = "pasang timer: " + timer_install_command("hermes-usage-collect")
     if not ledger.exists():
         rep.add(WARN, "pemakaian", "buku besar pemakaian belum ada (token & request per orang tidak tercatat)", fix)
         return
@@ -173,6 +184,157 @@ def check_usage(team: dict, rep: Report, now: Optional[float] = None) -> None:
     if age is None or age > 3600:
         last = "belum pernah" if age is None else f"{int(age // 60)} menit lalu"
         rep.add(WARN, "pemakaian", f"potret pemakaian terakhir: {last} (seharusnya tiap 15 menit)", fix)
+
+
+KIT_DIR = Path(__file__).resolve().parent
+
+
+def timer_install_command(unit: str) -> str:
+    """Perintah pasang satu timer user systemd dari folder kit (folder unit user belum tentu ada)."""
+    return (f"mkdir -p ~/.config/systemd/user && cp {KIT_DIR}/systemd/{unit}.* ~/.config/systemd/user/ && "
+            f"systemctl --user daemon-reload && systemctl --user enable --now {unit}.timer")
+
+
+# ----------------------------------------------------------------------------- konfigurasi
+def check_config(team: dict, rep: Report, ht: Any) -> None:
+    """Peringatan pemuatan (key tak dikenal) dan ID contoh yang belum diganti."""
+    for line in team.get("warnings") or []:
+        rep.add(WARN, "konfigurasi", line, "perbaiki ejaan key itu (atau hapus), lalu: hermes_team.py check")
+    if not ht.placeholders_allowed():
+        found = ht.placeholder_ids(team)
+        if found:
+            rep.add(ERROR, "konfigurasi", "masih memakai ID contoh dari *.example.yaml: " + ", ".join(found),
+                    "ganti dengan ID asli (Discord → Developer Mode → klik kanan → Copy ID)")
+
+
+# ----------------------------------------------------------------------------- managed scope (/etc/hermes)
+def check_managed(team: dict, rep: Report, ht: Any, managed_dir: Optional[Path] = None) -> None:
+    """Berkas managed terpasang vs `hermes_team.managed_config(team)`, dan /etc/hermes/.env. Hanya membaca."""
+    folder = Path(managed_dir) if managed_dir else ht.managed_dir()
+    install = "jalankan: " + ht.managed_install_command(team)
+    diff = ht.managed_diff(team, folder / "config.yaml")
+    if diff["missing_file"]:
+        rep.add(ERROR, "managed", f"{diff['path']} belum ada: kebijakan tim (sandbox Docker tanpa mount host, "
+                "batas langkah, provider LLM) tidak dipin dan bisa diubah dari profile mana pun", install)
+    elif diff["unreadable"]:
+        rep.add(ERROR, "managed", f"{diff['path']} tidak terbaca ({diff['unreadable']})",
+                f"perbaiki izin/isi berkas (seharusnya 0644 root), atau pasang ulang — {install}")
+    else:
+        if diff["moved"]:
+            rep.add(ERROR, "managed", f"{diff['path']} masih mem-pin {', '.join(diff['moved'])} (berkas dari kit "
+                    "versi lama). Key itu sekarang ditulis per profile; selama masih dipin, batas sandbox per "
+                    "orang dan ambang kompresi per model TIDAK berlaku",
+                    "urutan: hermes_team.py apply → managed (" + ht.managed_install_command(team)
+                    + ") → hermes_team.py apply sekali lagi")
+        drift = [f"kurang {k}" for k in diff["missing"]] + [f"berbeda {k}" for k in diff["changed"]]
+        drift += [f"berlebih {k}" for k in diff["extra"] if k not in diff["moved"]]
+        if drift:
+            rep.add(WARN, "managed", f"{diff['path']} tidak sama dengan team.yaml: " + ", ".join(drift),
+                    "lihat rinciannya: hermes_team.py managed --diff; pasang ulang — " + install)
+    check_managed_env(team, rep, ht, folder / ".env")
+
+
+def check_managed_env(team: dict, rep: Report, ht: Any, env_path: Path) -> None:
+    """.env managed: ada, tidak terbaca semua orang, memuat tiap key_env. Nilai TIDAK pernah dicetak."""
+    providers = (team.get("llm") or {}).get("providers") or {}
+    wanted = sorted({str(b["key_env"]) for b in providers.values() if isinstance(b, dict) and b.get("key_env")})
+    per_user = bool((team.get("llm") or {}).get("per_user_keys"))
+    level = WARN if per_user else ERROR
+    note = " (llm.per_user_keys aktif: key boleh ada di .env tiap profile)" if per_user else ""
+    try:
+        mode = stat.S_IMODE(env_path.stat().st_mode)
+    except OSError:
+        if wanted:
+            rep.add(level, "managed", f"{env_path} belum ada, padahal llm.providers memakai: {', '.join(wanted)}{note}",
+                    f"sebagai root: buat {env_path} berisi NAMA=nilai per baris, lalu "
+                    f"chown root:$(id -gn) {env_path} && chmod 640 {env_path}")
+        return
+    if mode & 0o004:
+        rep.add(ERROR, "managed", f"{env_path} bermode {oct(mode)}: terbaca SEMUA user di server (berisi API key)",
+                f"sudo chmod 640 {env_path} (pemilik root, grup = grup user Hermes)")
+    if not wanted:
+        return
+    try:
+        present = {k for k, v in ht.parse_env_text(env_path.read_text(encoding="utf-8", errors="replace")).items()
+                   if str(v).strip()}
+    except OSError as exc:
+        rep.add(ERROR, "managed", f"{env_path} tidak bisa dibaca user ini ({type(exc).__name__}); Hermes juga "
+                "tidak akan bisa membaca API key di dalamnya",
+                f"sudo chown root:$(id -gn) {env_path} && sudo chmod 640 {env_path}")
+        return
+    missing = [name for name in wanted if name not in present]
+    if missing:
+        rep.add(level, "managed", f"{env_path} tidak memuat (atau nilainya kosong): {', '.join(missing)}{note}",
+                f"sebagai root tambahkan baris {missing[0]}=… ke {env_path}, lalu restart gateway")
+
+
+# ----------------------------------------------------------------------------- systemd (linger & timer)
+def _current_user() -> str:
+    import getpass
+    try:
+        return getpass.getuser()
+    except Exception:  # noqa: BLE001 — tanpa entri passwd (container)
+        return os.environ.get("USER") or str(os.getuid())
+
+
+def check_linger(rep: Report, run: "Runner", user: Optional[str] = None) -> None:
+    """Tanpa linger, systemd --user (gateway + timer) mati saat user logout dan tidak hidup saat boot."""
+    user = user or _current_user()
+    fix = f"sudo loginctl enable-linger {user}"
+    try:
+        code, out = run(["loginctl", "show-user", user, "-p", "Linger"])
+    except (OSError, subprocess.SubprocessError):
+        rep.add(INFO, "systemd", "loginctl tidak tersedia; linger tidak diperiksa")
+        return
+    text = (out or "").strip()
+    if code == 0 and text.lower().endswith("linger=yes"):
+        return
+    if code == 0 and "linger=no" in text.lower():
+        rep.add(WARN, "systemd", f"linger user {user} mati: gateway dan timer berhenti saat {user} logout dan "
+                "tidak hidup otomatis setelah reboot", fix)
+        return
+    last = text.splitlines()[-1] if text else f"exit {code}"
+    rep.add(WARN, "systemd", f"linger user {user} tidak bisa dipastikan ({last}); bila belum aktif, gateway "
+            "berhenti saat logout", fix)
+
+
+def check_timers(team: dict, rep: Report, run: "Runner") -> None:
+    """Timer user: hermes-usage-collect (selalu), hermes-usage-report (bila laporan terjadwal diisi),
+    hermes-sandbox-idle (opsional). systemctl tidak ada / tanpa sesi user → satu catatan, bukan kegagalan."""
+    usage = team.get("usage") or {}
+    reports_on = bool(usage.get("report_channel_id")) and any((usage.get("reports") or {}).values())
+    units = [("hermes-usage-collect", WARN, "pemakaian token per orang tidak dipotret"),
+             ("hermes-usage-report", WARN if reports_on else None,
+              "laporan terjadwal (usage.reports) tidak akan terkirim"),
+             ("hermes-sandbox-idle", INFO, "sandbox menganggur tidak dihentikan otomatis (opsional)")]
+    for unit, level, why in units:
+        if level is None:
+            continue
+        try:
+            code, out = run(["systemctl", "--user", "is-enabled", f"{unit}.timer"])
+        except (OSError, subprocess.SubprocessError):
+            rep.add(INFO, "systemd", "systemctl tidak tersedia; timer tidak diperiksa")
+            return
+        text = (out or "").strip()
+        if code == 0 and text.splitlines()[:1] and text.splitlines()[0].strip() in ("enabled", "enabled-runtime",
+                                                                                   "static", "linked"):
+            continue
+        if "failed to connect to bus" in text.lower() or "no medium found" in text.lower():
+            rep.add(INFO, "systemd", "systemd --user tidak terjangkau dari sesi ini (jalankan sebagai user Hermes "
+                    "lewat login/ssh, bukan `su`); timer tidak diperiksa")
+            return
+        state = text.splitlines()[0].strip() if text else f"exit {code}"
+        rep.add(level, "systemd", f"timer {unit}.timer belum aktif ({state}): {why}", timer_install_command(unit))
+
+
+def check_system(team: dict, rep: Report, ht: Any, run: Optional["Runner"] = None,
+                 managed_dir: Optional[Path] = None, user: Optional[str] = None) -> None:
+    """Pemeriksaan di luar folder Hermes: konfigurasi, managed scope, linger, timer."""
+    run = run or run_command
+    check_config(team, rep, ht)
+    check_managed(team, rep, ht, managed_dir)
+    check_linger(rep, run, user)
+    check_timers(team, rep, run)
 
 
 # ----------------------------------------------------------------------------- sandbox Docker & state.db
@@ -309,6 +471,166 @@ def check_docker(team: dict, root: Path, rep: Report, run: Runner = run_command,
         rep.add(INFO, "sandbox", note)
 
 
+# Izin server yang dibutuhkan bot: (nama bit, label di Discord, untuk apa, wajib?(team) → bool).
+BOT_GUILD_PERMISSIONS = (
+    ("MANAGE_ROLES", "Manage Roles", "memberi/mencabut role dan mengatur izin channel pribadi", None),
+    ("MANAGE_CHANNELS", "Manage Channels", "membuat channel pribadi saat onboarding", None),
+    ("VIEW_AUDIT_LOG", "View Audit Log", "memeriksa siapa pemberi role @backend (onboarding.verify_actor)",
+     lambda team: team["onboarding"]["enabled"] and team["onboarding"]["verify_actor"]),
+    ("MANAGE_MESSAGES", "Manage Messages", "menghapus pesan berisi secret (secrets.delete_secret_messages)",
+     lambda team: team["secrets"]["delete_secret_messages"]),
+    ("MANAGE_THREADS", "Manage Threads", "mengelola thread percakapan", None),
+    ("CREATE_PUBLIC_THREADS", "Create Public Threads", "membuka thread per percakapan", None),
+    ("SEND_MESSAGES_IN_THREADS", "Send Messages in Threads", "membalas di dalam thread", None),
+)
+CATEGORY_CHANNEL_LIMIT = 50      # batas Discord: channel per kategori
+TEXT_CHANNEL_TYPES = (0, 5)      # teks, announcement
+
+
+def _bits(value: Any) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def guild_permissions(guild_id: str, role_ids: Any, roles: dict, ht: Any) -> int:
+    """Izin tingkat server: @everyone ∪ semua role yang dipegang. Administrator = semua izin."""
+    perms = _bits((roles.get(str(guild_id)) or {}).get("permissions"))
+    for rid in role_ids or []:
+        perms |= _bits((roles.get(str(rid)) or {}).get("permissions"))
+    return ~0 if perms & ht.PERM["ADMINISTRATOR"] else perms
+
+
+def channel_permissions(base: int, channel: dict, guild_id: str, role_ids: Any, user_id: str, ht: Any) -> int:
+    """Izin efektif di satu channel (aturan Discord: @everyone → role → member; Administrator melewati semua)."""
+    if base & ht.PERM["ADMINISTRATOR"]:
+        return ~0
+    ows = {str(o.get("id")): o for o in channel.get("permission_overwrites") or []}
+    perms = base
+    everyone = ows.get(str(guild_id))
+    if everyone:
+        perms = (perms & ~_bits(everyone.get("deny"))) | _bits(everyone.get("allow"))
+    allow = deny = 0
+    for rid in role_ids or []:
+        ow = ows.get(str(rid))
+        if ow:
+            allow |= _bits(ow.get("allow"))
+            deny |= _bits(ow.get("deny"))
+    perms = (perms & ~deny) | allow
+    mine = ows.get(str(user_id))
+    if mine:
+        perms = (perms & ~_bits(mine.get("deny"))) | _bits(mine.get("allow"))
+    return perms
+
+
+def check_discord_setup(team: dict, rep: Report, ht: Any, api: Any) -> bool:
+    """Preflight tingkat TIM (bukan per anggota): cukup token bot, gateway tidak perlu jalan.
+    Kembalikan False bila pemeriksaan lanjutan tidak mungkin (token salah / bot tidak di server)."""
+    guild = team["guild_id"]
+    view, send = ht.PERM["VIEW_CHANNEL"], ht.PERM["SEND_MESSAGES"]
+    roles_menu = "Discord → Server Settings → Roles"
+    try:
+        bot_id = str(api.bot_user_id())
+    except ht.TeamError as exc:
+        rep.add(ERROR, "discord", f"token bot ditolak atau Discord tidak terjangkau: {exc}",
+                "periksa DISCORD_BOT_TOKEN di ~/.hermes/.env (Developer Portal → Applications → Bot → Reset Token), "
+                "lalu ulangi")
+        return False
+    try:
+        me = api.guild_member(guild, bot_id) or {}
+        roles = {str(r.get("id")): r for r in api.guild_roles(guild)}
+        channels = {str(c.get("id")): c for c in api.guild_channels(guild)}
+    except ht.TeamError as exc:
+        rep.add(ERROR, "discord", f"bot belum ada di server guild_id {guild} (atau guild_id salah): {exc}",
+                "undang bot: Developer Portal → OAuth2 → URL Generator (scope bot + applications.commands) → buka "
+                "URL-nya dan pilih server tim; pastikan guild_id di team.yaml = ID server itu")
+        return False
+    my_roles = [str(r) for r in me.get("roles") or []]
+    # role
+    wanted_roles = [("roles.member", team["member_role"]), ("roles.admin", team["admin_role"])]
+    if team.get("entry_role"):
+        wanted_roles.append(("roles.entry", team["entry_role"]))
+    for key, rid in wanted_roles:
+        if rid not in roles:
+            rep.add(ERROR, "discord", f"role {key} ({rid}) tidak ada di server",
+                    f"{roles_menu} → klik kanan role yang benar → Copy ID → isi {key} di team.yaml")
+    top = max((int((roles.get(r) or {}).get("position") or 0) for r in my_roles), default=0)
+    for key, rid in wanted_roles:
+        if key == "roles.admin" or rid not in roles:
+            continue
+        if int(roles[rid].get("position") or 0) >= top:
+            rep.add(ERROR, "discord", f"role tertinggi bot (posisi {top}) tidak berada di ATAS {key} "
+                    f"'{roles[rid].get('name')}' (posisi {roles[rid].get('position')}): bot tidak bisa memberi "
+                    "atau mencabut role itu",
+                    f"{roles_menu} → seret (drag-and-drop) role bot ke ATAS role '{roles[rid].get('name')}' → "
+                    "Save Changes")
+    # izin server
+    base = guild_permissions(guild, my_roles, roles, ht)
+    for bit, label, why, needed in BOT_GUILD_PERMISSIONS:
+        if base & ht.PERM[bit]:
+            continue
+        level = ERROR if needed is None or needed(team) else WARN
+        rep.add(level, "discord", f"bot tidak punya izin {label} ({why})",
+                f"{roles_menu} → role bot → Permissions → aktifkan {label} (atau undang ulang bot dengan izin itu)")
+    # kategori
+    category = team.get("category_id")
+    if category:
+        cat = channels.get(category)
+        if cat is None:
+            rep.add(ERROR, "discord", f"category_id {category} tidak ada di server (channel pribadi baru tidak bisa dibuat)",
+                    "klik kanan kategori tujuan → Copy ID → isi category_id di team.yaml")
+        elif cat.get("type") != 4:
+            rep.add(ERROR, "discord", f"category_id {category} bukan kategori (tipe {cat.get('type')})",
+                    "isi category_id dengan ID KATEGORI, bukan channel")
+        else:
+            used = sum(1 for c in channels.values() if str(c.get("parent_id")) == category)
+            if used >= CATEGORY_CHANNEL_LIMIT:
+                rep.add(ERROR, "discord", f"kategori {category} sudah berisi {used} channel (batas Discord "
+                        f"{CATEGORY_CHANNEL_LIMIT}): onboarding berikutnya gagal membuat channel",
+                        "buat kategori baru dan isi category_id dengan ID-nya (channel lama boleh tetap di kategori lama)")
+            elif used >= CATEGORY_CHANNEL_LIMIT - 5:
+                rep.add(WARN, "discord", f"kategori {category} hampir penuh: {used}/{CATEGORY_CHANNEL_LIMIT} channel",
+                        "siapkan kategori baru sebelum penuh")
+    # channel bersama, admin, laporan
+    everyone_base = _bits((roles.get(guild) or {}).get("permissions"))
+    targets = [("shared.channel_id", team["shared"]["channel_id"], True),
+               ("admin.channel_id", team["admin"]["channel_id"], True)]
+    report_channel = (team.get("usage") or {}).get("report_channel_id")
+    if report_channel and report_channel not in (team["shared"]["channel_id"], team["admin"]["channel_id"]):
+        targets.append(("usage.report_channel_id", report_channel, False))
+    for key, cid, must_be_private in targets:
+        ch = channels.get(cid)
+        if ch is None:
+            try:
+                other = api.get_channel(cid)
+            except ht.TeamError:
+                other = None
+            if other is None:
+                rep.add(ERROR, "discord", f"channel {key} ({cid}) tidak ada (atau bot tidak bisa melihatnya)",
+                        f"klik kanan channel yang benar → Copy ID → isi {key} di team.yaml")
+            else:
+                rep.add(ERROR, "discord", f"channel {key} ({cid}) bukan di server tim (guild {other.get('guild_id')})",
+                        f"isi {key} dengan channel di server {guild}")
+            continue
+        if ch.get("type") not in TEXT_CHANNEL_TYPES:
+            rep.add(ERROR, "discord", f"channel {key} ({cid}) bukan channel teks (tipe {ch.get('type')})",
+                    f"isi {key} dengan ID channel teks")
+            continue
+        edit = f"Edit Channel #{ch.get('name') or cid} → Permissions"
+        if must_be_private and channel_permissions(everyone_base, ch, guild, [], "", ht) & view:
+            who = "role member" if key.startswith("shared") else "role admin"
+            rep.add(ERROR, "discord", f"channel {key} #{ch.get('name')} bisa dilihat @everyone: siapa pun di server "
+                    "dilayani profile itu",
+                    f"{edit} → @everyone: matikan View Channel; lalu beri View Channel ke {who} dan ke bot")
+        mine = channel_permissions(base, ch, guild, my_roles, bot_id, ht)
+        lacking = [label for bit, label in ((view, "View Channel"), (send, "Send Messages")) if not mine & bit]
+        if lacking:
+            rep.add(ERROR, "discord", f"bot tidak bisa {' / '.join(lacking)} di {key} #{ch.get('name')}",
+                    f"{edit} → tambah bot (atau role-nya) → izinkan View Channel dan Send Messages")
+    return True
+
+
 def check_discord(team: dict, rep: Report, ht: Any, api: Any) -> None:
     guild = team["guild_id"]
     everyone = guild            # id role @everyone = id server
@@ -339,31 +661,40 @@ def check_discord(team: dict, rep: Report, ht: Any, api: Any) -> None:
             rep.add(WARN, "discord", f"channel {m['name']} dapat dilihat pihak lain: {', '.join(extra)}")
 
 
-def main(argv: Optional[list[str]] = None) -> int:
+def main(argv: Optional[list[str]] = None, *, run: Optional[Runner] = None, api: Any = None) -> int:
+    """`run` (perintah sistem) dan `api` (klien Discord) bisa disuntik untuk uji."""
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     import hermes_team as ht
 
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--config", help="team.yaml (default: ~/.hermes-team/team.yaml)")
+    ap.add_argument("--config", help="team.yaml (default: $HERMES_TEAM_DIR/team.yaml, kalau tidak "
+                                     "~/.hermes-team/team.yaml)")
     ap.add_argument("--members")
     ap.add_argument("--hermes-root", default=os.environ.get("HERMES_HOME") or "~/.hermes")
-    ap.add_argument("--discord", action="store_true", help="periksa juga channel di Discord")
+    ap.add_argument("--discord", action="store_true",
+                    help="preflight Discord (token, server, role, izin bot, channel bersama/admin) + channel anggota")
     ap.add_argument("--docker", action="store_true",
                     help="periksa sandbox Docker per profile (status, RAM) dan ukuran state.db")
     ap.add_argument("--format", choices=("text", "json"), default="text")
     args = ap.parse_args(argv)
+    team_file = kit_paths.team_file(args.config)
+    notice = None if args.config else kit_paths.cwd_notice(team_file)
+    if notice:
+        print(notice, file=sys.stderr)
     try:
-        team = ht.load_team(Path(args.config).expanduser() if args.config else ht.default_team_file(),
-                            Path(args.members).expanduser() if args.members else None)
+        team = ht.load_team(team_file, Path(args.members).expanduser() if args.members else None)
     except ht.TeamError as exc:
         print(f"konfigurasi: {exc}", file=sys.stderr)
         return 2
     root = Path(args.hermes_root).expanduser()
     rep = Report()
     check_local(team, root, rep, ht)
+    check_system(team, rep, ht, run=run)
     if args.discord:
         try:
-            check_discord(team, rep, ht, ht.DiscordAPI(ht.discord_token(root)))
+            client = api or ht.DiscordAPI(ht.discord_token(root))
+            if check_discord_setup(team, rep, ht, client):
+                check_discord(team, rep, ht, client)
         except ht.TeamError as exc:
             rep.add(ERROR, "discord", f"tidak bisa memeriksa Discord: {exc}")
     if args.docker:

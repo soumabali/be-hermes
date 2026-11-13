@@ -21,31 +21,71 @@ SECRET_NAME_RE = re.compile(
 MAX_VALUE = 8192
 MANAGED_ENV = Path("/etc/hermes/.env")      # .env managed (milik root); hanya dibaca untuk penyamaran
 
-# Nama yang dipakai Hermes sendiri: kredensial provider, gerbang akses platform, setelan runtime/sandbox.
+# ---------------------------------------------------------------------------------------------------------
+# Kebijakan nama /env-set.
+#
+# Nilai /env-set ditulis ke `.env` profile, dan Hermes membaca berkas itu sebagai KONFIGURASI (token adapter
+# platform, gerbang `*_ALLOWED_USERS`, `*_BASE_URL` provider, …). Jadi nama yang dikenal Hermes tidak boleh
+# bisa diisi anggota: ia bisa menyalakan adapter platform lain untuk profilenya (melewati gerbang Discord,
+# pembatas, dan anggaran) atau membelokkan lalu lintas LLM. Penolakan memakai POLA, bukan hanya daftar:
+#   1. HERMES_PREFIXES — namespace platform / provider / gateway;
+#   2. HERMES_NAMES    — nama tunggal yang awalannya terlalu umum untuk dijadikan prefiks;
+#   3. BLOCKED_SHAPE   — bentuk yang oleh Hermes dipakai sebagai setelan apa pun namespacenya (juga menutup
+#      platform/provider yang baru ditambahkan hulu sebelum daftar ini diperbarui);
+#   4. SYSTEM_NAMES / SYSTEM_PREFIXES — variabel sistem/loader.
+# Namespace aman untuk anggota: awalan `MY_` (tidak pernah dibaca Hermes) — itu yang disarankan pesan tolak.
+#
+# Asal data (1) dan (2): Hermes hulu commit 5d87ea2, dibaca statis (tanpa menjalankan kodenya):
+#   - nama direktori `plugins/platforms/*` (26 platform) → `<NAMA>_`;
+#   - semua nama env yang dibaca kode di `plugins/platforms/**` (os.getenv / os.environ / helper env) dan
+#     semua literal HURUF_BESAR di `plugins/platforms/*/gateway_env.py` + `plugin.yaml`;
+#   - `gateway/platform_env.py`, `gateway/config_env.py`, `gateway/platforms/*.py`;
+#   - kunci `OPTIONAL_ENV_VARS` (hermes_cli/config_defaults.py) dan `_EXTRA_ENV_KEYS` (hermes_cli/config.py);
+#   - `api_key_env_vars` / `base_url_env_var` / `env_vars` provider di hermes_cli/, providers/, plugins/, agent/;
+#   - literal nama env di `tools/environments/local_env_policy*.py` (blocklist kredensial + gerbang otorisasi).
+#   Hasil: 531 nama. Token pertama tiap nama menjadi prefiks, kecuali token yang terlalu umum (API, TOOL, AI,
+#   MODEL, LLM, META, GH, HF, …) → prefiks dua token (`API_SERVER_`, `TOOL_GATEWAY_`, …) atau nama persis.
+#   Uji `TestIntegrationEnvNames` (butuh Hermes terpasang) menghitung ulang daftar itu dari Hermes yang
+#   terpasang dan gagal bila ada nama yang lolos — jadi pergeseran hulu tertangkap di CI.
 HERMES_NAMES = {
-    "OPENAI_API_KEY", "OPENAI_BASE_URL", "ANTHROPIC_API_KEY", "ANTHROPIC_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN",
-    "OPENROUTER_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY", "GROQ_API_KEY", "MISTRAL_API_KEY",
-    "DEEPSEEK_API_KEY", "XAI_API_KEY", "NOUS_API_KEY", "TOGETHER_API_KEY", "FIREWORKS_API_KEY",
-    "PERPLEXITY_API_KEY", "COHERE_API_KEY", "HF_TOKEN", "HUGGINGFACE_API_KEY", "AZURE_OPENAI_API_KEY",
-    "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "AWS_BEARER_TOKEN_BEDROCK",
-    "GITHUB_TOKEN", "GH_TOKEN", "COPILOT_GITHUB_TOKEN", "COPILOT_API_KEY",
-    "FIRECRAWL_API_KEY", "TAVILY_API_KEY", "EXA_API_KEY", "BRAVE_API_KEY", "SERPER_API_KEY",
-    "ELEVENLABS_API_KEY", "FAL_KEY", "BROWSERBASE_API_KEY", "BROWSERBASE_PROJECT_ID", "API_SERVER_KEY",
-    "SUDO_PASSWORD", "MESSAGING_CWD", "WEBHOOK_SECRET",
+    "ACTUAL_API_KEY", "ACTUAL_BASE_URL", "BRAVE_API_KEY", "BRAVE_SEARCH_API_KEY", "BRV_API_KEY",
+    "DAYTONA_API_KEY", "ELEVENLABS_API_KEY", "EXA_API_KEY", "FAL_KEY", "FFMPEG_PATH", "GH_TOKEN",
+    "HELICONE_API_KEY", "HF_BASE_URL", "HF_TOKEN", "HUGGINGFACE_API_KEY", "KEENABLE_API_KEY", "KREA_API_KEY",
+    "LINEAR_API_KEY", "LLM_MODEL", "LM_API_KEY", "LM_BASE_URL", "MEM0_API_KEY", "MESSAGING_CWD", "META_API_KEY",
+    "META_BASE_URL", "META_MODEL_API_KEY", "MODEL_API_KEY", "NOTION_API_KEY", "OAUTHLIB_RELAX_TOKEN_SCOPE",
+    "PARALLEL_API_KEY", "PORCUPINE_ACCESS_KEY", "ROUTER_API_KEY", "SEARXNG_URL", "SERPER_API_KEY",
+    "SUPERMEMORY_API_KEY", "TAVILY_API_KEY", "TENOR_API_KEY", "TOGETHER_API_KEY", "YUANBAO_APP_KEY",
 }
 HERMES_PREFIXES = (
-    "HERMES_", "_HERMES_", "GATEWAY_", "TERMINAL_", "AUXILIARY_", "DISCORD_", "TELEGRAM_", "SLACK_", "WHATSAPP_",
-    "SIGNAL_", "MATRIX_", "MATTERMOST_", "EMAIL_", "TEAMS_", "API_SERVER_", "TEAMCTL_", "NOUS_", "IDP_",
+    "A2A_", "AI_GATEWAY_", "ALIBABA_", "ANTHROPIC_", "API_SERVER_", "ARCEEAI_", "ARCEE_", "AUXILIARY_", "AWS_",
+    "AZURE_", "BLUEBUBBLES_", "BROWSERBASE_", "BROWSER_USE_", "BUZZ_", "CLAUDE_", "COHERE_", "COMMANDCODE_",
+    "CONNECTOR_GATEWAY_", "COPILOT_", "DASHSCOPE_", "DEEPINFRA_", "DEEPSEEK_", "DINGTALK_", "DISCORD_",
+    "EMAIL_", "FEISHU_", "FIRECRAWL_", "FIREWORKS_", "GATEWAY_", "GEMINI_", "GITHUB_", "GLM_", "GMI_",
+    "GOOGLE_", "GROQ_", "HERMES_", "HINDSIGHT_", "HONCHO_", "IDP_", "IRC_", "KILOCODE_", "KIMI_", "LINE_",
+    "MATRIX_", "MATTERMOST_", "MINIMAX_", "MISTRAL_", "MODAL_", "MSGRAPH_", "NEBIUS_", "NOUS_", "NOVITA_",
+    "NTFY_", "NVIDIA_", "OLLAMA_", "OPENAI_", "OPENCODE_", "OPENROUTER_", "OPENVIKING_", "PERPLEXITY_",
+    "PHOTON_", "QQBOT_", "QQ_", "QWEN_", "RAFT_", "RAMP_ROUTER_", "RETAINDB_", "SIGNAL_", "SIMPLEX_", "SLACK_",
+    "SMS_", "STEPFUN_", "TEAMCTL_", "TEAMS_", "TELEGRAM_", "TERMINAL_", "TOKENHUB_", "TOKENPLAN_",
+    "TOOL_GATEWAY_", "TWILIO_", "UPSTAGE_", "VERCEL_", "VERTEX_", "VOICE_TOOLS_", "WEBHOOK_", "WECOM_",
+    "WEIXIN_", "WHATSAPP_", "XAI_", "XIAOMI_", "ZAI_", "Z_AI_", "_HERMES_",
 )
+# Bentuk setelan Hermes apa pun namespacenya: endpoint LLM, gerbang akses, saklar/alamat adapter, webhook, proxy.
+BLOCKED_SHAPE = re.compile(
+    r"(?:_BASE_URL|_API_BASE|_ALLOWED_[A-Z0-9_]+|_ALLOW_ALL_USERS|_ALLOW_BOTS|_ENABLED|_PORT|_HOST"
+    r"|_HOME_CHANNEL(?:_[A-Z0-9_]+)?|_HOME_ROOM|_PROXY|_REQUIRE_MENTION|_FREE_RESPONSE_[A-Z0-9_]+)$"
+    r"|(?:^|_)WEBHOOK(?:_|$)")
+SAFE_PREFIX = "MY_"         # namespace anggota: tidak pernah dibaca Hermes, bebas dari aturan prefiks & bentuk
 SYSTEM_NAMES = {
     "PATH", "HOME", "USER", "LOGNAME", "SHELL", "PWD", "OLDPWD", "LANG", "LANGUAGE", "TERM", "TZ", "TMPDIR",
     "TEMP", "TMP", "HOSTNAME", "IFS", "PS1", "PS2", "PS4", "ENV", "BASH_ENV", "PROMPT_COMMAND", "SHLVL", "EDITOR",
     "PAGER", "VISUAL", "MAIL", "DISPLAY", "VIRTUAL_ENV", "NODE_OPTIONS", "NODE_PATH", "PERL5LIB", "PERL5OPT",
     "RUBYOPT", "RUBYLIB", "CLASSPATH", "JAVA_TOOL_OPTIONS", "GIT_ASKPASS", "GIT_SSH", "GIT_SSH_COMMAND",
     "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY", "SSL_CERT_FILE", "SSL_CERT_DIR", "CURL_CA_BUNDLE",
-    "REQUESTS_CA_BUNDLE", "KUBECONFIG",
+    "REQUESTS_CA_BUNDLE", "KUBECONFIG", "CONDA_PREFIX", "NOTIFY_SOCKET", "LOCALAPPDATA", "APPDATA",
+    "USERPROFILE", "SYSTEMROOT", "COMSPEC", "PATHEXT", "CDPATH", "GLOBIGNORE", "ZDOTDIR",
 }
-SYSTEM_PREFIXES = ("LD_", "DYLD_", "LC_", "PYTHON", "SSH_", "XDG_", "DOCKER_", "BASH_", "SUDO_", "GPG_")
+SYSTEM_PREFIXES = ("LD_", "DYLD_", "LC_", "PYTHON", "SSH_", "XDG_", "DOCKER_", "BASH_", "SUDO_", "GPG_",
+                   "WATCHDOG_", "CONDA_", "NPM_CONFIG_", "PIP_", "UV_", "GIT_CONFIG", "SYSTEMD_")
 SUGGEST = {
     "GITHUB_TOKEN": "GH_PAT", "GH_TOKEN": "GH_PAT", "COPILOT_GITHUB_TOKEN": "GH_PAT",
     "OPENAI_API_KEY": "MY_OPENAI_KEY", "ANTHROPIC_API_KEY": "MY_ANTHROPIC_KEY", "GEMINI_API_KEY": "MY_GEMINI_KEY",
@@ -53,17 +93,42 @@ SUGGEST = {
     "AWS_SECRET_ACCESS_KEY": "MY_AWS_SECRET", "HF_TOKEN": "MY_HF_TOKEN",
 }
 USAGE_HINT = {"GH_PAT": " Di sandbox: `GH_TOKEN=$GH_PAT gh pr list`."}
+COPILOT_NAMES = ("GITHUB_TOKEN", "GH_TOKEN", "COPILOT_GITHUB_TOKEN")
+
+
+def suggest_name(name: str) -> str:
+    """Nama pengganti yang pasti lolos kebijakan: pemetaan khusus (GH_PAT, …) atau awalan `MY_`."""
+    alt = SUGGEST.get(name)
+    if not alt:
+        alt = name if name.startswith(SAFE_PREFIX) else (SAFE_PREFIX + name.lstrip("_"))[:64].rstrip("_")
+    return alt
 
 
 def _suggest(name: str) -> str:
-    alt = SUGGEST.get(name) or f"MY_{name}"[:64]
-    return f" Pakai nama lain, mis. `{alt}`.{USAGE_HINT.get(alt, '')}"
+    alt = suggest_name(name)
+    return (f" Pakai nama lain berawalan `{SAFE_PREFIX}` (namespace yang tidak dibaca Hermes), mis. `{alt}`."
+            f"{USAGE_HINT.get(alt, '')}")
+
+
+def blocked_kind(name: str) -> str:
+    """"" = bukan nama Hermes/sistem; selain itu jenisnya: hermes | shape | system."""
+    if name in SYSTEM_NAMES or name.startswith(SYSTEM_PREFIXES):
+        return "system"
+    if name in HERMES_NAMES:
+        return "hermes"
+    if name.startswith(SAFE_PREFIX):
+        return ""
+    if name.startswith(HERMES_PREFIXES):
+        return "hermes"
+    if BLOCKED_SHAPE.search(name):
+        return "shape"
+    return ""
 
 
 def check_env_name(name: Any, *, reserved: Iterable[str] = (), allow: Iterable[str] = (),
                    deny: Iterable[str] = (), upstream: Optional[Callable[[str], bool]] = None) -> tuple[bool, str]:
-    """(boleh?, pesan). `reserved` (key LLM tim) dan `deny` selalu ditolak; `allow` hanya membuka
-    nama yang biasanya ditolak karena dipakai Hermes/sistem."""
+    """(boleh?, pesan). `reserved` (key LLM tim) dan `deny` selalu ditolak; `allow` (secrets.allow_names)
+    adalah pintu darurat admin: hanya membuka nama yang biasanya ditolak karena dipakai Hermes/sistem."""
     if not isinstance(name, str) or not ENV_NAME_RE.match(name):
         return False, ("Nama harus HURUF BESAR, angka, dan garis bawah (2–64 karakter, diawali huruf), "
                        "mis. `GH_PAT`.")
@@ -73,12 +138,17 @@ def check_env_name(name: Any, *, reserved: Iterable[str] = (), allow: Iterable[s
         return False, f"`{name}` dilarang oleh admin tim (secrets.deny_names)." + _suggest(name)
     if name in {str(a) for a in allow}:
         return True, ""
-    if name in HERMES_NAMES or name.startswith(HERMES_PREFIXES):
-        why = ("dipakai Hermes sebagai kredensial provider Copilot" if name in ("GITHUB_TOKEN", "GH_TOKEN",
-                                                                                 "COPILOT_GITHUB_TOKEN")
-               else "dipakai Hermes sendiri (kredensial provider / gerbang akses / setelan sandbox)")
-        return False, f"`{name}` {why}, jadi tidak boleh ditimpa." + _suggest(name)
-    if name in SYSTEM_NAMES or name.startswith(SYSTEM_PREFIXES):
+    kind = blocked_kind(name)
+    if kind == "hermes":
+        why = ("dipakai Hermes sebagai kredensial provider Copilot" if name in COPILOT_NAMES
+               else "berada di namespace yang dibaca Hermes sendiri (kredensial provider / adapter platform / "
+                    "gerbang akses / setelan sandbox)")
+        return False, f"`{name}` {why}, jadi tidak boleh diisi lewat /env-set." + _suggest(name)
+    if kind == "shape":
+        return False, (f"`{name}` berbentuk setelan yang dibaca Hermes (akhiran seperti `_BASE_URL`, "
+                       "`_ALLOWED_USERS`, `_ENABLED`, `_HOST`, `_PORT`, `_PROXY`, atau memuat `WEBHOOK`), jadi "
+                       "tidak boleh diisi lewat /env-set." + _suggest(name))
+    if kind == "system":
         return False, f"`{name}` adalah variabel sistem; mengubahnya bisa merusak sandbox." + _suggest(name)
     if upstream is not None:
         try:
@@ -87,6 +157,18 @@ def check_env_name(name: Any, *, reserved: Iterable[str] = (), allow: Iterable[s
         except Exception:
             pass
     return True, ""
+
+
+def stale_names(names: Iterable[str], *, reserved: Iterable[str] = (), allow: Iterable[str] = (),
+                deny: Iterable[str] = (), upstream: Optional[Callable[[str], bool]] = None) -> dict[str, str]:
+    """Nama yang SUDAH tersimpan tetapi kini ditolak kebijakan → nama pengganti yang disarankan. Tidak ada
+    yang dihapus otomatis: pemiliknya diberi tahu lewat /env-list supaya menyimpan ulang dengan nama baru."""
+    out: dict[str, str] = {}
+    for name in names:
+        ok, _why = check_env_name(name, reserved=reserved, allow=allow, deny=deny, upstream=upstream)
+        if not ok:
+            out[str(name)] = suggest_name(str(name))
+    return out
 
 
 def check_env_value(value: Any, min_length: int = 6) -> tuple[bool, str]:

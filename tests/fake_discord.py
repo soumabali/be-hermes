@@ -36,6 +36,10 @@ class State:
         self.messages = {}
         self.forbid = set()     # (method, path-prefix) yang dijawab 403
         self.faults = []        # gangguan sekali pakai, lihat fault()
+        # Dipakai kit_setup.py (wizard): aplikasi bot (flags = bit intent) dan daftar server tempat bot berada.
+        self.application = {"id": "990000000000000001", "name": "Hermes Backend", "bot_public": False,
+                            "flags": (1 << 15) | (1 << 19)}
+        self.bot_guilds = [{"id": GUILD, "name": "Tim Backend"}]
         self._seed()
 
     def fault(self, method, prefix, status=500, body=None, headers=None, raw=None, times=1):
@@ -153,6 +157,10 @@ class Handler(BaseHTTPRequestHandler):
         st = self.state
         if p == ["users", "@me"]:
             return self._send(200, {"id": BOT, "username": "hermes", "bot": True})
+        if p == ["oauth2", "applications", "@me"]:
+            return self._send(200, dict(st.application))
+        if p == ["users", "@me", "guilds"]:
+            return self._send(200, [dict(g) for g in st.bot_guilds])
         if p[:2] == ["guilds", GUILD]:
             rest = p[2:]
             if not rest:

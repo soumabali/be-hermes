@@ -13,7 +13,7 @@ parameter callback, dan `discord` baru diimpor di dalam fungsi.
 import asyncio
 from typing import Any, Callable, Optional
 
-from .secrets import SecretStore, check_env_name, check_env_value, sync_passthrough
+from .secrets import SecretStore, check_env_name, check_env_value, stale_names, sync_passthrough
 from .shared import log, log_once
 
 MSG_WHERE = ("Perintah ini hanya berfungsi di channel pribadimu (#hermes-<nama>) atau thread di dalamnya. "
@@ -104,9 +104,22 @@ async def do_env_list(roster: Any, profile: str, *, store: Optional[SecretStore]
     names = await asyncio.to_thread(store.names)
     if not names:
         return f"Belum ada secret untuk profile `{profile}`. Tambahkan dengan `/env-set`."
-    limit = int(roster.settings.get("max_keys") or 40)
-    return (f"Secret profile `{profile}` ({len(names)}/{limit}) — hanya nama, nilainya tidak ditampilkan:\n"
-            + "\n".join(f"• `{n}`" for n in names))
+    settings = roster.settings
+    limit = int(settings.get("max_keys") or 40)
+    # Nama lama yang kini ditolak kebijakan (mis. namespace platform Hermes) TIDAK dihapus diam-diam:
+    # ditandai di sini supaya pemiliknya menyimpan ulang dengan nama baru lalu menghapus yang lama.
+    flagged = stale_names(names, reserved=roster.reserved_env, allow=settings.get("allow_names") or [],
+                          deny=settings.get("deny_names") or [], upstream=_upstream_blocklist())
+    text = (f"Secret profile `{profile}` ({len(names)}/{limit}) — hanya nama, nilainya tidak ditampilkan:\n"
+            + "\n".join(f"• `{n}`" + (" ⚠️ nama tidak lagi diizinkan" if n in flagged else "") for n in names))
+    if flagged:
+        log_once(f"env-stale-{profile}", "profile %s menyimpan nama secret yang kini ditolak kebijakan: %s",
+                 profile, ", ".join(sorted(flagged)))
+        text += ("\n\n⚠️ Nama bertanda di atas kini dicadangkan untuk Hermes/sistem (bisa terbaca sebagai setelan "
+                 "Hermes). Nilainya TIDAK dihapus otomatis. Ganti namanya: simpan ulang nilainya lewat `/env-set` "
+                 "dengan nama baru, lalu hapus yang lama dengan `/env-unset`:\n"
+                 + "\n".join(f"• `{old}` → `{new}`" for old, new in sorted(flagged.items())))
+    return text
 
 
 async def do_env_unset(roster: Any, profile: str, name: Any, *, store: Optional[SecretStore] = None,

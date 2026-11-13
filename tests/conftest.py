@@ -1,7 +1,8 @@
 """Fixture bersama uji kit. Tidak butuh binary `hermes` asli maupun jaringan:
 
 - `hermes` tiruan (skrip Python di tmp_path) mencatat argv dan meniru `config set`, `profile create
-  --clone-from` (menyalin config.yaml/.env/SOUL.md/memories/skills seperti upstream), `plugins enable`.
+  --clone-from` (menyalin config.yaml/.env/SOUL.md/memories/skills seperti upstream), `plugins enable`,
+  `profile delete <nama> --yes`.
   config.yaml ditulis sebagai JSON (subset YAML) supaya skrip tiruan tidak perlu PyYAML dan cepat.
 - HERMES_HOME dan HERMES_TEAM_DIR menunjuk ke tmp_path.
 - Discord: tests/fake_discord.py lewat env TEAMCTL_DISCORD_API.
@@ -145,6 +146,15 @@ elif argv[:2] == ["profile", "create"] and "--clone-from" in argv:
     save(os.path.join(dest, "config.yaml"), cfg)
     if os.path.isdir(os.path.join(source, "skills")):
         shutil.copytree(os.path.join(source, "skills"), os.path.join(dest, "skills"), dirs_exist_ok=True)
+elif argv[:2] == ["profile", "delete"] and len(argv) >= 3:
+    name = argv[2]
+    if name in listed("FAKE_HERMES_FAIL_DELETE"):
+        fail("tidak bisa menghapus profile " + name)
+    if "--yes" not in argv and "-y" not in argv:
+        fail("butuh konfirmasi interaktif (tanpa --yes)")       # upstream bertanya; tanpa TTY akan menggantung
+    if name == "default" or not os.path.isdir(home_of(name)):
+        fail("profile '%s' does not exist" % name)
+    shutil.rmtree(home_of(name))
 else:
     fail("perintah tidak ditiru: " + " ".join(argv))
 '''
@@ -305,7 +315,7 @@ def kit(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed))
     k.managed_dir = managed
     for name in ("DISCORD_BOT_TOKEN", "PYTHONPATH", "HERMES_TEAM_DEBUG", "FAKE_HERMES_FAIL_KEYS",
-                 "FAKE_HERMES_FAIL_CREATE"):
+                 "FAKE_HERMES_FAIL_CREATE", "FAKE_HERMES_FAIL_DELETE", "HERMES_TEAM_ALLOW_PLACEHOLDERS"):
         monkeypatch.delenv(name, raising=False)
     return k
 

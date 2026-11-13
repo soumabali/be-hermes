@@ -818,6 +818,20 @@ def ledger_add(path: Path, day: str, user_key: str, input_tokens: int = 0, outpu
         con.close()
 
 
+def ledger_collected(path: Path, ts: float) -> None:
+    """Catat `meta.last_collect` seperti akhir `usage_ledger.py collect` (tabel meta sama dengan kit)."""
+    import sqlite3
+    path.parent.mkdir(parents=True, exist_ok=True)
+    con = sqlite3.connect(path)
+    try:
+        con.executescript(LEDGER_SCHEMA)
+        con.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        con.execute("INSERT OR REPLACE INTO meta VALUES ('last_collect', ?)", (str(float(ts)),))
+        con.commit()
+    finally:
+        con.close()
+
+
 def api_request(ctx: "StubContext", request_id: str, session_id: str = "s", **extra: Any) -> None:
     """Meniru agent/turn_api_request.py: hook pengamat sebelum request ke provider."""
     ctx.fire("pre_api_request", **{**dict(

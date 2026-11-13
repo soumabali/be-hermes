@@ -43,9 +43,11 @@ def channel_posts(discord):
     return discord.calls_matching("POST", f"/guilds/{fd.GUILD}/channels")
 
 
-def cli(kit, *args):
+def cli(kit, *args, placeholders=True):
+    """argv CLI untuk kit tiruan. ID uji = ID Discord tiruan = pola ID contoh, jadi `--allow-placeholders`
+    ikut dipasang; uji penolakan ID contoh memakai `placeholders=False`."""
     return [*args, "-c", str(kit.team_file), "--hermes-bin", str(kit.bin), "--hermes-root", str(kit.root),
-            "--allow-root"]
+            "--allow-root", *(["--allow-placeholders"] if placeholders else [])]
 
 
 def routes_for(kit, profile):
@@ -2306,3 +2308,499 @@ class TestUsageReportConfig:
         team = ht.load_team(root / "team.example.yaml", root / "members.example.yaml")
         assert team["sandbox"]["memory_mb"] == 1024
         assert team["usage"]["reports"] == {"daily": "", "weekly": "", "monthly": ""}
+        assert team["warnings"] == []                    # contoh tidak boleh memuat key yang tidak dikenal
+
+
+# =========================================================================== audit kepraktisan operator
+REAL = {  # ID berbentuk snowflake asli (bukan pola ID contoh)
+    "guild_id": "912345678901234567",
+    "roles": {"member": "923456789012345678", "admin": "934567890123456789", "entry": "945678901234567890"},
+    "admins": ["956789012345678901"], "category_id": "967890123456789012",
+    "shared": {"profile": "team-shared", "channel_id": "978901234567890123"},
+    "admin": {"profile": "team-admin", "channel_id": "989012345678901234"},
+}
+REAL_MEMBER = {"name": "andi", "display_name": "Andi", "discord_user_id": "811111111111111111",
+               "channel_id": "822222222222222222"}
+
+
+class TestUnknownKeys:                                                                # butir 1
+    def test_typos_everywhere_are_collected_with_suggestions(self, kit):
+        kit.write_team(scale={"max_concurent_sessions": 3, "daily_token_bugdet": 9}, secrets={"max_key": 5},
+                       server_admin={"allow_moderasi": False}, sandbox={"memori_mb": 512},
+                       roles={"entri": fd.ROLE_ENTRY}, shared={"auto_skill": ["x"]}, threads={"personel": False},
+                       usage={"time_zone": "UTC"}, llm={"defualt_model": "td-normal"}, tema_gelap=True,
+                       channel_prefiks="x-")
+        kit.write_members([{**BE1, "modle": "td-simple", "actve": False}], models={"shared": "td-normal"})
+        team = kit.team()                                           # tetap termuat: peringatan, bukan error
+        text = "\n".join(team["warnings"])
+        for key, hint in (("scale.max_concurent_sessions", "max_concurrent_sessions"),
+                          ("scale.daily_token_bugdet", "daily_token_budget"), ("secrets.max_key", "max_keys"),
+                          ("server_admin.allow_moderasi", "allow_moderation"), ("sandbox.memori_mb", "memory_mb"),
+                          ("roles.entri", "entry"), ("shared.auto_skill", "auto_skills"),
+                          ("threads.personel", "personal"), ("usage.time_zone", "timezone"),
+                          ("llm.defualt_model", "default_model"), ("channel_prefiks", "channel_prefix"),
+                          ("members[0] (be1).modle", "model"), ("members[0] (be1).actve", "active")):
+            line = next((w for w in team["warnings"] if f"'{key}'" in w), "")
+            assert line and f"maksudnya '{hint}'?" in line and "DIABAIKAN" in line, (key, text)
+        assert any("'tema_gelap'" in w and "pilihan:" in w for w in team["warnings"])   # tanpa kandidat mirip
+        assert sum("members.yaml" in w for w in team["warnings"]) == 2
+        # nilai yang salah ketik memang tidak dipakai (itu sebabnya harus terlihat)
+        assert team["scale"]["max_concurrent_sessions"] == 8 and team["members"][0]["active"] is True
+
+    def test_llm_model_block_and_clean_config(self, kit):
+        assert kit.team()["warnings"] == []
+        data = kit.write_team()
+        data["llm"]["models"]["td-normal"]["compresion_threshold_tokens"] = 9
+        kit.team_file.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+        assert ["compression_threshold_tokens" in w and "llm.models.td-normal" in w
+                for w in kit.team()["warnings"]] == [True]
+
+    def test_existing_hard_errors_stay_hard(self, kit):
+        kit.write_team(onboarding={"enabeld": True})
+        with pytest.raises(ht.TeamError, match="onboarding.enabeld"):
+            kit.team()
+        kit.write_team(usage={"reports": {"dayly": "08:00"}})
+        with pytest.raises(ht.TeamError, match="usage.reports.dayly"):
+            kit.team()
+
+    def test_check_apply_and_status_print_them(self, kit, capsys):
+        kit.write_team(scale={"max_concurent_sessions": 3})
+        for command in ("check", "status", "apply"):
+            ht.main(cli(kit, command))
+            out = capsys.readouterr().out
+            assert "Peringatan" in out and "scale.max_concurent_sessions" in out, command
+            assert "maksudnya 'max_concurrent_sessions'?" in out
+
+
+class TestPlaceholderIds:                                                             # butir 2
+    def test_load_team_still_accepts_the_example(self):
+        team = ht.load_team(ht.KIT_DIR / "team.example.yaml", ht.KIT_DIR / "members.example.yaml")
+        found = ht.placeholder_ids(team)
+        assert [f.split(" ")[0] for f in found] == ["guild_id", "roles.member", "roles.admin", "roles.entry",
+                                                    "category_id", "shared.channel_id", "admin.channel_id",
+                                                    "admins[0]"]
+
+    def test_pattern_matches_shipped_ids_only(self):
+        for sample in ("100000000000000001", "200000000000000003", "300000000000000001", "400000000000000009",
+                       "500000000000000002", "600000000000000001"):
+            assert ht.PLACEHOLDER_ID_RE.match(sample), sample
+        for real in ("912345678901234567", "710000000000000001", "1234567890123456789", "999000000000000001"):
+            assert not ht.PLACEHOLDER_ID_RE.match(real), real
+
+    def test_check_exits_nonzero_and_lists_keys(self, kit, capsys):
+        with pytest.raises(SystemExit) as exit_info:
+            ht.main(cli(kit, "check", placeholders=False))
+        message = str(exit_info.value.code)
+        assert exit_info.value.code not in (0, None) and "ID contoh" in message
+        for key in ("guild_id (100000000000000001)", "roles.member", "admins[0]", "shared.channel_id",
+                    "members.yaml be1.discord_user_id (500000000000000001)", "members.yaml budi.channel_id"):
+            assert key in message, key
+        assert "Konfigurasi valid" not in capsys.readouterr().out
+
+    def test_apply_refuses_without_touching_hermes(self, kit, capsys):
+        with pytest.raises(SystemExit) as exit_info:
+            ht.main(cli(kit, "apply", placeholders=False))
+        assert "apply ditolak" in str(exit_info.value.code) and "guild_id" in str(exit_info.value.code)
+        assert kit.calls() == [] and not (kit.state / "roster.json").exists()
+        with pytest.raises(SystemExit):                                  # dry-run pun ditolak
+            ht.main(cli(kit, "apply", "--dry-run", placeholders=False))
+
+    def test_flag_and_env_allow_them_for_tests(self, kit, capsys, monkeypatch):
+        ht.main(cli(kit, "apply"))
+        assert kit.creates()
+        monkeypatch.setenv(ht.ALLOW_PLACEHOLDERS_ENV, "1")
+        ht.main(cli(kit, "check", placeholders=False))
+        assert "Konfigurasi valid." in capsys.readouterr().out
+
+    def test_real_ids_pass_and_one_leftover_is_named(self, kit, capsys):
+        kit.write_team(**REAL)
+        kit.write_members([REAL_MEMBER])
+        assert ht.placeholder_ids(kit.team()) == []
+        ht.main(cli(kit, "check", placeholders=False))
+        assert capsys.readouterr().out.rstrip().endswith("Konfigurasi valid.")
+        kit.write_team(**{**REAL, "usage": {"report_channel_id": "400000000000000002"}})
+        with pytest.raises(SystemExit) as exit_info:
+            ht.main(cli(kit, "check", placeholders=False))
+        assert "usage.report_channel_id (400000000000000002)" in str(exit_info.value.code)
+        assert "guild_id" not in str(exit_info.value.code)
+
+
+class TestExampleMembers:                                                             # butir 3
+    def test_example_ships_no_members(self):
+        path = ht.KIT_DIR / "members.example.yaml"
+        raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+        assert raw == {"members": []}
+        team = ht.load_team(ht.KIT_DIR / "team.example.yaml", path)
+        assert team["members"] == [] and ht.active_members(team) == []
+        assert [r["profile"] for r in ht.build_routes(team)] == ["team-shared", "team-admin"]
+
+    def test_commented_example_is_valid_once_uncommented(self, tmp_path):
+        text = (ht.KIT_DIR / "members.example.yaml").read_text(encoding="utf-8")
+        start = text.index("# members:\n")
+        block = "\n".join(line[2:] if line.startswith("# ") else line.lstrip("#")
+                          for line in text[start:].splitlines() if not line.startswith("# Opsional"))
+        members = tmp_path / "members.yaml"
+        members.write_text(block, encoding="utf-8")
+        team = ht.load_team(ht.KIT_DIR / "team.example.yaml", members)
+        assert [(m["name"], m["active"]) for m in team["members"]] == [("andi", True), ("budi", True), ("citra", False)]
+        assert team["members"][0]["model"] == "td-normal" and team["members"][1]["sandbox"] == {"memory_mb": 4096, "cpu": 2}
+        assert team["model_overrides"] == {"shared": "td-simple", "admin": "td-normal", "lobby": "td-simple"}
+        assert team["warnings"] == []
+
+
+class TestKitPaths:                                                                   # butir 4
+    def test_resolution_order(self, tmp_path, monkeypatch):
+        import kit_paths
+        monkeypatch.setenv("HOME", str(tmp_path / "home"))
+        monkeypatch.delenv("HERMES_TEAM_DIR", raising=False)
+        base = tmp_path / "home" / ".hermes-team"
+        assert kit_paths.team_dir() == base and kit_paths.team_file() == base / "team.yaml"
+        assert kit_paths.members_file() == base / "members.yaml" and kit_paths.state_dir() == base / "state"
+        assert kit_paths.ledger_path() == base / "state" / "usage.db"
+        monkeypatch.setenv("HERMES_TEAM_DIR", str(tmp_path / "lain"))
+        assert kit_paths.team_file() == tmp_path / "lain" / "team.yaml"
+        assert kit_paths.ledger_path() == tmp_path / "lain" / "state" / "usage.db"
+        explicit = tmp_path / "x" / "tim.yaml"                       # --config menang atas env
+        assert kit_paths.team_file(explicit) == explicit
+        assert kit_paths.members_file(explicit) == tmp_path / "x" / "members.yaml"
+        assert kit_paths.state_dir(explicit) == tmp_path / "x" / "state"
+        assert ht.default_team_file() == tmp_path / "lain" / "team.yaml"
+
+    def test_cwd_team_yaml_is_not_picked_up_and_a_notice_names_both(self, kit, tmp_path, monkeypatch, capsys):
+        import kit_paths
+        elsewhere = tmp_path / "proyek"
+        elsewhere.mkdir()
+        raw = yaml.safe_load(kit.team_file.read_text(encoding="utf-8"))
+        (elsewhere / "team.yaml").write_text(yaml.safe_dump({**raw, "team_name": "SALAH"}), encoding="utf-8")
+        monkeypatch.chdir(elsewhere)
+        assert ht.default_team_file() == kit.team_file              # HERMES_TEAM_DIR, bukan ./team.yaml
+        argv = ["check", "--hermes-bin", str(kit.bin), "--hermes-root", str(kit.root), "--allow-placeholders"]
+        ht.main(argv)
+        captured = capsys.readouterr()
+        assert "Tim Backend" in captured.out and "SALAH" not in captured.out
+        notice = [line for line in captured.err.splitlines() if line.startswith("catatan:")]
+        assert len(notice) == 1 and str(kit.team_file) in notice[0]
+        assert f"--config {elsewhere / 'team.yaml'}" in notice[0] and f"HERMES_TEAM_DIR={elsewhere}" in notice[0]
+        ht.main(["check", "-c", "team.yaml", "--hermes-bin", str(kit.bin), "--allow-placeholders"])
+        captured = capsys.readouterr()                               # dipilih eksplisit → dipakai, tanpa catatan
+        assert "Tim SALAH" in captured.out and "catatan:" not in captured.err
+        monkeypatch.chdir(kit.team_dir)                              # berkas yang sama → tanpa catatan
+        assert kit_paths.cwd_notice(kit.team_file) is None
+        monkeypatch.chdir(tmp_path)                                  # tidak ada ./team.yaml → tanpa catatan
+        assert kit_paths.cwd_notice(kit.team_file) is None
+
+    def test_state_follows_the_resolved_file_not_the_cwd(self, kit, tmp_path, monkeypatch):
+        elsewhere = tmp_path / "proyek"
+        elsewhere.mkdir()
+        (elsewhere / "team.yaml").write_text(kit.team_file.read_text(encoding="utf-8"), encoding="utf-8")
+        monkeypatch.chdir(elsewhere)
+        ht.main(["apply", "--hermes-bin", str(kit.bin), "--hermes-root", str(kit.root), "--allow-root",
+                 "--allow-placeholders"])
+        assert (kit.state / "roster.json").exists() and not (elsewhere / "state").exists()
+
+
+class TestManagedDiffAndInstall:                                                      # butir 7
+    def test_diff_reports_missing_changed_extra_and_moved(self, kit):
+        team = kit.team()
+        target = kit.managed_dir / "config.yaml"
+        assert ht.managed_diff(team)["missing_file"] is True
+        target.write_text(ht.managed_yaml(team))
+        diff = ht.managed_diff(team)
+        assert ht.managed_diff_clean(diff) and diff["path"] == str(target)
+        data = yaml.safe_load(target.read_text())
+        data["agent"]["max_turns"] = 5
+        del data["goals"]
+        data["terminal"]["container_memory"] = 2048
+        data["display"]["tema"] = "gelap"
+        target.write_text(yaml.safe_dump(data))
+        diff = ht.managed_diff(team)
+        assert diff["changed"] == ["agent.max_turns"] and diff["missing"] == ["goals.max_turns"]
+        assert diff["moved"] == ["terminal.container_memory"]
+        assert diff["extra"] == ["display.tema", "terminal.container_memory"]
+        assert not ht.managed_diff_clean(diff)
+        target.write_text(": bukan yaml [")
+        assert ht.managed_diff(team)["unreadable"]
+
+    def test_cli_diff_exit_codes_and_output(self, kit, capsys):
+        with pytest.raises(SystemExit) as exit_info:
+            ht.main(cli(kit, "managed", "--diff"))
+        out = capsys.readouterr().out
+        assert exit_info.value.code == 1 and "belum ada" in out and "managed --install" in out and "sudo" in out
+        (kit.managed_dir / "config.yaml").write_text(ht.managed_yaml(kit.team()))
+        ht.main(cli(kit, "managed", "--diff"))
+        assert "sama dengan kebijakan" in capsys.readouterr().out
+        kit.write_team(scale={"agent_max_turns": 30})
+        with pytest.raises(SystemExit) as exit_info:
+            ht.main(cli(kit, "managed", "--diff"))
+        assert exit_info.value.code == 1 and "berbeda: agent.max_turns" in capsys.readouterr().out
+
+    def test_install_requires_root_and_prints_exact_sudo_command(self, kit, monkeypatch, capsys):
+        team = kit.team()
+        with pytest.raises(ht.TeamError) as err:
+            ht.install_managed(team, euid=1000)
+        text = str(err.value)
+        assert "harus sebagai root" in text and "sudo" in text and "managed --install" in text
+        assert f"-c {kit.team_file}" in text and str(ht.KIT_DIR / "hermes_team.py") in text
+        assert not (kit.managed_dir / "config.yaml").exists()
+        monkeypatch.setattr(ht.os, "geteuid", lambda: 1000)
+        with pytest.raises(SystemExit) as exit_info:
+            ht.main(cli(kit, "managed", "--install"))
+        assert "sudo" in str(exit_info.value.code) and not (kit.managed_dir / "config.yaml").exists()
+
+    def test_install_writes_atomically_with_0644(self, kit, monkeypatch, capsys):
+        team = kit.team()
+        target = kit.managed_dir / "sub" / "config.yaml"
+        path = ht.install_managed(team, target_dir=target.parent, euid=0)
+        assert path == target and stat.S_IMODE(target.stat().st_mode) == 0o644
+        assert target.read_text() == ht.managed_yaml(team)
+        assert [p.name for p in target.parent.iterdir()] == ["config.yaml"]          # tanpa berkas sementara
+        assert ht.install_managed(team, target_dir=kit.managed_dir / "kering", euid=0, dry_run=True)
+        assert not (kit.managed_dir / "kering").exists()
+        monkeypatch.setattr(ht.os, "geteuid", lambda: 0)
+        ht.main(cli(kit, "managed", "--install"))
+        assert "ditulis (0644)" in capsys.readouterr().out
+        assert ht.managed_diff_clean(ht.managed_diff(team))
+        ht.main(cli(kit, "managed"))                                                 # tanpa flag: tetap mencetak YAML
+        assert yaml.safe_load(capsys.readouterr().out) == yaml.safe_load(ht.managed_yaml(team))
+        with pytest.raises(SystemExit):                                              # saling eksklusif
+            ht.main(cli(kit, "managed", "--diff", "--install"))
+
+
+class TestRemoveMember:                                                               # butir 9
+    @pytest.fixture
+    def applied(self, kit):
+        ht.cmd_apply(kit.team(), kit.hermes())
+        kit.write_members([BE1, {**BUDI, "active": False}])
+        ht.cmd_apply(kit.team(), kit.hermes(), only=[], host_only=True)
+        kit.clear_log()
+        return kit
+
+    def test_active_member_must_be_offboarded_first(self, applied):
+        with pytest.raises(ht.TeamError) as err:
+            ht.remove_member(applied.team(), applied.hermes(), "be1")
+        assert "masih AKTIF" in str(err.value) and "set-active be1 off" in str(err.value)
+        with pytest.raises(ht.TeamError, match="tidak ada di members.yaml"):
+            ht.remove_member(applied.team(), applied.hermes(), "hantu")
+        assert [m["name"] for m in applied.members_yaml()] == ["be1", "budi"]
+
+    def test_default_removes_entry_only_and_lists_what_is_kept(self, applied):
+        result = ht.remove_member(applied.team(), applied.hermes(), "budi")
+        assert [m["name"] for m in applied.members_yaml()] == ["be1"]
+        assert applied.home("be-budi").is_dir()                                       # profile dibiarkan
+        assert not [c for c in applied.calls() if c[:2] == ["profile", "delete"]]
+        kept = "\n".join(result["kept"])
+        assert "profile be-budi" in kept and f"channel Discord {BUDI_CH}" in kept
+        assert 'label=hermes-profile=be-budi' in kept and "docker rm -f" in kept and "docker volume rm" in kept
+        assert BUDI_UID not in applied.roster()["inactive_users"]                     # roster ikut diselaraskan
+        assert any("members.yaml" in line for line in result["done"])
+
+    def test_dry_run_changes_nothing(self, applied):
+        result = ht.remove_member(applied.team(), applied.hermes(dry_run=True), "budi", delete_profile=True,
+                                  delete_channel=True)
+        assert result["dry_run"] and result["done"] == []
+        assert any("hermes profile delete" in line for line in result["will_delete"])
+        assert any(BUDI_CH in line for line in result["will_delete"])
+        assert [m["name"] for m in applied.members_yaml()] == ["be1", "budi"] and applied.home("be-budi").is_dir()
+
+    def test_delete_profile_and_channel(self, applied, discord, api):
+        assert BUDI_CH in discord.channels
+        result = ht.remove_member(applied.team(), applied.hermes(), "budi", delete_profile=True,
+                                  delete_channel=True, api=api)
+        assert ["profile", "delete", "be-budi", "--yes"] in applied.calls()
+        assert not applied.home("be-budi").exists() and BUDI_CH not in discord.channels
+        assert BE1_CH in discord.channels and applied.home("be-be1").is_dir()         # orang lain utuh
+        done = "\n".join(result["done"])
+        assert "profile be-budi dihapus" in done and f"channel Discord {BUDI_CH} dihapus" in done
+        assert not any("profile be-budi" in line and "hapus:" in line for line in result["kept"])
+        assert any("docker" in line for line in result["kept"])                       # sandbox tetap disebut
+
+    def test_failures_are_reported_not_hidden(self, applied, discord, api, monkeypatch):
+        monkeypatch.setenv("FAKE_HERMES_FAIL_DELETE", "be-budi")
+        discord.fault("DELETE", f"/channels/{BUDI_CH}", status=403, body={"message": "Missing Permissions", "code": 50013})
+        result = ht.remove_member(applied.team(), applied.hermes(), "budi", delete_profile=True,
+                                  delete_channel=True, api=api)
+        notes = "\n".join(result["notes"])
+        assert "GAGAL dihapus" in notes and "hermes profile delete be-budi" in notes
+        assert "TIDAK terhapus" in notes and BUDI_CH in discord.channels
+        assert [m["name"] for m in applied.members_yaml()] == ["be1"]                 # entri tetap terhapus
+
+    def test_shared_skill_registry_references_are_removed(self, applied, monkeypatch, tmp_path):
+        kit = applied
+        kit.fake_scanner(monkeypatch, tmp_path, "safe")
+        kit.write_members([BE1, BUDI])
+        kit.make_skill("be-budi", "deploy")
+        kit.make_skill("be-be1", "lint")
+        ht.share_skill(kit.team(), kit.hermes(), "deploy", "budi", ["all"])
+        ht.share_skill(kit.team(), kit.hermes(), "lint", "be1", ["budi"])
+        registry = ht.shared_skill_registry(kit.team())["skills"]
+        assert registry["deploy"]["origin_member"] == "budi" and registry["lint"]["targets"] == ["budi"]
+        assert (kit.home("be-be1") / "skills" / "shared" / "deploy").is_dir()
+        kit.write_members([BE1, {**BUDI, "active": False}])
+        plan = ht.remove_member_plan(kit.team(), kit.hermes(), "budi")
+        assert plan["origin_skills"] == ["deploy"] and plan["target_skills"] == ["lint"]
+        ht.remove_member(kit.team(), kit.hermes(), "budi")
+        registry = ht.shared_skill_registry(kit.team())["skills"]
+        assert "deploy" not in registry and registry["lint"]["targets"] == []
+        assert not (kit.home("be-be1") / "skills" / "shared" / "deploy").exists()
+        assert not (kit.state / "shared-skills" / "deploy").exists()
+        assert (kit.home("be-be1") / "skills" / "lint").is_dir()                      # skill asli be1 utuh
+
+    def test_holds_the_team_lock(self, applied, monkeypatch):
+        depths = []
+        real = ht.save_members
+        monkeypatch.setattr(ht, "save_members", lambda team: (depths.append(ht._lock_depth()), real(team))[1])
+        ht.remove_member(applied.team(), applied.hermes(), "budi")
+        assert depths and min(depths) >= 1
+
+    def test_cli_shows_plan_and_needs_confirmation(self, applied, capsys, monkeypatch):
+        monkeypatch.setattr(ht.sys, "stdin", io.StringIO(""))                         # bukan TTY, tanpa --yes
+        with pytest.raises(SystemExit) as exit_info:
+            ht.main(cli(applied, "remove-member", "budi", "--delete-profile"))
+        out = capsys.readouterr().out
+        assert "butuh konfirmasi" in str(exit_info.value.code) and "--yes" in str(exit_info.value.code)
+        assert "AKAN DIHAPUS" in out and "TIDAK dihapus" in out and "hermes profile delete" in out
+        assert [m["name"] for m in applied.members_yaml()] == ["be1", "budi"]
+        ht.main(cli(applied, "remove-member", "budi", "--dry-run"))
+        assert "(dry-run) tidak ada yang diubah" in capsys.readouterr().out
+        assert [m["name"] for m in applied.members_yaml()] == ["be1", "budi"]
+        ht.main(cli(applied, "remove-member", "budi", "--delete-profile", "--yes"))
+        out = capsys.readouterr().out
+        assert "Sudah dilakukan" in out and "profile be-budi dihapus" in out and "docker volume rm" in out
+        assert [m["name"] for m in applied.members_yaml()] == ["be1"] and not applied.home("be-budi").exists()
+        with pytest.raises(SystemExit) as exit_info:
+            ht.main(cli(applied, "remove-member", "be1", "--yes"))
+        assert "masih AKTIF" in str(exit_info.value.code)
+
+
+class TestVersionLabels:                                                              # butir 11
+    def test_version_flag_prints_kit_version(self, capsys):
+        import kit_base
+        with pytest.raises(SystemExit) as exit_info:
+            ht.main(["--version"])
+        assert exit_info.value.code == 0
+        assert capsys.readouterr().out.strip() == f"hermes-team-kit {kit_base.KIT_VERSION}"
+
+    def test_no_stale_labels_in_help_or_example_header(self, capsys):
+        import kit_base
+        with pytest.raises(SystemExit):
+            ht.main(["--help"])
+        text = capsys.readouterr().out
+        assert f"Versi kit: {kit_base.KIT_VERSION}" in text and "remove-member" in text
+        header = (ht.KIT_DIR / "team.example.yaml").read_text(encoding="utf-8").split("\n\n")[0]
+        for stale in ("kit v3", "3.0.0", "v3)"):
+            assert stale not in text and stale not in header and stale not in (ht.__doc__ or "")
+        assert "hermes_team.py --version" in header
+
+    def test_changelog_documents_the_current_version(self):
+        import kit_base
+        text = (ht.KIT_DIR / "CHANGELOG.md").read_text(encoding="utf-8")
+        assert f"## [{kit_base.KIT_VERSION}]" in text and "## [Belum dirilis]" in text
+        assert text.index("## [Belum dirilis]") < text.index(f"## [{kit_base.KIT_VERSION}]")
+
+
+# =========================================================================== tests/selftest.sh (butir 10)
+SELFTEST = ht.KIT_DIR / "tests" / "selftest.sh"
+
+
+def _fake_hermes_source(root):
+    """Direktori sumber Hermes tiruan: cukup supaya `import gateway, toolsets, hermes_cli.*, discord` lolos."""
+    for package in ("gateway", "hermes_cli", "discord"):
+        (root / package).mkdir(parents=True)
+        (root / package / "__init__.py").write_text("", encoding="utf-8")
+    for module in ("toolsets.py", "hermes_cli/plugins.py", "hermes_cli/config_defaults.py", "hermes_cli/commands.py"):
+        (root / module).write_text("", encoding="utf-8")
+    return root
+
+
+def _selftest(tmp_path, *args, launcher=None, **env):
+    import sys
+    base = {"PATH": f"{tmp_path / 'kosong'}:/usr/bin:/bin", "HOME": str(tmp_path / "rumah"), "LC_ALL": "C.UTF-8"}
+    (tmp_path / "kosong").mkdir(exist_ok=True)
+    if launcher is not None:
+        base["HERMES_BIN"] = str(launcher)
+    base.update(env)
+    return subprocess.run(["bash", str(SELFTEST), *args], env=base, text=True, capture_output=True, timeout=600,
+                          cwd=str(tmp_path)), sys.executable
+
+
+def _detected(proc):
+    return dict(line.split("=", 1) for line in proc.stdout.splitlines() if "=" in line)
+
+
+class TestSelftestScript:
+    def test_bash_syntax(self):
+        assert subprocess.run(["bash", "-n", str(SELFTEST)], capture_output=True, text=True).returncode == 0
+        text = SELFTEST.read_text(encoding="utf-8")
+        assert "--system-site-packages" in text and "pip install" in text
+        assert "KIT_REQUIRE_HERMES=1" in text and "exit 3" in text
+
+    def test_shell_wrapper_launcher_with_spaces_and_symlink(self, tmp_path):
+        import shlex
+        import sys
+        source = _fake_hermes_source(tmp_path / "sumber hermes")
+        script = f"import os, re, sys\nsys.path.insert(0, {str(source)!r})\nimport hermes_bootstrap\n"
+        real = tmp_path / "pasang" / "hermes"
+        real.parent.mkdir()
+        # bentuk persis upstream hermes_cli/_launchers.py::_write_shell
+        real.write_text(f'#!/bin/sh\nexec {shlex.join([sys.executable, "-I", "-c", script])} "$@"\n', encoding="utf-8")
+        real.chmod(0o755)
+        link = tmp_path / "bin" / "hermes"
+        link.parent.mkdir()
+        link.symlink_to(real)
+        proc, python = _selftest(tmp_path, "--detect", launcher=link)
+        found = _detected(proc)
+        assert proc.returncode == 0, proc.stderr
+        assert found["launcher"] == str(real) and found["python"] == python
+        assert found["source"] == str(source) and found["pythonpath"] == str(source)
+        assert found["integration"] == "run"
+
+    def test_shebang_launcher_needs_source_dir_and_honours_overrides(self, tmp_path):
+        import sys
+        source = _fake_hermes_source(tmp_path / "src")
+        launcher = tmp_path / "hermes"
+        launcher.write_bytes(f"#!{sys.executable} -I\n".encode() + b"PK\x03\x04\x00\x00biner zip\x00\n")
+        launcher.chmod(0o755)
+        proc, python = _selftest(tmp_path, "--detect", launcher=launcher)
+        found = _detected(proc)
+        assert found["python"] == python and found["source"] == "" and found["integration"] == "skip"
+        assert "HERMES_SRC" in found["reason"]
+        proc, _ = _selftest(tmp_path, "--detect", launcher=launcher, HERMES_SRC=str(source))
+        assert _detected(proc)["integration"] == "run" and _detected(proc)["pythonpath"] == str(source)
+        # lokasi pasang bawaan installer: $HERMES_HOME/hermes-agent
+        home = tmp_path / "hh"
+        home.mkdir()
+        (home / "hermes-agent").symlink_to(source)
+        proc, _ = _selftest(tmp_path, "--detect", launcher=launcher, HERMES_HOME=str(home))
+        assert _detected(proc)["source"] == str(home / "hermes-agent") and _detected(proc)["integration"] == "run"
+        # HERMES_PYTHON menang atas launcher; nilai yang salah → kode 2
+        proc, _ = _selftest(tmp_path, "--detect", launcher=tmp_path / "tidak-ada", HERMES_PYTHON=python,
+                            HERMES_SRC=str(source))
+        assert _detected(proc)["python"] == python and _detected(proc)["integration"] == "run"
+        proc, _ = _selftest(tmp_path, "--detect", HERMES_PYTHON=str(tmp_path / "bukan-python"))
+        assert proc.returncode == 2 and "HERMES_PYTHON" in proc.stderr
+
+    def test_skip_is_loud_and_exits_3_unless_allowed(self, tmp_path):
+        import sys
+        launcher = tmp_path / "hermes"
+        launcher.write_text(f"#!{sys.executable} -I\n", encoding="utf-8")       # python ketemu, sumber tidak
+        launcher.chmod(0o755)
+        proc, _ = _selftest(tmp_path, "tests/test_usage_report.py", "-q", launcher=launcher)
+        last = proc.stdout.strip().splitlines()
+        assert proc.returncode == 3, proc.stdout + proc.stderr
+        assert "passed" in proc.stdout and "uji integrasi DILEWATI" in proc.stdout
+        assert any(line.startswith("  Alasan:") for line in last[-4:]) and "PERINGATAN" in proc.stderr
+        proc, _ = _selftest(tmp_path, "--allow-skip", "tests/test_usage_report.py", "-q", launcher=launcher)
+        assert proc.returncode == 0 and "DILEWATI" in proc.stdout and "--allow-skip" in proc.stdout
+
+    def test_integration_run_is_reported_at_the_end_and_failures_win(self, tmp_path):
+        source = _fake_hermes_source(tmp_path / "src")
+        import sys
+        proc, python = _selftest(tmp_path, "tests/test_usage_report.py", "-q", HERMES_PYTHON=sys.executable,
+                                 HERMES_SRC=str(source))
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert "Hermes terdeteksi" in proc.stdout and "DILEWATI" not in proc.stdout + proc.stderr
+        assert proc.stdout.strip().splitlines()[-1].startswith("✓ Lulus. Uji integrasi: DIJALANKAN")
+        assert not (ht.KIT_DIR / "venv").exists()                    # tidak ada venv/pip di luar folder sementara
+        proc, _ = _selftest(tmp_path, "tests/tidak-ada-berkas-ini.py", "-q", HERMES_PYTHON=sys.executable,
+                            HERMES_SRC=str(source))
+        assert proc.returncode not in (0, 3) and "✗ GAGAL" in proc.stdout

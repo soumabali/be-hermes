@@ -106,6 +106,24 @@ def test_ledger_to_budget_to_admin_override_end_to_end(tc):
     assert verdict(BUDI).refused
 
 
+def test_admin_extra_matches_plugin_semantics_team_ceiling_is_untouched(tc):
+    """Kontrak teks ↔ perilaku: ringkasan teamctl berkata anggaran tim tetap, dan plugin memang tidak
+    menjumlahkan tambahan per orang ke plafon tim."""
+    tc.patch_team(scale={"daily_token_budget": 1000, "team_daily_token_budget": 3000}, usage={"timezone": "UTC"})
+    team, roster = kit_roster(tc)
+    _spend(tc, "team-shared", "s-budi", BUDI, 2500)
+    _spend(tc, "be-be1", "s-be1", BE1, 900)                                  # tim: 3.400 > 3.000
+    owners, _people = ul.load_members(tc.members_file)
+    ul.collect(tc.team_dir / "state" / "usage.db", tc.root, owners=owners, tz=ul.resolve_tz("UTC"))
+    ctl = tc.ctl()
+    ctl.call("set_usage_budget_extra", user="budi", extra_tokens=1_000_000)
+    assert "anggaran harian tim tetap 3.000" in ctl.previews[0]
+    for uid in (BUDI, BE1):
+        verdict = budget_mod.Budget(tc.team_dir / "state", spawn=lambda *_a, **_k: None).check(roster, uid)
+        assert verdict.team_limit == 3000 and verdict.refused, uid
+    assert budget_mod.Budget(tc.team_dir / "state", spawn=lambda *_a, **_k: None).check(roster, BUDI).limit == 1_001_000
+
+
 def test_admin_tool_reads_the_metrics_shape_the_plugin_writes(tc, tmp_path):
     """Monitor plugin menulis metrics.json; `team_status` harus bisa menampilkannya."""
     scale = S.sub(P, "scale")

@@ -38,6 +38,9 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import kit_paths  # noqa: E402
+
 try:
     from zoneinfo import ZoneInfo
 except ImportError:  # pragma: no cover
@@ -83,13 +86,28 @@ class LedgerError(Exception):
 # ----------------------------------------------------------------------------- waktu
 def team_timezone() -> str:
     """`usage.timezone` dari team.yaml tim (kosong bila tidak ada / tidak terbaca)."""
+    usage = _team_raw().get("usage")
+    return str((usage.get("timezone") if isinstance(usage, dict) else "") or "").strip()
+
+
+def _team_raw(team_file: Optional[Path] = None) -> dict:
+    """Isi mentah team.yaml (kit_paths: --config/HERMES_TEAM_DIR/~/.hermes-team). Tidak terbaca → {}."""
     try:
         import yaml
-        team_dir = Path(os.environ.get("HERMES_TEAM_DIR") or "~/.hermes-team").expanduser()
-        data = yaml.safe_load((team_dir / "team.yaml").read_text(encoding="utf-8")) or {}
-        return str(((data.get("usage") or {}).get("timezone")) or "").strip()
+        data = yaml.safe_load(Path(team_file or kit_paths.team_file()).expanduser().read_text(encoding="utf-8"))
     except Exception:
-        return ""
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+DEFAULT_PROFILE_PREFIX = "be-"
+
+
+def team_profile_prefix(team_file: Optional[Path] = None) -> str:
+    """`profile_prefix` dari TEAM.yaml (bukan members.yaml). Aturannya sama dengan hermes_team.load_team:
+    key tidak ada → "be-"; string kosong sah (profile = nama anggota)."""
+    value = _team_raw(team_file).get("profile_prefix", DEFAULT_PROFILE_PREFIX)
+    return DEFAULT_PROFILE_PREFIX if value is None else str(value)
 
 
 def resolve_tz(name: Optional[str] = None):
@@ -130,8 +148,7 @@ def period_range(period: str, today: date, offset: int = 0) -> tuple[date, date,
 
 # ----------------------------------------------------------------------------- berkas
 def default_ledger_path() -> Path:
-    team_dir = Path(os.environ.get("HERMES_TEAM_DIR") or "~/.hermes-team").expanduser()
-    return team_dir / "state" / "usage.db"
+    return kit_paths.ledger_path()
 
 
 @contextlib.contextmanager
@@ -306,23 +323,45 @@ def collect(ledger: Path, hermes_root: Path, *, owners: Optional[dict[str, str]]
 
 
 # ----------------------------------------------------------------------------- laporan
-def load_members(members_file: Optional[Path]) -> tuple[dict[str, str], dict[str, dict]]:
+def member_profiles(members_file: Optional[Path], prefix: Optional[str] = None,
+                    team_file: Optional[Path] = None) -> list[tuple[str, dict]]:
+    """[(profile, entri members.yaml)] untuk tiap anggota bernama. Satu-satunya tempat pemetaan
+    anggota → profile di luar hermes_team.py (dipakai juga usage_report.py).
+
+    Nama profile: field `profile` eksplisit bila ada, kalau tidak `<profile_prefix><name>`. Prefix dibaca
+    dari TEAM.yaml — `team_file`, kalau tidak team.yaml di samping members.yaml, kalau tidak yang
+    ditentukan kit_paths — bukan dari members.yaml (dulu salah: prefix selain "be-" membuat pemakaian
+    jatuh ke `profile:<nama>` alih-alih ke pemiliknya). Berkas hilang / rusak → daftar kosong."""
+    if not members_file:
+        return []
+    path = Path(members_file).expanduser()
+    try:
+        import yaml
+        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except Exception:
+        return []
+    if not isinstance(data, dict):
+        return []
+    if prefix is None:
+        beside = path.parent / "team.yaml"
+        prefix = team_profile_prefix(team_file or (beside if beside.is_file() else None))
+    out = []
+    for m in data.get("members") or []:
+        if isinstance(m, dict) and m.get("name"):
+            out.append((str(m.get("profile") or f"{prefix}{m['name']}"), m))
+    return out
+
+
+def load_members(members_file: Optional[Path], prefix: Optional[str] = None,
+                 team_file: Optional[Path] = None) -> tuple[dict[str, str], dict[str, dict]]:
     """(profile → ID user pemilik, ID user → {name, display_name}). Berkas hilang → kosong."""
     owners: dict[str, str] = {}
     people: dict[str, dict] = {}
-    if not members_file:
-        return owners, people
-    try:
-        import yaml
-        data = yaml.safe_load(Path(members_file).expanduser().read_text(encoding="utf-8")) or {}
-    except Exception:
-        return owners, people
-    prefix = str(data.get("profile_prefix") or "be-")
-    for m in data.get("members") or []:
-        if not isinstance(m, dict) or not m.get("name") or not m.get("discord_user_id"):
+    for profile, m in member_profiles(members_file, prefix, team_file):
+        if not m.get("discord_user_id"):
             continue
         uid, name = str(m["discord_user_id"]), str(m["name"])
-        owners[str(m.get("profile") or f"{prefix}{name}")] = uid
+        owners[profile] = uid
         people[uid] = {"name": name, "display_name": str(m.get("display_name") or name)}
     return owners, people
 
@@ -439,9 +478,11 @@ def report(ledger: Path, period: str = "day", *, offset: int = 0, last: int = 0,
 # ----------------------------------------------------------------------------- CLI
 def main(argv: Optional[list[str]] = None) -> int:
     ap = argparse.ArgumentParser(description="Buku besar pemakaian LLM tim (token & request per orang).")
-    ap.add_argument("--ledger", help="berkas buku besar (default: ~/.hermes-team/state/usage.db)")
+    ap.add_argument("--ledger", help="berkas buku besar (default: $HERMES_TEAM_DIR/state/usage.db, "
+                                     "kalau tidak ~/.hermes-team/state/usage.db)")
     ap.add_argument("--hermes-root", default=os.environ.get("HERMES_HOME") or "~/.hermes")
-    ap.add_argument("--members-file", default=None, help="members.yaml (default: ~/.hermes-team/members.yaml)")
+    ap.add_argument("--members-file", default=None,
+                    help="members.yaml (default: di folder tim; profile_prefix dibaca dari team.yaml di sampingnya)")
     ap.add_argument("--tz", default=None, help="zona waktu IANA untuk batas hari, mis. Asia/Makassar")
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("collect", help="potret selisih pemakaian sejak potret terakhir")
@@ -454,7 +495,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     rp.add_argument("--no-collect", action="store_true", help="jangan memotret dulu (pakai data terakhir)")
     args = ap.parse_args(argv)
     ledger = Path(args.ledger).expanduser() if args.ledger else default_ledger_path()
-    members = Path(args.members_file).expanduser() if args.members_file else default_ledger_path().parent.parent / "members.yaml"
+    members = Path(args.members_file).expanduser() if args.members_file else kit_paths.members_file()
     try:
         tz = resolve_tz(args.tz)
         owners, people = load_members(members)

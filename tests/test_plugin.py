@@ -1908,14 +1908,161 @@ class TestPerUserConcurrency(ScaleBase):
         assert self.env.runner._running_agent_count() == 0
         assert self.go(d, thread_event(S.U_BUDI, S.CH_BUDI, "701")) is None
 
-    def test_per_user_cap_waits_for_proof_that_hooks_fire(self, d, caplog):
-        """Sebelum on_session_end pernah terlihat, hitungan hook tidak dipercaya (gagal-terbuka)."""
+    def test_per_user_cap_is_enforced_from_the_first_turn_start_after_restart(self, d):
+        """Regresi: sesudah restart hitungan per orang baru dipercaya setelah on_session_end pertama, jadi
+        satu orang bisa membuka sesi tanpa batas sampai ada sesi yang selesai."""
+        self.env.set("settings", user_max_concurrent=1, max_active=50, queue_max_wait=5, rate_per_minute=0)
+
+        async def main():
+            return [await self.turn(d, thread_event(S.U_BUDI, S.CH_BUDI, f"71{i}"), f"s{i}") for i in range(4)]
+
+        results = run(main())
+        assert self.rt.turns.ends == 0                                        # belum ada sesi yang selesai
+        assert results[0] is None
+        assert all(r and r["reason"].endswith("batas sesi per orang") for r in results[1:])
+        assert self.started == ["s0"]
+        self.finish("s0")
+        assert run(self.turn(d, thread_event(S.U_BUDI, S.CH_BUDI, "719"), "s9")) is None
+
+    def test_reservation_survives_a_slow_turn_start(self, d):
+        """Regresi: reservasi 30 detik habis sebelum pre_llm_call → pesan kedua mendapat slot tambahan."""
+        self.env.set("settings", user_max_concurrent=1, max_active=50, queue_max_wait=5, rate_per_minute=0)
+        self.prime()
+        assert self.go(d, thread_event(S.U_BUDI, S.CH_BUDI, "720")) is None
+        self.clock.advance(31)                                                # giliran pertama belum mulai
+        got = self.go(d, thread_event(S.U_BUDI, S.CH_BUDI, "721"))
+        assert got and got["reason"].endswith("batas sesi per orang")
+        self.rt.turns.start("s1", S.U_BUDI, self.clock())                     # mulai → reservasi jadi sesi aktif
+        assert self.rt.turns.user_reserved(S.U_BUDI, self.clock()) == 0
+        assert self.rt.turns.user_active(S.U_BUDI, self.clock()) == 1
+
+    def test_reservation_has_a_generous_but_finite_timeout(self, d):
+        self.env.set("settings", user_max_concurrent=1, max_active=50, queue_max_wait=5, rate_per_minute=0)
+        self.prime()
+        assert self.go(d, thread_event(S.U_BUDI, S.CH_BUDI, "720")) is None
+        self.clock.advance(5 + 60 + 1)                                        # queue_max_wait + 60 detik
+        assert self.go(d, thread_event(S.U_BUDI, S.CH_BUDI, "721")) is None
+
+    def test_gateway_running_session_is_a_lower_bound_when_hooks_never_fire(self, d):
+        """Hook giliran tidak pernah tiba: sesi yang diloloskan tetap dihitung selama gateway melaporkannya
+        berjalan (melewati TTL reservasi), dan dilepas begitu selesai."""
+        self.env.set("settings", user_max_concurrent=1, max_active=50, queue_max_wait=5, rate_per_minute=0)
+        first = thread_event(S.U_BUDI, S.CH_BUDI, "720")
+        assert self.go(d, first) is None
+        key = self.env.runner._session_key_for_source(first.source)
+        self.env.runner._running_agents[key] = "s1"                           # gateway: sesi berjalan
+        assert self.rt.turns.starts == 0
+        for _ in range(3):
+            self.clock.advance(120)
+            got = self.go(d, thread_event(S.U_BUDI, S.CH_BUDI, "721"))
+            assert got and got["reason"].endswith("batas sesi per orang")
+        assert self.go(d, thread_event(S.U_BE1, S.CH_BE1, "801")) is None    # orang lain tidak terpengaruh
+        del self.env.runner._running_agents[key]                              # sesi selesai
+        assert self.go(d, thread_event(S.U_BUDI, S.CH_BUDI, "722")) is None
+
+    def test_without_any_way_to_end_it_early_the_reservation_stays_short(self, d):
+        """Hook belum terlihat DAN gateway tidak bisa ditanya → TTL pendek (jangan menahan slot lama-lama)."""
+        self.env.set("settings", user_max_concurrent=1, max_active=0, queue_max_wait=5, rate_per_minute=0)
+        gateway = types.SimpleNamespace(adapters=self.env.runner.adapters)
+        go = lambda ev: run(d.handle(event=ev, gateway=gateway, session_store=None))  # noqa: E731
+        assert go(thread_event(S.U_BUDI, S.CH_BUDI, "720")) is None
+        self.clock.advance(31)
+        assert go(thread_event(S.U_BUDI, S.CH_BUDI, "721")) is None
+
+
+class Cmd(S.FakeEvent):
+    """Event dengan `get_command()` seperti MessageEvent Hermes (dipakai lebih dulu daripada pengurai kit)."""
+
+    def __init__(self, command, **kw):
+        super().__init__(**kw)
+        self._command = command
+
+    def get_command(self):
+        if isinstance(self._command, Exception):
+            raise self._command
+        return self._command
+
+
+class TestSlashCommandGate(ScaleBase):
+    """Hanya perintah kendali di daftar izin yang bebas anggaran/pembatas; teks "/…" lain = pesan biasa."""
+
+    @pytest.fixture
+    def over(self, d):
+        path = self.env.state_dir / "usage.db"
+        self.env.roster["usage"] = {"timezone": "UTC", "ledger": str(path)}
+        self.env.set("settings", daily_token_budget=1000, rate_per_minute=0)
+        S.ledger_add(path, TODAY, S.U_BUDI, 5000, 5000)
+        return d
+
+    @pytest.mark.parametrize("text,command", [
+        ("/stop", "stop"), ("  /Stop sekarang", "stop"), ("/approve@hermes always", "approve"), ("/", ""),
+        ("/ kerjakan tugas besar", ""), ("/tmp/a jelaskan", None), ("/a/b", None), ("halo /stop", None),
+        ("", None), (None, None), ("@file:/tmp/x.txt\n/status", "status"), ("/btw apa kabar", "btw"),
+    ])
+    def test_parser_matches_upstream_get_command(self, text, command):
+        assert dispatch.parse_command(text) == command
+        assert dispatch.parse_command(text, allow_control=False) is None
+
+    @pytest.mark.parametrize("text", ["/ kerjakan tugas besar", "/tmp/x jelaskan berkas ini", "/btw lanjutkan",
+                                      " /skill-apapun kerjakan", "/retry", "/plan fitur baru", "/goal selesaikan",
+                                      "/queue kerjakan lagi", "/q lagi", "/bg tugas", "/tidak-dikenal x", "/"])
+    def test_slash_text_that_reaches_the_agent_is_budgeted(self, over, text):
+        """Regresi: apa pun yang diawali "/" dulu lolos anggaran, rate limit, batas per orang, dan antrean."""
+        got = self.go(over, event(S.U_BUDI, S.CH_BUDI, text))
+        assert got == {"action": "skip", "reason": "team-guard: anggaran token habis"}
+
+    @pytest.mark.parametrize("text", ["/stop", "/approve", "/approve always", "/deny terlalu berbahaya", "/status",
+                                      "/usage", "/new", "/reset", "/help", "/commands", "/whoami", "/sessions",
+                                      "/title rapat", "/context", "/ctx all", "/STOP", "/stop@hermes"])
+    def test_control_commands_stay_exempt(self, over, text):
+        assert self.go(over, event(S.U_BUDI, S.CH_BUDI, text)) is None
+        assert self.rt.metrics.refused["budget"] == 0 and self.said() == []
+
+    def test_slash_text_is_rate_limited_and_capped_per_user(self, d):
+        self.env.set("settings", rate_per_minute=6, burst=3, user_max_concurrent=1, max_active=8, queue_max_wait=3)
+        self.prime()
+        texts = ["/ kerjakan", "/tmp/x jelaskan", "/btw lanjut", "/skill-x kerjakan"]
+        results = [self.go(d, thread_event(S.U_BUDI, S.CH_BUDI, f"73{i}", text)) for i, text in enumerate(texts)]
+        assert results[0] is None
+        assert all(r and r["action"] == "skip" for r in results[1:])
+        assert self.rt.metrics.refused["user_concurrent"] >= 1
+        assert self.rt.metrics.refused["user_concurrent"] + self.rt.metrics.refused["rate"] == 3
+
+    def test_event_get_command_is_preferred_and_failure_is_not_an_exemption(self, over):
+        mk = lambda command, text: Cmd(command, text=text, source=S.FakeSource(  # noqa: E731
+            user_id=S.U_BUDI, chat_id=S.CH_BUDI))
+        assert self.go(over, mk("stop", "apa saja")) is None                  # Hermes bilang: /stop
+        assert self.go(over, mk(None, "/stop"))["action"] == "skip"           # Hermes bilang: bukan perintah
+        assert self.go(over, mk("btw", "/btw x"))["action"] == "skip"
+        assert self.go(over, mk(RuntimeError("x"), "/stop"))["action"] == "skip"
+        assert self.go(over, mk(123, "/stop"))["action"] == "skip"
+
+    def test_admin_slash_text_still_bypasses(self, over):
+        S.ledger_add(self.env.state_dir / "usage.db", TODAY, S.ADMIN, 9000, 9000)
+        assert self.go(over, event(S.ADMIN, S.CH_ADMIN, "/btw lanjutkan")) is None
+
+    def test_unlisted_command_holds_its_slot_only_briefly(self, d):
+        """Perintah di luar daftar izin belum tentu memulai giliran → reservasinya memakai TTL pendek."""
         self.env.set("settings", user_max_concurrent=1, max_active=8, queue_max_wait=3, rate_per_minute=0)
-        self.rt.turns.start("s-lama", S.U_BUDI, self.clock() - 100)
-        self.env.runner._running_agents["x"] = "s-lama"
-        with caplog.at_level(logging.INFO, logger="team-guard"):
-            assert self.go(d, thread_event(S.U_BUDI, S.CH_BUDI, "701")) is None
-        assert sum("batas sesi per orang baru aktif penuh" in r.getMessage() for r in caplog.records) == 1
+        self.prime()
+        assert self.go(d, thread_event(S.U_BUDI, S.CH_BUDI, "740", "/model gpt")) is None
+        self.clock.advance(31)
+        assert self.go(d, thread_event(S.U_BUDI, S.CH_BUDI, "741")) is None
+
+    def test_scrub_rewrite_survives_a_later_failure(self, d, caplog):
+        """Regresi: galat sesudah penyamaran membuang hasil rewrite → token asli sampai ke AI."""
+        self.env.set("settings", rate_per_minute=6)
+        token = "ghp_" + "A1b2C3d4" * 5
+
+        def boom(*_a, **_k):
+            raise RuntimeError("limiter rusak")
+
+        self.rt.limiter.reserve = boom
+        with caplog.at_level(logging.WARNING, logger="team-guard"):
+            got = self.go(d, event(S.U_BUDI, S.CH_BUDI, f"pakai {token} ya", raw_message=Raw()))
+        assert got and got["action"] == "rewrite" and token not in got["text"]
+        assert any("token tersamar" in r.getMessage() for r in caplog.records)
+        assert self.go(d, event(S.U_BUDI, S.CH_BUDI, "halo")) is None         # tanpa token: tetap gagal-terbuka
 
 
 class TestFairDispatch(ScaleBase):
@@ -2231,6 +2378,12 @@ class TestCronGuard:
         ("every monday 9am", 1440), ("weekdays at 9am", 1440), ("every day at 9am", 1440),
         ("every monday, wednesday at 9am", 1440),
         ("*/5 * * * * */10", pytest.approx(10 / 60)), ("0 9 * * * 0", 1440),
+        # rentang melingkar, kolom detik, dan bentuk 7 kolom (detik + tahun) — dulu lolos tanpa dihitung
+        ("59-58 * * * *", 1), ("30-29 * * * *", 1), ("5-1 * * * *", 1), ("50-10 * * * *", 1),
+        ("55-5 9 * * *", 1), ("0 22-2 * * *", 60), ("* * * * * 59-0", pytest.approx(1 / 60)),
+        ("0 9 * * * 30-29", pytest.approx(1 / 60)), ("* * * * * * *", pytest.approx(1 / 60)),
+        ("0 9 * * * 0 2027", 1440), ("*/30 * * * * 0 2027-2030", 30), ("0 * * * * 0,30 *", 0.5),
+        ("monday wednesday friday at 9am", 1440),
     ])
     def test_recurring_intervals(self, schedule, minutes):
         assert cronguard.schedule_interval_minutes(schedule) == minutes
@@ -2240,10 +2393,39 @@ class TestCronGuard:
         assert cronguard.schedule_interval_minutes(schedule) == float("inf")
 
     @pytest.mark.parametrize("schedule", ["", "   ", None, 15, "sesekali saja", "every now and then", "in a while",
-                                          "*/0 * * * *", "61 * * * *", "MON * * * *", "5-1 * * * *",
-                                          "* * * * * * *", "every monday"])
+                                          "*/0 * * * *", "61 * * * *", "H * * * *", "50-10/20 * * * *",
+                                          "*/5 * * * * 2026", "* * * * * * * *", "0 9 * * * 0 tahun",
+                                          "0 9 * * * 61", "5/ * * * *", "every monday", "@hourly"])
     def test_unparseable_schedules_return_none(self, schedule):
         assert cronguard.schedule_interval_minutes(schedule) is None
+
+    @pytest.mark.parametrize("schedule", ["59-58 * * * *", "30-29 * * * *", "* * * * * * *", "* * * * * 59-0",
+                                          "0 9 * * * 59-0", "5-1 * * * *"])
+    def test_wraparound_and_seconds_forms_are_blocked_when_too_frequent(self, schedule):
+        """Regresi: bentuk cron yang sah tetapi tidak terurai dulu diloloskan (gagal-terbuka)."""
+        msg = cronguard.check_cron_call("cronjob_manage", {"action": "create", "schedule": schedule}, 30)
+        assert msg and "berjalan tiap" in msg and "30 menit" in msg
+
+    @pytest.mark.parametrize("schedule", ["*/0 * * * *", "61 * * * *", "H * * * *", "50-10/20 * * * *",
+                                          "*/5 * * * * 2026", "* * * * * * * *", "0 9 * * * 0 tahun",
+                                          "0 9 L * *  x y z", "1,2,x * * * *"])
+    def test_cron_shaped_but_uncomputable_schedule_is_rejected(self, schedule, caplog):
+        """Berbentuk ekspresi cron tetapi jaraknya tidak bisa dihitung → ditolak, bukan diloloskan."""
+        assert cronguard.looks_like_cron(schedule)
+        with caplog.at_level(logging.WARNING, logger="team-guard"):
+            msg = cronguard.check_cron_call("cronjob_manage", {"action": "update", "schedule": schedule}, 15)
+        assert msg and "tidak bisa diperiksa" in msg and "every 15m" in msg and schedule.strip()[:20] in msg
+        assert not any("diloloskan" in r.getMessage() for r in caplog.records)
+
+    @pytest.mark.parametrize("schedule", ["kapan-kapan", "sesekali saja", "every now and then", "@hourly",
+                                          "besok pagi (kira-kira) jam 9.30 ya", "every monday"])
+    def test_free_text_is_not_treated_as_cron(self, schedule):
+        assert not cronguard.looks_like_cron(schedule)
+        assert cronguard.check_cron_call("cronjob_manage", {"action": "create", "schedule": schedule}, 15) is None
+
+    def test_sparse_wraparound_and_yearly_forms_are_allowed(self):
+        for schedule in ("0 22-2 * * *", "0 9 * * * 0 2027", "0 */2 * * * 30", "monday wednesday friday at 9am"):
+            assert cronguard.check_cron_call("cronjob_manage", {"action": "create", "schedule": schedule}, 30) is None
 
     def test_check_blocks_only_too_frequent_create_or_update(self):
         check = cronguard.check_cron_call
@@ -2481,10 +2663,72 @@ class TestBudget(ScaleBase):
     def test_snapshot_for_metrics(self, d, ledger):
         self.use(ledger, S.U_BUDI, 300)
         assert self.rt.budget.snapshot(self.rt.roster()) == {
-            "day": TODAY, "used_by_user": {S.U_BE1: 20, S.U_BUDI: 300}, "team_used": 320}
+            "day": TODAY, "used_by_user": {S.U_BE1: 20, S.U_BUDI: 300}, "team_used": 320, "stale": False,
+            "last_collect": None}
         self.env.roster["usage"] = {}
         self.env.save()
         assert self.rt.budget.snapshot(self.rt.roster())["used_by_user"] == {}
+
+    def test_extra_for_one_user_never_raises_the_team_ceiling(self, d, ledger):
+        """Regresi: tambahan jatah satu orang ikut dijumlahkan ke plafon tim → batas tim bisa dilonggarkan
+        untuk semua orang, padahal konfirmasi admin berkata batas tim tidak berubah."""
+        self.env.set("settings", daily_token_budget=1000, team_daily_token_budget=3000)
+        self.use(ledger, "profile:team-shared", 4000)                        # tim: 4.020 > 3.000
+        assert self.go(d, event(S.U_BE1, S.CH_BE1))["action"] == "skip"
+        (self.env.state_dir / "budget_overrides.json").write_text(
+            json.dumps({S.U_BUDI: {"day": TODAY, "extra_tokens": 1_000_000_000}}))
+        self.clock.advance(61)
+        for uid, chat in ((S.U_BE1, S.CH_BE1), (S.U_BUDI, S.CH_BUDI)):
+            got = self.go(d, event(uid, chat))
+            assert got == {"action": "skip", "reason": "team-guard: anggaran token habis"}
+            assert "TIM sudah habis" in self.said(chat)[-1] and "dari 3.000 token" in self.said(chat)[-1]
+        verdict = self.rt.budget.check(self.rt.roster(), S.U_BUDI)
+        assert verdict.team_limit == 3000 and verdict.limit == 1_000_001_000  # hanya batas orangnya yang naik
+
+    # ---- buku besar basi (kolektor gagal terus)
+    def test_stale_ledger_notifies_admin_once_a_day_and_is_flagged_in_metrics(self, d, ledger, caplog):
+        """Regresi: kolektor yang terus gagal membuat anggaran diam-diam tidak pernah terpicu."""
+        S.ledger_collected(ledger, NOON)
+        self.use(ledger, S.U_BUDI, 100)
+        with caplog.at_level(logging.WARNING, logger="team-guard"):
+            assert self.go(d, event(S.U_BUDI, S.CH_BUDI)) is None
+            assert self.admin_said() == [] and self.rt.budget.snapshot(self.rt.roster())["stale"] is False
+            self.clock.advance(31 * 60)                                       # potret kini > 30 menit
+            for _ in range(3):
+                assert self.go(d, event(S.U_BUDI, S.CH_BUDI)) is None         # tetap dilayani (gagal-terbuka)
+                self.clock.advance(61)
+        told = [s for s in self.admin_said() if "nggaran tidak ditegakkan" in s]
+        assert len(told) == 1 and "buku besar basi sejak 2027-01-15 08:00" in told[0]
+        assert sum("buku besar basi sejak" in r.getMessage() for r in caplog.records) == 1
+        snap = self.rt.budget.snapshot(self.rt.roster())
+        assert snap["stale"] is True and snap["last_collect"] == NOON
+        assert scale.build_metrics(self.rt, self.env.runner, d.probe)["budget"]["stale"] is True
+        self.clock.advance(24 * 3600)                                         # hari berikutnya → kabar lagi, sekali
+        self.go(d, event(S.U_BUDI, S.CH_BUDI))
+        assert sum("nggaran tidak ditegakkan" in s for s in self.admin_said()) == 2
+
+    def test_fresh_collect_clears_the_stale_flag(self, d, ledger):
+        S.ledger_collected(ledger, NOON)
+        self.clock.advance(40 * 60)
+        self.go(d, event(S.U_BUDI, S.CH_BUDI))
+        assert self.rt.budget.snapshot(self.rt.roster())["stale"] is True
+        S.ledger_collected(ledger, NOON + 40 * 60)
+        self.clock.advance(61)
+        self.go(d, event(S.U_BUDI, S.CH_BUDI))
+        assert self.rt.budget.snapshot(self.rt.roster())["stale"] is False
+
+    def test_ledger_never_collected_or_unreadable_is_reported_after_thirty_minutes(self, d, ledger):
+        ledger.unlink()                                                       # kolektor tidak pernah berhasil
+        assert self.go(d, event(S.U_BUDI, S.CH_BUDI)) is None and self.admin_said() == []
+        self.clock.advance(31 * 60)
+        assert self.go(d, event(S.U_BUDI, S.CH_BUDI)) is None
+        assert len(self.admin_said()) == 1 and "tidak terbaca / belum pernah diisi" in self.admin_said()[0]
+        assert self.rt.budget.snapshot(self.rt.roster())["stale"] is True
+
+    def test_stale_check_is_off_when_budgets_are_off(self, d, ledger):
+        self.env.set("settings", daily_token_budget=0, team_daily_token_budget=0)
+        S.ledger_collected(ledger, NOON - 86400)
+        assert self.go(d, event(S.U_BUDI, S.CH_BUDI)) is None and self.admin_said() == []
 
 
 class TestMetricsAndAlerts(ScaleBase):
@@ -2583,7 +2827,8 @@ class TestMetricsAndAlerts(ScaleBase):
             "llm_inflight": 1, "llm_inflight_peak_5m": 2, "queue_len": 0, "queue_wait_p95_s": 0.0,
             "refused": {"rate": 0, "queue_full": 0, "budget": 0, "user_concurrent": 1},
             "http_429_last_minute": 3, "effective_max_active": 3, "configured_max_active": 6, "throttled": True,
-            "budget": {"day": TODAY, "used_by_user": {S.U_BUDI: 150}, "team_used": 150}}
+            "budget": {"day": TODAY, "used_by_user": {S.U_BUDI: 150}, "team_used": 150, "stale": False,
+                       "last_collect": None}}
         json.dumps(data)
 
     def test_metrics_without_gateway_or_ledger_still_complete(self, d):

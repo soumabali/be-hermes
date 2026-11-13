@@ -44,39 +44,76 @@ class RateLimiter:
 
 class TurnTracker:
     """Giliran anggota yang sedang berjalan, dihitung dari hook terdokumentasi:
-    `pre_llm_call` (mulai) dan `on_session_end` (selesai), plus "reservasi" singkat untuk pesan yang
-    baru saja diloloskan antrean tetapi gilirannya belum mulai."""
+    `pre_llm_call` (mulai) dan `on_session_end` (selesai), plus "reservasi" untuk pesan yang baru saja
+    diloloskan antrean tetapi gilirannya belum mulai.
+
+    Reservasi hidup sampai gilirannya mulai (`start`), sampai sesi gateway-nya terlihat berjalan lalu
+    selesai (`sweep`), atau sampai TTL-nya habis. TTL diberikan per reservasi: pesan biasa memakai TTL
+    panjang (lihat dispatch) supaya giliran yang lambat mulai tidak memberi slot tambahan."""
 
     def __init__(self, reserve_ttl: float = 30.0, turn_ttl: float = 3600.0):
         self.reserve_ttl, self.turn_ttl = reserve_ttl, turn_ttl
         self._lock = threading.Lock()
-        self._reserved: list[tuple[str, float]] = []
+        # [kunci "uid:chat", waktu, ttl, kunci sesi gateway ("" = tidak diketahui), terlihat berjalan?]
+        self._reserved: list[list] = []
         self._active: dict[str, tuple[str, float]] = {}        # session_id → (uid, mulai)
         self.starts = self.ends = 0
 
-    def reserve(self, user_id: str, now: float, chat_id: str = "") -> None:
+    def reserve(self, user_id: str, now: float, chat_id: str = "", ttl: Optional[float] = None,
+                session_key: str = "") -> None:
         with self._lock:
-            self._reserved.append((f"{user_id}:{chat_id}", now))
+            self._reserved.append([f"{user_id}:{chat_id}", now, float(ttl if ttl else self.reserve_ttl),
+                                   str(session_key or ""), False])
+
+    def _prune(self, now: float) -> None:
+        # Reservasi yang sesinya terlihat berjalan tidak kedaluwarsa oleh TTL pendeknya (sesinya memang masih
+        # jalan); batas atasnya `turn_ttl`, sama seperti giliran yang dihitung hook.
+        self._reserved = [r for r in self._reserved if now - r[1] < (self.turn_ttl if r[4] else r[2])]
+
+    def sweep(self, now: float, is_running: Optional[Callable[[str], bool]] = None) -> None:
+        """Buang reservasi kedaluwarsa. Dengan `is_running(kunci sesi)` dari gateway: reservasi yang
+        sesinya terlihat berjalan ditandai (dihitung sebagai sesi berjalan, bukan lagi "belum mulai"), dan
+        dibuang begitu sesi itu selesai — jadi tetap benar walau hook `pre_llm_call` tidak pernah tiba."""
+        with self._lock:
+            if is_running is not None:
+                keep = []
+                for item in self._reserved:           # ditanya SEBELUM TTL diperiksa: sesi yang berjalan menang
+                    if item[3]:
+                        try:
+                            running = bool(is_running(item[3]))
+                        except Exception:
+                            running = item[4]          # gateway tidak bisa ditanya → status terakhir
+                        if running:
+                            item[4] = True
+                        elif item[4]:
+                            continue                   # sesinya sudah selesai
+                    keep.append(item)
+                self._reserved = keep
+            self._prune(now)
 
     def holds(self, user_id: str, chat_id: str, now: float) -> bool:
         """Orang ini sudah memegang reservasi untuk chat yang sama (pesan susulan → sesi yang sama)."""
         key = f"{user_id}:{chat_id}"
         with self._lock:
-            return any(k == key and now - t < self.reserve_ttl for k, t in self._reserved)
+            self._prune(now)
+            return any(r[0] == key for r in self._reserved)
 
-    def reserved(self, now: float) -> int:
+    def reserved(self, now: float, include_seen: bool = True) -> int:
+        """Pesan yang sudah diloloskan tetapi gilirannya belum mulai. `include_seen=False` melewatkan yang
+        sesinya sudah terlihat berjalan di gateway (sudah terhitung di jumlah sesi gateway)."""
         with self._lock:
-            self._reserved = [(k, t) for k, t in self._reserved if now - t < self.reserve_ttl]
-            return len(self._reserved)
+            self._prune(now)
+            return sum(1 for r in self._reserved if include_seen or not r[4])
 
     def start(self, session_id: str, user_id: str, now: float, counted: bool = True) -> None:
         with self._lock:
             self.starts += 1
             prefix = f"{user_id}:"
-            for i, (key, _t) in enumerate(self._reserved):
-                if key.startswith(prefix):
-                    del self._reserved[i]
-                    break
+            mine = [r for r in self._reserved if r[0].startswith(prefix)]
+            if mine:
+                # Yang sesinya sudah terlihat berjalan lebih dulu; kalau tidak ada, yang paling lama.
+                chosen = next((r for r in mine if r[4]), mine[0])
+                self._reserved = [r for r in self._reserved if r is not chosen]
             if counted and session_id:
                 self._active[str(session_id)] = (str(user_id), now)
 
@@ -103,10 +140,12 @@ class TurnTracker:
             return sum(1 for u, t in self._active.values() if u == uid and now - t <= self.turn_ttl)
 
     def user_reserved(self, user_id: str, now: float) -> int:
-        """Pesan orang ini yang sudah diloloskan tetapi gilirannya belum mulai."""
+        """Pesan orang ini yang sudah diloloskan tetapi gilirannya belum tercatat mulai oleh hook (termasuk
+        yang sesinya sudah terlihat berjalan di gateway)."""
         prefix = f"{user_id}:"
         with self._lock:
-            return sum(1 for k, t in self._reserved if k.startswith(prefix) and now - t < self.reserve_ttl)
+            self._prune(now)
+            return sum(1 for r in self._reserved if r[0].startswith(prefix))
 
     def by_user(self, now: float) -> dict[str, int]:
         """uid → jumlah sesi aktif (untuk metrik)."""

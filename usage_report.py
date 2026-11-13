@@ -7,6 +7,10 @@ Hanya membaca (SQLite mode read-only); tidak mengubah apa pun dan tidak memuat i
   python3 usage_report.py --days 30 --format markdown
   python3 usage_report.py --format json --members-file ~/.hermes-team/members.yaml
 
+Ini laporan "langsung dari state.db" per PROFILE dengan biaya. Untuk angka per ORANG dan riwayat yang
+tidak hilang saat sesi dipangkas, pakai `usage_ledger.py report`. Penemuan profile dan pemetaan
+anggota → profile dipinjam dari usage_ledger.py (satu sumber; profile_prefix dibaca dari team.yaml).
+
 Tabel sumber: `session_model_usage` (Hermes ≥ schema v20). Profile tanpa tabel itu dilewati dan
 dilaporkan di bagian "dilewati". `last_seen` dipakai sebagai penanda waktu, jadi sesi yang
 berjalan melewati batas periode dihitung penuh pada periode tempat ia terakhir aktif.
@@ -22,16 +26,16 @@ import time
 from pathlib import Path
 from typing import Optional
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import kit_paths  # noqa: E402
+import usage_ledger  # noqa: E402
+
 COLUMNS = ("api_call_count", "input_tokens", "output_tokens", "cache_read_tokens",
            "cache_write_tokens", "reasoning_tokens", "estimated_cost_usd", "actual_cost_usd")
 
 
-def _profile_dirs(root: Path) -> list[tuple[str, Path]]:
-    found = [("default", root)] if (root / "state.db").exists() else []
-    base = root / "profiles"
-    if base.is_dir():
-        found += [(p.name, p) for p in sorted(base.iterdir()) if (p / "state.db").exists()]
-    return found
+_profile_dirs = usage_ledger.profile_homes       # satu implementasi penemuan profile (usage_ledger.py)
+_fmt_tokens = usage_ledger._n                   # dan satu pemformat angka token
 
 
 def _usage_for(db: Path, since: float, until: float) -> dict[str, dict]:
@@ -82,11 +86,6 @@ def build_report(root: Path, days: float = 7, now: Optional[float] = None,
             "totals": grand, "skipped": skipped}
 
 
-def _fmt_tokens(n: float) -> str:
-    n = int(n)
-    return f"{n / 1_000_000:.2f}M" if n >= 1_000_000 else f"{n / 1000:.1f}k" if n >= 1000 else str(n)
-
-
 def render(report: dict, fmt: str = "text") -> str:
     if fmt == "json":
         return json.dumps(report, indent=2, ensure_ascii=False)
@@ -111,19 +110,9 @@ def render(report: dict, fmt: str = "text") -> str:
 
 
 def _owners_from(members_file: Optional[str]) -> dict[str, str]:
-    if not members_file:
-        return {}
-    try:
-        import yaml
-        data = yaml.safe_load(Path(members_file).expanduser().read_text(encoding="utf-8")) or {}
-    except (OSError, ImportError, ValueError):
-        return {}
-    prefix = str(data.get("profile_prefix") or "be-")
-    out = {}
-    for m in data.get("members") or []:
-        if isinstance(m, dict) and m.get("name"):
-            out[str(m.get("profile") or f"{prefix}{m['name']}")] = str(m.get("display_name") or m["name"])
-    return out
+    """profile → nama tampilan pemilik. Pemetaan anggota → profile milik usage_ledger.member_profiles."""
+    return {profile: str(m.get("display_name") or m["name"])
+            for profile, m in usage_ledger.member_profiles(members_file)}
 
 
 def main(argv: Optional[list[str]] = None) -> int:
@@ -131,12 +120,14 @@ def main(argv: Optional[list[str]] = None) -> int:
     ap.add_argument("--hermes-root", default=os.environ.get("HERMES_HOME") or "~/.hermes")
     ap.add_argument("--days", type=float, default=7)
     ap.add_argument("--format", choices=("text", "markdown", "json"), default="text")
-    ap.add_argument("--members-file", help="members.yaml untuk menampilkan nama pemilik profile")
+    ap.add_argument("--members-file", default=None,
+                    help="members.yaml untuk menampilkan nama pemilik profile (default: members.yaml di folder "
+                         "tim; profile_prefix dibaca dari team.yaml di sampingnya)")
     args = ap.parse_args(argv)
     if args.days <= 0:
         ap.error("--days harus > 0")
-    print(render(build_report(Path(args.hermes_root), args.days, owners=_owners_from(args.members_file)),
-                 args.format))
+    members = args.members_file or kit_paths.members_file()
+    print(render(build_report(Path(args.hermes_root), args.days, owners=_owners_from(members)), args.format))
     return 0
 
 
