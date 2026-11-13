@@ -2727,6 +2727,15 @@ def _detected(proc):
     return dict(line.split("=", 1) for line in proc.stdout.splitlines() if "=" in line)
 
 
+
+def _needs_python_without_hermes():
+    """Uji ini meniru instalasi yang Python-nya ketemu tetapi sumber Hermes tidak. Itu tidak bisa ditiru bila
+    Python penguji sendiri adalah Python milik Hermes (job integrasi CI): `import gateway` selalu berhasil."""
+    import importlib.util
+    if importlib.util.find_spec("gateway") is not None:
+        pytest.skip("Python penguji sudah memuat Hermes; jalur 'sumber Hermes tidak ditemukan' diuji di job unit")
+
+
 class TestSelftestScript:
     def test_bash_syntax(self):
         assert subprocess.run(["bash", "-n", str(SELFTEST)], capture_output=True, text=True).returncode == 0
@@ -2756,6 +2765,7 @@ class TestSelftestScript:
 
     def test_shebang_launcher_needs_source_dir_and_honours_overrides(self, tmp_path):
         import sys
+        _needs_python_without_hermes()
         source = _fake_hermes_source(tmp_path / "src")
         launcher = tmp_path / "hermes"
         launcher.write_bytes(f"#!{sys.executable} -I\n".encode() + b"PK\x03\x04\x00\x00biner zip\x00\n")
@@ -2781,6 +2791,7 @@ class TestSelftestScript:
 
     def test_skip_is_loud_and_exits_3_unless_allowed(self, tmp_path):
         import sys
+        _needs_python_without_hermes()
         launcher = tmp_path / "hermes"
         launcher.write_text(f"#!{sys.executable} -I\n", encoding="utf-8")       # python ketemu, sumber tidak
         launcher.chmod(0o755)
