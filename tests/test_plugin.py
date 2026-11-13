@@ -3123,9 +3123,11 @@ class TestUpstreamAdapterLayer:
         pkg.mkdir()
         (pkg / "__init__.py").write_text("raise RuntimeError('tidak boleh dijalankan')\n")
         (pkg / "profile_routing.py").write_text("def parse_profile_routes(raw):\n    return raw\n")
-        monkeypatch.syspath_prepend(str(tmp_path))
-        # Dengan Hermes asli terpasang (job integrasi CI) submodulnya mungkin sudah dimuat: singkirkan semuanya
-        # untuk uji ini (monkeypatch memulihkannya) supaya yang diperiksa memang jalur "belum dimuat".
+        # Hanya folder tiruan yang boleh menjadi sumber: dengan Hermes asli di sys.path (job integrasi CI) nama-nama
+        # seperti rescan_gateway_profiles memang ada di sumber aslinya dan probe akan menemukannya di sana.
+        monkeypatch.setattr(sys, "path", [str(tmp_path)])
+        # Submodulnya mungkin sudah dimuat Hermes asli: singkirkan semuanya untuk uji ini (monkeypatch
+        # memulihkannya) supaya yang diperiksa memang jalur "belum dimuat".
         for name in [k for k in sys.modules if k == "gateway" or k.startswith("gateway.")]:
             monkeypatch.delitem(sys.modules, name)
         shared.reset()
