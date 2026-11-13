@@ -251,6 +251,10 @@ class TestFakeLlm:
             limited = next(r for r in results if r[0] == 429)
             assert limited[1]["Retry-After"] == "1"
             assert json.loads(limited[2])["error"]["type"] == "rate_limit_error"
+            # Server memperbarui penghitung SETELAH jawaban terkirim; tunggu sampai tenang sebelum memeriksa.
+            deadline = time.time() + 5
+            while (srv.stats()["inflight"] != 0 or srv.stats()["ok"] != 2) and time.time() < deadline:
+                time.sleep(0.01)
             stats = srv.stats()
             assert stats == {**stats, "requests": 5, "ok": 2, "rejected_429": 3, "peak_parallel": 2, "inflight": 0}
         finally:

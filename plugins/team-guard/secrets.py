@@ -70,6 +70,8 @@ HERMES_PREFIXES = (
     "WEIXIN_", "WHATSAPP_", "XAI_", "XIAOMI_", "ZAI_", "Z_AI_", "_HERMES_",
     # Ditemukan uji drift di CI terhadap Hermes asli (tabel env saat runtime, tidak terlihat dari pindaian statis):
     "CAMOFOX_", "HASS_", "YUANBAO_",
+    # Sumber secret (Bitwarden Secrets Manager, 1Password) — ditemukan uji drift terhadap Hermes `main`:
+    "BWS_", "OP_SERVICE_ACCOUNT_", "OP_CONNECT_",
 )
 # Bentuk setelan Hermes apa pun namespacenya: endpoint LLM, gerbang akses, saklar/alamat adapter, webhook, proxy.
 BLOCKED_SHAPE = re.compile(
