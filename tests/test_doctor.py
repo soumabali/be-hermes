@@ -311,3 +311,419 @@ def test_main_docker_flag_is_wired(env, monkeypatch, capsys):
     assert seen == []
     kd.main(argv + ["--docker", "--format", "json"])
     assert seen == [root] and '"sandbox"' in capsys.readouterr().out
+
+
+# ----------------------------------------------------------------------------- konfigurasi (key tak dikenal, ID contoh)
+def test_config_warnings_and_placeholders_reach_doctor(env, monkeypatch):
+    team, root, tmp = env
+    monkeypatch.delenv("HERMES_TEAM_ALLOW_PLACEHOLDERS", raising=False)
+    raw = dict(TEAM, scale={"max_concurent_sessions": 3})
+    (tmp / "team" / "team.yaml").write_text(yaml.safe_dump(raw))
+    team = ht.load_team(tmp / "team" / "team.yaml")
+    rep = kd.Report()
+    kd.check_config(team, rep, ht)
+    warn = [i for i in rep.items if i["level"] == kd.WARN]
+    assert len(warn) == 1 and "max_concurrent_sessions" in warn[0]["message"] and warn[0]["area"] == "konfigurasi"
+    errors = [i for i in rep.items if i["level"] == kd.ERROR]
+    assert len(errors) == 1 and "ID contoh" in errors[0]["message"] and "guild_id" in errors[0]["message"]
+    monkeypatch.setenv("HERMES_TEAM_ALLOW_PLACEHOLDERS", "1")
+    rep = kd.Report()
+    kd.check_config(team, rep, ht)
+    assert rep.errors == 0
+
+
+# ----------------------------------------------------------------------------- managed scope (/etc/hermes)
+LLM = {"providers": {"td": {"api": "https://llm.example.internal/v1", "key_env": "TD_API_KEY"},
+                     "cadangan": {"api": "https://b.example.internal/v1", "key_env": "BACKUP_API_KEY"}},
+       "models": {"td-simple": {"provider": "custom:td", "model": "td-simple"}}, "default_model": "td-simple"}
+
+
+def managed_report(team, folder):
+    rep = kd.Report()
+    kd.check_managed(team, rep, ht, managed_dir=folder)
+    return rep
+
+
+def test_managed_file_missing_is_error_with_install_command(env):
+    team, _root, tmp = env
+    rep = managed_report(team, tmp / "etc-hermes")
+    item = next(i for i in rep.items if i["area"] == "managed")
+    assert item["level"] == kd.ERROR and "belum ada" in item["message"]
+    assert "sudo" in item["fix"] and "managed --install" in item["fix"] and team["paths"]["team_file"] in item["fix"]
+
+
+def test_managed_drift_is_warning_listing_keys_and_clean_file_is_silent(env):
+    team, _root, tmp = env
+    folder = tmp / "etc-hermes"
+    ht.install_managed(team, target_dir=folder, euid=0)
+    assert [i for i in managed_report(team, folder).items if i["area"] == "managed"] == []
+    data = yaml.safe_load((folder / "config.yaml").read_text())
+    data["agent"]["max_turns"] = 7
+    del data["cron"]
+    data["security"]["tambahan"] = True
+    (folder / "config.yaml").write_text(yaml.safe_dump(data))
+    rep = managed_report(team, folder)
+    assert rep.errors == 0
+    item = next(i for i in rep.items if i["area"] == "managed")
+    assert item["level"] == kd.WARN
+    for key in ("berbeda agent.max_turns", "kurang cron.max_parallel_jobs", "berlebih security.tambahan"):
+        assert key in item["message"], key
+    assert "managed --diff" in item["fix"]
+
+
+def test_keys_moved_out_of_managed_are_an_error_with_the_three_step_fix(env):
+    team, _root, tmp = env
+    folder = tmp / "etc-hermes"
+    ht.install_managed(team, target_dir=folder, euid=0)
+    data = yaml.safe_load((folder / "config.yaml").read_text())
+    data["terminal"].update({"container_cpu": 1, "container_memory": 1024})
+    data["compression"]["threshold_tokens"] = 64000
+    (folder / "config.yaml").write_text(yaml.safe_dump(data))
+    rep = managed_report(team, folder)
+    errors = [i for i in rep.items if i["level"] == kd.ERROR]
+    assert len(errors) == 1
+    for key in ("terminal.container_cpu", "terminal.container_memory", "compression.threshold_tokens"):
+        assert key in errors[0]["message"]
+    fix = errors[0]["fix"]
+    assert fix.index("apply") < fix.index("managed") < fix.rindex("apply") and "sekali lagi" in fix
+    assert not [i for i in rep.items if i["level"] == kd.WARN]          # key pindahan tidak dilaporkan dua kali
+
+
+def test_managed_env_must_exist_be_private_and_hold_every_key_env(env):
+    team, _root, tmp = env
+    (tmp / "team" / "team.yaml").write_text(yaml.safe_dump(dict(TEAM, llm=LLM)))
+    team = ht.load_team(tmp / "team" / "team.yaml")
+    folder = tmp / "etc-hermes"
+    ht.install_managed(team, target_dir=folder, euid=0)
+    env_file = folder / ".env"
+    rep = managed_report(team, folder)
+    item = next(i for i in rep.items if ".env" in i["message"])
+    assert item["level"] == kd.ERROR and "belum ada" in item["message"]
+    assert "BACKUP_API_KEY, TD_API_KEY" in item["message"] and "chmod 640" in item["fix"]
+
+    secret = "sk-RAHASIA-jangan-tercetak-123"
+    env_file.write_text(f"TD_API_KEY={secret}\nBACKUP_API_KEY=\n")
+    env_file.chmod(0o644)
+    rep = managed_report(team, folder)
+    messages = [i["message"] for i in rep.items if i["level"] == kd.ERROR]
+    assert any("terbaca SEMUA user" in m and "0o644" in m for m in messages)
+    missing = next(m for m in messages if "tidak memuat" in m)
+    assert "BACKUP_API_KEY" in missing and "TD_API_KEY" not in missing     # ada tapi kosong = belum diisi
+    assert secret not in rep.render("text") and secret not in rep.render("json")
+
+    env_file.write_text(f"TD_API_KEY={secret}\nBACKUP_API_KEY=x-cadangan-456\n")
+    env_file.chmod(0o640)
+    assert managed_report(team, folder).items == []
+
+
+def test_managed_env_per_user_keys_downgrades_missing_key_to_warning(env):
+    team, _root, tmp = env
+    (tmp / "team" / "team.yaml").write_text(yaml.safe_dump(dict(TEAM, llm=dict(LLM, per_user_keys=True))))
+    team = ht.load_team(tmp / "team" / "team.yaml")
+    folder = tmp / "etc-hermes"
+    ht.install_managed(team, target_dir=folder, euid=0)
+    rep = managed_report(team, folder)
+    assert rep.errors == 0 and any("per_user_keys" in i["message"] for i in rep.items)
+
+
+# ----------------------------------------------------------------------------- systemd: linger & timer
+def runner(table, calls=None):
+    def run(cmd):
+        if calls is not None:
+            calls.append(cmd)
+        result = table.get(cmd[0] if cmd[0] == "loginctl" else cmd[-1])
+        if isinstance(result, Exception):
+            raise result
+        return result if result is not None else (1, "not-found")
+    return run
+
+
+def test_linger_states(env):
+    calls = []
+    rep = kd.Report()
+    kd.check_linger(rep, runner({"loginctl": (0, "Linger=yes\n")}, calls), user="hermes")
+    assert rep.items == [] and calls == [["loginctl", "show-user", "hermes", "-p", "Linger"]]
+    rep = kd.Report()
+    kd.check_linger(rep, runner({"loginctl": (0, "Linger=no\n")}), user="hermes")
+    assert rep.items[0]["level"] == kd.WARN and rep.items[0]["fix"] == "sudo loginctl enable-linger hermes"
+    rep = kd.Report()
+    kd.check_linger(rep, runner({"loginctl": (1, "Failed to get user: User ID 1001 is not logged in or lingering")}),
+                    user="hermes")
+    assert rep.items[0]["level"] == kd.WARN and "not logged in or lingering" in rep.items[0]["message"]
+    rep = kd.Report()
+    kd.check_linger(rep, runner({"loginctl": FileNotFoundError(2, "loginctl")}), user="hermes")
+    assert [i["level"] for i in rep.items] == [kd.INFO] and rep.errors == 0          # tanpa loginctl: ditoleransi
+
+
+def test_timers_collect_always_report_only_when_configured(env):
+    team, _root, tmp = env
+    calls = []
+    rep = kd.Report()
+    kd.check_timers(team, rep, runner({"hermes-usage-collect.timer": (0, "enabled\n"),
+                                       "hermes-sandbox-idle.timer": (0, "enabled\n")}, calls))
+    assert rep.items == []
+    assert [c[-1] for c in calls] == ["hermes-usage-collect.timer", "hermes-sandbox-idle.timer"]
+    assert calls[0][:3] == ["systemctl", "--user", "is-enabled"]
+
+    rep = kd.Report()
+    kd.check_timers(team, rep, runner({}))
+    levels = {i["message"].split()[1]: i["level"] for i in rep.items}
+    assert levels == {"hermes-usage-collect.timer": kd.WARN, "hermes-sandbox-idle.timer": kd.INFO}
+    fix = rep.items[0]["fix"]
+    assert fix.startswith("mkdir -p ~/.config/systemd/user && cp ")
+    assert f"{kd.KIT_DIR}/systemd/hermes-usage-collect.*" in fix and "enable --now hermes-usage-collect.timer" in fix
+
+    raw = dict(TEAM, usage={"report_channel_id": "400000000000000002", "reports": {"daily": "08:00"}})
+    (tmp / "team" / "team.yaml").write_text(yaml.safe_dump(raw))
+    with_reports = ht.load_team(tmp / "team" / "team.yaml")
+    calls.clear()
+    rep = kd.Report()
+    kd.check_timers(with_reports, rep, runner({"hermes-usage-collect.timer": (0, "enabled\n"),
+                                               "hermes-usage-report.timer": (1, "disabled\n")}, calls))
+    assert "hermes-usage-report.timer" in [c[-1] for c in calls]
+    item = next(i for i in rep.items if "hermes-usage-report.timer" in i["message"])
+    assert item["level"] == kd.WARN and "(disabled)" in item["message"] and "hermes-usage-report.timer" in item["fix"]
+
+
+def test_timers_tolerate_missing_systemctl_and_missing_user_bus(env):
+    team, *_ = env
+    rep = kd.Report()
+    kd.check_timers(team, rep, runner({"hermes-usage-collect.timer": FileNotFoundError(2, "systemctl")}))
+    assert [i["level"] for i in rep.items] == [kd.INFO]
+    rep = kd.Report()
+    kd.check_timers(team, rep, runner({"hermes-usage-collect.timer": (1, "Failed to connect to bus: No medium found")}))
+    assert [i["level"] for i in rep.items] == [kd.INFO] and rep.errors == 0
+
+
+def test_usage_fix_creates_the_user_unit_directory(env):
+    team, *_ = env
+    rep = kd.Report()
+    kd.check_usage(team, rep)
+    assert rep.items[0]["fix"].startswith("pasang timer: mkdir -p ~/.config/systemd/user && cp ")
+
+
+def test_main_runs_system_checks_with_injected_runner(env, monkeypatch, capsys):
+    team, root, tmp = env
+    sync(team, root)
+    folder = tmp / "etc-hermes"
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(folder))
+    monkeypatch.setenv("HERMES_TEAM_ALLOW_PLACEHOLDERS", "1")
+    calls = []
+    run = runner({"loginctl": (0, "Linger=yes"), "hermes-usage-collect.timer": (0, "enabled"),
+                  "hermes-sandbox-idle.timer": (0, "enabled")}, calls)
+    argv = ["--config", team["paths"]["team_file"], "--members", team["paths"]["members_file"],
+            "--hermes-root", str(root), "--format", "json"]
+    assert kd.main(argv, run=run) == 1                                   # managed belum terpasang → error
+    out = json.loads(capsys.readouterr().out)
+    assert [i["area"] for i in out["items"] if i["level"] == "error"] == ["managed"]
+    assert {c[0] for c in calls} == {"loginctl", "systemctl"}
+    ht.install_managed(team, target_dir=folder, euid=0)
+    assert kd.main(argv, run=run) == 0
+
+
+# ----------------------------------------------------------------------------- preflight Discord (--discord)
+import fake_discord as fd  # noqa: E402
+
+BOT_ROLE = "200000000000000099"
+NEEDED = ("MANAGE_ROLES", "MANAGE_CHANNELS", "VIEW_AUDIT_LOG", "MANAGE_MESSAGES", "MANAGE_THREADS",
+          "CREATE_PUBLIC_THREADS", "SEND_MESSAGES_IN_THREADS")
+
+
+@pytest.fixture
+def server(monkeypatch):
+    state, base, srv = fd.start()
+    monkeypatch.setenv("TEAMCTL_DISCORD_API", base)
+    yield state, ht.DiscordAPI("token-tiruan", sleep=lambda _s: None)
+    srv.shutdown()
+    srv.server_close()
+
+
+def healthy(state):
+    """Server tiruan dalam kondisi yang diminta kit: izin bot lengkap, channel bersama tertutup untuk @everyone."""
+    state.roles[BOT_ROLE]["permissions"] = str(sum(ht.PERM[p] for p in NEEDED))
+    hidden = {"id": fd.GUILD, "type": 0, "allow": "0", "deny": str(ht.PERM["VIEW_CHANNEL"])}
+    bot = {"id": fd.BOT, "type": 1, "allow": str(ht.PERM["VIEW_CHANNEL"] | ht.PERM["SEND_MESSAGES"]), "deny": "0"}
+    for cid in (fd.CH_SHARED, fd.CH_ADMIN):
+        state.channels[cid]["permission_overwrites"] = [dict(hidden), dict(bot)]
+
+
+def preflight(team, api):
+    rep = kd.Report()
+    ok = kd.check_discord_setup(team, rep, ht, api)
+    return rep, ok
+
+
+def team_with(tmp, **extra):
+    raw = dict(TEAM, roles={**TEAM["roles"], "entry": fd.ROLE_ENTRY}, **extra)
+    (tmp / "team" / "team.yaml").write_text(yaml.safe_dump(raw))
+    (tmp / "team" / "members.yaml").write_text("members: []\n")           # preflight tidak butuh anggota
+    return ht.load_team(tmp / "team" / "team.yaml")
+
+
+def errors_of(rep):
+    return [i["message"] for i in rep.items if i["level"] == kd.ERROR]
+
+
+def test_preflight_clean_server_has_no_findings_even_without_members(env, server):
+    state, api = server
+    healthy(state)
+    team = team_with(env[2])
+    assert team["members"] == []
+    rep, ok = preflight(team, api)
+    assert ok is True and rep.items == [], rep.render()
+    assert state.calls and not [c for c in state.calls if c["method"] != "GET"]     # hanya membaca
+
+
+def test_preflight_invalid_token_stops_early_with_fix(env, server):
+    state, api = server
+    state.fault("GET", "/users/@me", status=401, body={"message": "401: Unauthorized", "code": 0})
+    rep, ok = preflight(team_with(env[2]), api)
+    assert ok is False and len(rep.items) == 1
+    assert "token bot ditolak" in rep.items[0]["message"] and "DISCORD_BOT_TOKEN" in rep.items[0]["fix"]
+
+
+def test_preflight_bot_not_in_guild(env, server):
+    state, api = server
+    del state.members[fd.BOT]
+    rep, ok = preflight(team_with(env[2]), api)
+    assert ok is False and "belum ada di server" in rep.items[0]["message"] and "OAuth2" in rep.items[0]["fix"]
+
+
+def test_preflight_missing_roles_and_role_hierarchy(env, server):
+    state, api = server
+    healthy(state)
+    del state.roles[fd.ROLE_ADMIN]
+    state.roles[fd.ROLE_MEMBER]["position"] = 9                          # di atas role bot (posisi 7)
+    state.roles[fd.ROLE_ENTRY]["position"] = 7                           # sejajar = tetap tidak bisa dikelola
+    rep, _ = preflight(team_with(env[2]), api)
+    found = errors_of(rep)
+    assert any("role roles.admin" in m and "tidak ada" in m for m in found)
+    above = [i for i in rep.items if "tidak berada di ATAS" in i["message"]]
+    assert sorted(i["message"].split("ATAS ")[1].split(" ")[0] for i in above) == ["roles.entry", "roles.member"]
+    assert all("drag-and-drop" in i["fix"] and "ATAS" in i["fix"] for i in above)
+    assert len(found) == 3
+
+
+def test_preflight_guild_permissions_are_computed_from_roles(env, server):
+    state, api = server
+    healthy(state)
+    state.roles[BOT_ROLE]["permissions"] = str(ht.PERM["MANAGE_ROLES"] | ht.PERM["MANAGE_THREADS"])
+    state.roles[fd.GUILD]["permissions"] = str(int(state.roles[fd.GUILD]["permissions"])
+                                               | ht.PERM["CREATE_PUBLIC_THREADS"])   # dari @everyone juga dihitung
+    rep, _ = preflight(team_with(env[2]), api)
+    missing = sorted(m.split("izin ")[1].split(" (")[0] for m in errors_of(rep) if "tidak punya izin" in m)
+    assert missing == ["Manage Channels", "Manage Messages", "Send Messages in Threads", "View Audit Log"]
+    assert all("Server Settings → Roles" in i["fix"] for i in rep.items)
+    # fitur yang memakainya dimatikan → peringatan, bukan error
+    team = team_with(env[2], onboarding={"verify_actor": False}, secrets={"delete_secret_messages": False})
+    rep, _ = preflight(team, api)
+    soft = sorted(i["message"].split("izin ")[1].split(" (")[0] for i in rep.items if i["level"] == kd.WARN)
+    assert soft == ["Manage Messages", "View Audit Log"]
+    # Administrator mencakup semuanya (termasuk izin channel)
+    state.roles[BOT_ROLE]["permissions"] = str(ht.PERM["ADMINISTRATOR"])
+    for cid in (fd.CH_SHARED, fd.CH_ADMIN):
+        state.channels[cid]["permission_overwrites"] = state.channels[cid]["permission_overwrites"][:1]
+    rep, _ = preflight(team_with(env[2]), api)
+    assert rep.items == []
+
+
+def test_preflight_category_missing_wrong_type_and_full(env, server):
+    state, api = server
+    healthy(state)
+    rep, _ = preflight(team_with(env[2], category_id="400000000000000077"), api)
+    assert any("category_id 400000000000000077 tidak ada" in m for m in errors_of(rep))
+    rep, _ = preflight(team_with(env[2], category_id=fd.CH_GENERAL), api)
+    assert any("bukan kategori" in m for m in errors_of(rep))
+    for n in range(46):                                                   # 4 bawaan + 46 = 50
+        state.add_channel(720000000000000000 + n, f"hermes-x{n}")
+    rep, _ = preflight(team_with(env[2]), api)
+    full = [i for i in rep.items if "sudah berisi 50 channel" in i["message"]]
+    assert len(full) == 1 and full[0]["level"] == kd.ERROR and "kategori baru" in full[0]["fix"]
+    del state.channels["720000000000000000"]
+    rep, _ = preflight(team_with(env[2]), api)
+    assert rep.errors == 0 and any("hampir penuh: 49/50" in i["message"] for i in rep.items)
+
+
+def test_preflight_shared_and_admin_channels(env, server):
+    state, api = server
+    healthy(state)
+    # seperti bawaan server tiruan: #hermes-shared tanpa overwrite → terlihat @everyone
+    state.channels[fd.CH_SHARED]["permission_overwrites"] = []
+    # admin: tertutup untuk @everyone, tetapi bot tidak diberi izin → bot tidak bisa melihat/mengirim
+    state.channels[fd.CH_ADMIN]["permission_overwrites"] = state.channels[fd.CH_ADMIN]["permission_overwrites"][:1]
+    rep, _ = preflight(team_with(env[2]), api)
+    found = errors_of(rep)
+    assert len(found) == 2
+    assert any("shared.channel_id #hermes-shared bisa dilihat @everyone" in m for m in found)
+    assert any("bot tidak bisa View Channel / Send Messages di admin.channel_id" in m for m in found)
+    assert any("matikan View Channel" in i["fix"] for i in rep.items)
+
+    healthy(state)
+    state.channels[fd.CH_SHARED]["type"] = 2
+    del state.channels[fd.CH_ADMIN]
+    rep, _ = preflight(team_with(env[2]), api)
+    found = errors_of(rep)
+    assert any("shared.channel_id" in m and "bukan channel teks" in m for m in found)
+    assert any("admin.channel_id" in m and "tidak ada" in m for m in found)
+
+
+def test_preflight_channel_in_another_guild(env, server):
+    state, api = server
+    healthy(state)
+    other = dict(state.channels.pop(fd.CH_SHARED), guild_id="111111111111111111")
+
+    class OtherGuild:
+        """Fake server hanya punya satu guild: channel milik server lain ditiru di lapisan API."""
+        def __getattr__(self, name):
+            return getattr(api, name)
+
+        def get_channel(self, cid):
+            return other if cid == fd.CH_SHARED else api.get_channel(cid)
+
+    rep, _ = preflight(team_with(env[2]), OtherGuild())
+    assert any("bukan di server tim (guild 111111111111111111)" in m for m in errors_of(rep))
+
+
+def test_preflight_report_channel_must_exist_and_be_writable(env, server):
+    state, api = server
+    healthy(state)
+    report = "730000000000000001"
+    usage = {"report_channel_id": report, "reports": {"daily": "08:00"}}
+    rep, _ = preflight(team_with(env[2], usage=usage), api)
+    assert any("usage.report_channel_id" in m and "tidak ada" in m for m in errors_of(rep))
+    state.add_channel(report, "hermes-usage", overwrites=[
+        {"id": fd.GUILD, "type": 0, "allow": "0", "deny": str(ht.PERM["VIEW_CHANNEL"])},
+        {"id": BOT_ROLE, "type": 0, "allow": str(ht.PERM["VIEW_CHANNEL"]), "deny": str(ht.PERM["SEND_MESSAGES"])}])
+    rep, _ = preflight(team_with(env[2], usage=usage), api)
+    found = errors_of(rep)
+    assert len(found) == 1 and "bot tidak bisa Send Messages di usage.report_channel_id #hermes-usage" in found[0]
+    state.channels[report]["permission_overwrites"][1]["deny"] = "0"
+    state.channels[report]["permission_overwrites"][1]["allow"] = str(ht.PERM["VIEW_CHANNEL"] | ht.PERM["SEND_MESSAGES"])
+    rep, _ = preflight(team_with(env[2], usage=usage), api)
+    assert rep.items == []
+    # channel laporan yang terbuka untuk semua bukan kesalahan (boleh channel umum); pakai channel admin → tidak dobel
+    rep, _ = preflight(team_with(env[2], usage={"report_channel_id": fd.CH_ADMIN}), api)
+    assert rep.items == []
+
+
+def test_main_discord_runs_preflight_before_gateway_and_with_no_members(env, server, monkeypatch, capsys):
+    state, api = server
+    team, root, tmp = env
+    team = team_with(tmp)
+    sync(team, root)
+    folder = tmp / "etc-hermes"
+    ht.install_managed(team, target_dir=folder, euid=0)
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(folder))
+    monkeypatch.setenv("HERMES_TEAM_ALLOW_PLACEHOLDERS", "1")
+    run = runner({"loginctl": (0, "Linger=yes"), "hermes-usage-collect.timer": (0, "enabled"),
+                  "hermes-sandbox-idle.timer": (0, "enabled")})
+    argv = ["--config", team["paths"]["team_file"], "--hermes-root", str(root), "--format", "json", "--discord"]
+    assert kd.main(argv, run=run, api=api) == 1                           # server tiruan bawaan: banyak temuan
+    items = json.loads(capsys.readouterr().out)["items"]
+    assert sum(1 for i in items if i["area"] == "discord" and i["level"] == "error") >= 5
+    assert all(i["fix"] for i in items if i["area"] == "discord")         # tiap kegagalan menyebut perbaikannya
+    healthy(state)
+    assert kd.main(argv, run=run, api=api) == 0
+    # tanpa token sama sekali: satu error yang jelas, bukan traceback
+    assert kd.main(argv, run=run) == 1
+    assert "DISCORD_BOT_TOKEN" in capsys.readouterr().out

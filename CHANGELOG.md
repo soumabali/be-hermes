@@ -57,7 +57,7 @@ Hasil audit kepraktisan operator. Yang bertanda **PERILAKU BERUBAH** terasa oleh
   `/bin/sh` (`exec <python> -I -c …`) tidak dikenali, dan direktori sumber Hermes tidak ada di `PYTHONPATH`.
 - `kit_doctor.py --discord` tidak memeriksa apa pun saat `members: []`.
 
-## [3.1.0] - 2026-11-13
+## [3.1.0]
 
 Dirangkum dari riwayat git sejak baseline v3 (`Impor kit Hermes tim v3`).
 

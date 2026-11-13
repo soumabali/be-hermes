@@ -352,3 +352,88 @@ def test_load_members_and_cli_roundtrip(env, tmp_path, capsys, monkeypatch):
     json.loads(capsys.readouterr().out)
     assert ul.main(["--ledger", str(tmp_path / "x.db"), "--hermes-root", str(tmp_path / "kosong"),
                     "report", "--no-collect"]) == 2
+
+
+# ----------------------------------------------------------------------------- profile_prefix dari team.yaml
+def team_folder(tmp_path, prefix_line, members):
+    folder = tmp_path / "tim"
+    folder.mkdir(exist_ok=True)
+    (folder / "team.yaml").write_text(f"team_name: X\n{prefix_line}usage: {{timezone: UTC}}\n")
+    (folder / "members.yaml").write_text(members)
+    return folder
+
+
+def test_profile_prefix_is_read_from_team_yaml_not_members_yaml(env, tmp_path, monkeypatch):
+    """Regresi: prefix dibaca dari members.yaml (selalu jatuh ke "be-"), jadi dengan prefix lain pemakaian
+    sesi tanpa pengirim (cron/subagent) di profile anggota tercatat sebagai `profile:<nama>`, bukan orangnya."""
+    monkeypatch.delenv("HERMES_TEAM_DIR", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path / "rumah-kosong"))
+    members = (f"profile_prefix: salah-\nmembers:\n  - {{name: andi, discord_user_id: '{ANDI}'}}\n"
+               f"  - {{name: budi, discord_user_id: '{BUDI}', profile: khusus}}\n")
+    folder = team_folder(tmp_path, "profile_prefix: 'ops-'\n", members)
+    owners, people = ul.load_members(folder / "members.yaml")
+    assert owners == {"ops-andi": ANDI, "khusus": BUDI}                  # field `profile` eksplisit menang
+    assert people[ANDI]["name"] == "andi"
+    assert ul.team_profile_prefix(folder / "team.yaml") == "ops-"
+
+    root, ledger = env
+    Profile(root, "ops-andi").usage("cron-1", 3, 900, 100, ts(2026, 11, 10))          # sesi tanpa pengirim
+    Profile(root, "be-andi").usage("lama", 1, 5, 5, ts(2026, 11, 10))                 # profile berawalan bawaan: bukan milik andi
+    ul.collect(ledger, root, owners=owners, now=ts(2026, 11, 10), tz=UTC)
+    rep = ul.query(ledger, date(2026, 11, 10), date(2026, 11, 10), people=people)
+    by_key = {u["user_key"]: u["total"]["requests"] for u in rep["users"]}
+    assert by_key == {ANDI: 3, "profile:be-andi": 1}
+
+
+def test_prefix_resolution_order_and_edge_values(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path / "rumah-kosong"))
+    one = f"members:\n  - {{name: andi, discord_user_id: '{ANDI}'}}\n"
+    # tanpa key → "be-"; string kosong sah (profile = nama anggota), sama dengan hermes_team.load_team
+    folder = team_folder(tmp_path, "", one)
+    monkeypatch.delenv("HERMES_TEAM_DIR", raising=False)
+    assert ul.load_members(folder / "members.yaml")[0] == {"be-andi": ANDI}
+    team_folder(tmp_path, "profile_prefix: ''\n", one)
+    assert ul.load_members(folder / "members.yaml")[0] == {"andi": ANDI}
+    # members.yaml di luar folder tim → team.yaml dari HERMES_TEAM_DIR (kit_paths)
+    team_folder(tmp_path, "profile_prefix: 'qa-'\n", one)
+    stray = tmp_path / "lain" / "members.yaml"
+    stray.parent.mkdir()
+    stray.write_text(one)
+    assert ul.load_members(stray)[0] == {"be-andi": ANDI}                # tanpa HERMES_TEAM_DIR: bawaan
+    monkeypatch.setenv("HERMES_TEAM_DIR", str(folder))
+    assert ul.load_members(stray)[0] == {"qa-andi": ANDI}
+    assert ul.load_members(stray, prefix="x-")[0] == {"x-andi": ANDI}    # argumen eksplisit menang
+    assert ul.default_ledger_path() == folder / "state" / "usage.db"
+    assert ul.team_timezone() == "UTC"
+
+
+def test_ledger_agrees_with_hermes_team_on_profile_names(tmp_path, monkeypatch):
+    """Pemetaan anggota → profile di buku besar harus sama dengan yang dipakai `apply`."""
+    import yaml
+    import hermes_team as ht
+    raw = yaml.safe_load((Path(ht.__file__).parent / "team.example.yaml").read_text(encoding="utf-8"))
+    raw["profile_prefix"] = "tim-"
+    raw["template_profile"] = "tim-template"
+    folder = tmp_path / "tim"
+    folder.mkdir()
+    (folder / "team.yaml").write_text(yaml.safe_dump(raw))
+    (folder / "members.yaml").write_text(
+        f"members:\n  - {{name: andi, discord_user_id: '{ANDI}', channel_id: '600000000000000001'}}\n")
+    team = ht.load_team(folder / "team.yaml")
+    owners, _ = ul.load_members(folder / "members.yaml")
+    assert owners == {m["profile"]: m["user_id"] for m in team["members"]} == {"tim-andi": ANDI}
+
+
+def test_cli_uses_team_folder_defaults(env, tmp_path, monkeypatch, capsys):
+    root, _ = env
+    folder = team_folder(tmp_path, "profile_prefix: 'ops-'\n",
+                         f"members:\n  - {{name: andi, display_name: Andi P, discord_user_id: '{ANDI}'}}\n")
+    monkeypatch.setenv("HERMES_TEAM_DIR", str(folder))
+    import time
+    Profile(root, "ops-andi").usage("cron-1", 2, 100, 10, time.time())
+    assert ul.main(["--hermes-root", str(root), "collect"]) == 0
+    capsys.readouterr()
+    assert (folder / "state" / "usage.db").exists()
+    assert ul.main(["--hermes-root", str(root), "report", "--period", "month", "--format", "json", "--no-collect"]) == 0
+    users = json.loads(capsys.readouterr().out)["users"]
+    assert [(u["user_key"], u["display_name"]) for u in users] == [(ANDI, "Andi P")]

@@ -624,7 +624,9 @@ def check_discord_setup(team: dict, rep: Report, ht: Any, api: Any) -> bool:
                     "dilayani profile itu",
                     f"{edit} → @everyone: matikan View Channel; lalu beri View Channel ke {who} dan ke bot")
         mine = channel_permissions(base, ch, guild, my_roles, bot_id, ht)
-        lacking = [label for bit, label in ((view, "View Channel"), (send, "Send Messages")) if not mine & bit]
+        # Aturan Discord: tanpa View Channel, Send Messages ikut tidak berlaku (izin implisit).
+        lacking = [label for bit, label in ((view, "View Channel"), (send, "Send Messages"))
+                   if not mine & bit or not mine & view]
         if lacking:
             rep.add(ERROR, "discord", f"bot tidak bisa {' / '.join(lacking)} di {key} #{ch.get('name')}",
                     f"{edit} → tambah bot (atau role-nya) → izinkan View Channel dan Send Messages")

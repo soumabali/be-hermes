@@ -88,3 +88,44 @@ def test_cli_rejects_nonpositive_days(tmp_path, capsys):
         assert exc.code == 2
     else:
         raise AssertionError("harus keluar dengan kode 2")
+
+
+# ----------------------------------------------------------------------------- pembungkus tipis usage_ledger
+def test_reuses_ledger_helpers_instead_of_duplicating_them():
+    import usage_ledger as ul
+    assert ur._profile_dirs is ul.profile_homes and ur._fmt_tokens is ul._n
+    source = Path(ur.__file__).read_text(encoding="utf-8")
+    assert 'get("profile_prefix")' not in source                         # pemetaan prefix hanya ada di usage_ledger
+    assert "iterdir" not in source
+
+
+def test_owner_names_follow_team_yaml_prefix(tmp_path):
+    folder = tmp_path / "tim"
+    folder.mkdir()
+    (folder / "team.yaml").write_text("profile_prefix: 'ops-'\n")
+    (folder / "members.yaml").write_text(
+        "profile_prefix: salah-\nmembers:\n  - {name: andi, display_name: Andi P}\n  - {name: budi, profile: custom-budi}\n")
+    assert ur._owners_from(str(folder / "members.yaml")) == {"ops-andi": "Andi P", "custom-budi": "budi"}
+    assert ur._owners_from(None) == {}
+
+
+def test_cli_output_is_stable_and_defaults_to_team_members(tmp_path, monkeypatch, capsys):
+    import time
+    folder = tmp_path / "tim"
+    folder.mkdir()
+    (folder / "team.yaml").write_text("profile_prefix: 'ops-'\n")
+    (folder / "members.yaml").write_text("members:\n  - {name: andi, display_name: Andi P}\n")
+    monkeypatch.setenv("HERMES_TEAM_DIR", str(folder))
+    root = tmp_path / "hermes"
+    make_db(root / "profiles" / "ops-andi", [("s", "m", 2, 1500, 20, 0.5, 0, time.time() - 60)])
+    make_db(root / "profiles" / "be-lain", [("s", "m", 1, 10, 1, 0.1, 0, time.time() - 60)])
+    assert ur.main(["--hermes-root", str(root)]) == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[0] == "Pemakaian LLM 7 hari terakhir"
+    assert lines[2].split() == ["Profile", "Pemilik", "Panggilan", "Token", "masuk", "Token", "keluar", "Biaya", "(USD)"]
+    assert lines[3].split() == ["ops-andi", "Andi", "P", "2", "1.5k", "20", "0.5000"]
+    assert lines[4].split() == ["be-lain", "-", "1", "10", "1", "0.1000"]
+    assert lines[5].split()[0] == "TOTAL"
+    assert ur.main(["--hermes-root", str(root), "--format", "json", "--members-file", str(tmp_path / "nope.yaml")]) == 0
+    data = json.loads(capsys.readouterr().out)
+    assert set(data) == {"period", "profiles", "totals", "skipped"} and data["profiles"][0]["owner"] == ""

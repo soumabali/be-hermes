@@ -64,3 +64,4 @@ jobs:
         env:
           PYTHONPATH: ${{ github.workspace }}/.hermes-src
           KIT_REQUIRE_HERMES: "1"
+          HERMES_SOURCE_DIR: ${{ github.workspace }}/.hermes-src   # uji drift nama env /env-set

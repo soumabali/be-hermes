@@ -5,6 +5,7 @@ membalas 429 bila permintaan paralel melebihi N; perintah docker ditiru lewat fu
 """
 import importlib.util
 import json
+import os
 import sys
 import threading
 import time
@@ -311,9 +312,16 @@ TOP_BUSY = "PID                 TIME\n101                 00:00:03\n102         
 HOUR = 3600.0
 
 
+CPU_STAT = "usage_usec {usec}\nuser_usec 1\nsystem_usec 2\nnr_periods 0\n"
+
+
 class FakeDocker:
-    def __init__(self, ps=PS, tops=None, ps_code=0, stop_code=0):
+    """`cpu`: id → usage_usec kumulatif cgroup (bawaan 5 detik, tidak berubah); None = tidak terbaca.
+    `v1=True` meniru cgroup v1 (cpu.stat tanpa usage_usec; cpuacct.usage dalam nanodetik)."""
+
+    def __init__(self, ps=PS, tops=None, ps_code=0, stop_code=0, cpu=None, v1=False):
         self.ps, self.tops, self.ps_code, self.stop_code = ps, tops or {}, ps_code, stop_code
+        self.cpu, self.v1 = cpu or {}, v1
         self.calls = []
 
     def __call__(self, cmd):
@@ -323,6 +331,15 @@ class FakeDocker:
         if cmd[:2] == ["docker", "top"]:
             out = self.tops.get(cmd[2], TOP_QUIET)
             return (1, "container tidak berjalan") if out is None else (0, out)
+        if cmd[:2] == ["docker", "exec"]:
+            usec = self.cpu.get(cmd[2], 5_000_000)
+            if usec is None or cmd[3] != "cat":
+                return 1, "OCI runtime exec failed"
+            if cmd[4] == "/sys/fs/cgroup/cpu.stat":
+                return (1, "cat: No such file") if self.v1 else (0, CPU_STAT.format(usec=usec))
+            if cmd[4] == "/sys/fs/cgroup/cpuacct/cpuacct.usage" and self.v1:
+                return 0, f"{usec * 1000}\n"
+            return 1, "cat: No such file"
         if cmd[:2] == ["docker", "stop"]:
             return self.stop_code, "" if self.stop_code == 0 else "Error: permission denied"
         return 1, "perintah tak terduga"
@@ -335,47 +352,146 @@ def sweep(docker, state_file, now, **kw):
     lines = []
     kw.setdefault("idle_hours", 6)
     kw.setdefault("apply", True)
+    kw.setdefault("read_file", lambda _path: None)                           # cgroup host tidak terbaca → docker exec
     code = idle.sweep(docker, state_file, now=now, out=lines.append, **kw)
     return code, "\n".join(lines)
 
 
 class TestSandboxIdleSelection:
-    def containers(self, **fingerprints):
-        return [{"id": cid, "profile": f"be-{cid}", "name": cid, "fingerprint": fp} for cid, fp in fingerprints.items()]
+    def containers(self, cpu=7, source="host", **fingerprints):
+        return [{"id": cid, "profile": f"be-{cid}", "name": cid, "fingerprint": fp, "cpu_usec": cpu,
+                 "cpu_source": source} for cid, fp in fingerprints.items()]
+
+    @staticmethod
+    def seen(fingerprint="f1", since=0.0, cpu=7, profile="be-a"):
+        return {"fingerprint": fingerprint, "cpu_usec": cpu, "since": since, "profile": profile}
 
     def test_first_sighting_is_never_idle(self):
         chosen, state = idle.select_idle(self.containers(a="f1"), {}, now=1000.0, idle_seconds=6 * HOUR)
-        assert chosen == [] and state == {"a": {"fingerprint": "f1", "since": 1000.0, "profile": "be-a"}}
+        assert chosen == [] and state == {"a": self.seen(since=1000.0)}
 
     def test_unchanged_fingerprint_becomes_idle_after_threshold(self):
-        state = {"a": {"fingerprint": "f1", "since": 0.0, "profile": "be-a"}}
+        state = {"a": self.seen()}
         chosen, new = idle.select_idle(self.containers(a="f1"), state, now=6 * HOUR - 1, idle_seconds=6 * HOUR)
         assert chosen == [] and new["a"]["since"] == 0.0                         # belum cukup lama; jam tidak diulang
         chosen, new = idle.select_idle(self.containers(a="f1"), state, now=6 * HOUR, idle_seconds=6 * HOUR)
         assert [c["id"] for c in chosen] == ["a"] and chosen[0]["idle_seconds"] == 6 * HOUR
 
     def test_any_cpu_change_restarts_the_clock(self):
-        state = {"a": {"fingerprint": "f1", "since": 0.0, "profile": "be-a"}}
+        state = {"a": self.seen()}
         chosen, new = idle.select_idle(self.containers(a="f2"), state, now=100 * HOUR, idle_seconds=6 * HOUR)
-        assert chosen == [] and new["a"] == {"fingerprint": "f2", "since": 100 * HOUR, "profile": "be-a"}
+        assert chosen == [] and new["a"] == self.seen("f2", 100 * HOUR)
+
+    def test_cgroup_cpu_catches_use_that_docker_top_misses(self):
+        """Regresi: (pid, TIME berpresisi 1 detik) yang dicuplik tiap 30 menit bisa SAMA walau container dipakai
+        (perintah singkat lahir dan mati di antara dua cuplikan) → container yang dipakai dianggap menganggur."""
+        state = {"a": self.seen(cpu=5_000_000)}
+        busy = self.containers(cpu=5_000_001, a="f1")                             # sidik jari sama, CPU +1 µs
+        chosen, new = idle.select_idle(busy, state, now=100 * HOUR, idle_seconds=6 * HOUR)
+        assert chosen == [] and new["a"]["since"] == 100 * HOUR and new["a"]["cpu_usec"] == 5_000_001
+        chosen, _ = idle.select_idle(self.containers(cpu=5_000_000, a="f1"), state, now=100 * HOUR,
+                                     idle_seconds=6 * HOUR)
+        assert [c["id"] for c in chosen] == ["a"]                                # benar-benar diam
+
+    def test_exec_sampling_noise_is_tolerated_but_real_use_is_not(self):
+        state = {"a": self.seen(cpu=5_000_000)}
+        noisy = self.containers(cpu=5_000_000 + 200_000, source="exec", a="f1")  # 200 md: biaya `docker exec cat`
+        chosen, new = idle.select_idle(noisy, state, now=7 * HOUR, idle_seconds=6 * HOUR)
+        assert [c["id"] for c in chosen] == ["a"] and new["a"]["cpu_usec"] == 5_200_000
+        used = self.containers(cpu=5_000_000 + 400_000, source="exec", a="f1")
+        assert idle.select_idle(used, state, now=7 * HOUR, idle_seconds=6 * HOUR)[0] == []
+        assert idle.select_idle(noisy, state, now=7 * HOUR, idle_seconds=6 * HOUR, exec_noise_usec=0)[0] == []
+        on_host = self.containers(cpu=5_000_000 + 200_000, source="host", a="f1")  # dari host: tanpa toleransi
+        assert idle.select_idle(on_host, state, now=7 * HOUR, idle_seconds=6 * HOUR)[0] == []
+
+    def test_cpu_counter_going_backwards_means_restarted(self):
+        state = {"a": self.seen(cpu=5_000_000)}
+        chosen, new = idle.select_idle(self.containers(cpu=10, a="f1"), state, now=9 * HOUR, idle_seconds=6 * HOUR)
+        assert chosen == [] and new["a"]["since"] == 9 * HOUR
+
+    def test_state_from_before_cgroup_tracking_restarts_the_clock(self):
+        old = {"a": {"fingerprint": "f1", "since": 0.0, "profile": "be-a"}}       # catatan versi lama
+        chosen, new = idle.select_idle(self.containers(a="f1"), old, now=50 * HOUR, idle_seconds=6 * HOUR)
+        assert chosen == [] and new["a"]["since"] == 50 * HOUR
+
+    def test_recent_state_db_activity_keeps_container_alive(self):
+        """Regresi: profile yang baru saja bercakap (state.db berubah) tidak boleh dihentikan walau CPU diam."""
+        state = {"a": self.seen()}
+        quiet = self.containers(a="f1")
+        quiet[0]["activity"] = 10 * HOUR - 600                                   # 10 menit lalu
+        chosen, new = idle.select_idle(quiet, state, now=10 * HOUR, idle_seconds=6 * HOUR)
+        assert chosen == [] and new["a"]["since"] == 0.0                         # jam CPU tetap; hanya tidak dipilih
+        quiet[0]["activity"] = 10 * HOUR - 7 * HOUR                              # terakhir 7 jam lalu
+        chosen, _ = idle.select_idle(quiet, state, now=10 * HOUR, idle_seconds=6 * HOUR)
+        assert [c["id"] for c in chosen] == ["a"] and chosen[0]["idle_seconds"] == 7 * HOUR
+        quiet[0]["activity"] = None                                              # state.db belum ada → hanya CPU
+        assert len(idle.select_idle(quiet, state, now=10 * HOUR, idle_seconds=6 * HOUR)[0]) == 1
+        quiet[0]["activity_known"] = False                                       # tidak bisa diperiksa → aktif
+        assert idle.select_idle(quiet, state, now=10 * HOUR, idle_seconds=6 * HOUR)[0] == []
 
     def test_unreadable_cpu_is_treated_as_active_and_forgotten(self):
-        state = {"a": {"fingerprint": "f1", "since": 0.0, "profile": "be-a"}}
+        state = {"a": self.seen()}
         chosen, new = idle.select_idle(self.containers(a=None), state, now=100 * HOUR, idle_seconds=6 * HOUR)
+        assert chosen == [] and new == {}
+        chosen, new = idle.select_idle(self.containers(cpu=None, a="f1"), state, now=100 * HOUR,
+                                       idle_seconds=6 * HOUR)                    # cgroup tidak terbaca
         assert chosen == [] and new == {}
 
     def test_excluded_profiles_and_vanished_containers(self):
-        state = {"a": {"fingerprint": "f1", "since": 0.0, "profile": "be-a"},
-                 "gone": {"fingerprint": "x", "since": 0.0, "profile": "be-gone"}}
+        state = {"a": self.seen(), "gone": self.seen("x", profile="be-gone")}
         chosen, new = idle.select_idle(self.containers(a="f1", b="f9"), state, now=10 * HOUR, idle_seconds=6 * HOUR,
                                        exclude=frozenset({"be-a"}))
         assert chosen == [] and set(new) == {"a", "b"} and new["a"]["since"] == 0.0
 
     def test_corrupt_state_entries_are_ignored(self):
-        for bad in ("x", {"fingerprint": "f1"}, {"fingerprint": "f1", "since": "kemarin"},
-                    {"fingerprint": "f1", "since": 9e18}):
+        for bad in ("x", {"fingerprint": "f1"}, {"fingerprint": "f1", "since": "kemarin", "cpu_usec": 7},
+                    {"fingerprint": "f1", "since": 9e18, "cpu_usec": 7},
+                    {"fingerprint": "f1", "since": 0.0, "cpu_usec": "7"}, {"fingerprint": "f1", "since": 0.0,
+                                                                           "cpu_usec": True}):
             chosen, new = idle.select_idle(self.containers(a="f1"), {"a": bad}, now=50 * HOUR, idle_seconds=HOUR)
             assert chosen == [] and new["a"]["since"] == 50 * HOUR
+
+    def test_parse_cpu_usage(self):
+        assert idle.parse_cpu_usage(CPU_STAT.format(usec=123456)) == 123456
+        assert idle.parse_cpu_usage("123456789000\n", 1000) == 123456789           # cgroup v1: nanodetik
+        for bad in ("", None, "user_usec 5\n", "usage_usec banyak\n", "Error response from daemon"):
+            assert idle.parse_cpu_usage(bad) is None
+        assert idle.parse_cpu_usage("bukan angka", 1000) is None
+
+    def test_cpu_usage_prefers_host_cgroup_then_docker_exec(self):
+        cid = "a" * 64
+        host = {f"/sys/fs/cgroup/system.slice/docker-{cid}.scope/cpu.stat": CPU_STAT.format(usec=42)}
+        docker = FakeDocker()
+        assert idle.cpu_usage(docker, cid, host.get) == (42, "host") and docker.calls == []   # tanpa efek samping
+        v1 = {f"/sys/fs/cgroup/cpu,cpuacct/docker/{cid}/cpuacct.usage": "9000000\n"}
+        assert idle.cpu_usage(docker, cid, v1.get) == (9000, "host")
+        docker = FakeDocker(cpu={cid: 77})
+        assert idle.cpu_usage(docker, cid, lambda _p: None) == (77, "exec")
+        assert docker.calls == [["docker", "exec", cid, "cat", "/sys/fs/cgroup/cpu.stat"]]     # hanya `cat`
+        assert idle.cpu_usage(FakeDocker(cpu={cid: 77}, v1=True), cid, lambda _p: None) == (77, "exec")
+        assert idle.cpu_usage(FakeDocker(cpu={cid: None}), cid, lambda _p: None) == (None, "")
+
+    def test_profile_activity_reads_state_db_mtime(self, tmp_path):
+        home = tmp_path / "profiles" / "be-andi"
+        home.mkdir(parents=True)
+        assert idle.profile_activity(tmp_path, "be-andi") == (None, True)        # belum ada state.db
+        (home / "state.db").write_text("x")
+        os.utime(home / "state.db", (1000, 1000))
+        assert idle.profile_activity(tmp_path, "be-andi") == (1000.0, True)
+        (home / "state.db-wal").write_text("x")
+        os.utime(home / "state.db-wal", (2000, 2000))                            # WAL lebih baru → itu yang dipakai
+        assert idle.profile_activity(tmp_path, "be-andi") == (2000.0, True)
+        (tmp_path / "state.db").write_text("x")
+        os.utime(tmp_path / "state.db", (3000, 3000))
+        assert idle.profile_activity(tmp_path, "default") == (3000.0, True)      # profile default = root
+        assert idle.profile_activity(None, "be-andi") == (None, True)            # pemeriksaan dimatikan
+        for odd in ("../x", "a/b", "..", ""):
+            assert idle.profile_activity(tmp_path, odd) == (None, False)         # label aneh → jangan menebak
+
+        def denied(_path):
+            raise PermissionError("Permission denied")
+
+        assert idle.profile_activity(tmp_path, "be-andi", denied) == (None, False)
 
     def test_cpu_fingerprint_changes_with_time_or_process_set(self):
         quiet = idle.cpu_fingerprint(TOP_QUIET)
@@ -406,9 +522,70 @@ class TestSandboxIdleSweep:
         assert "aaa" not in json.loads(state_file.read_text())
         # hanya `stop`: tidak pernah rm/kill/prune, dan `ps` hanya untuk yang berjalan & berlabel
         verbs = {c[1] for c in docker.calls}
-        assert verbs == {"ps", "top", "stop"}
+        assert verbs == {"ps", "top", "exec", "stop"}
+        assert all(c[3] == "cat" and c[4].startswith("/sys/fs/cgroup/") for c in docker.calls if c[1] == "exec")
         ps = docker.calls[0]
         assert "label=hermes-profile" in ps and "status=running" in ps
+
+    def test_container_used_between_samples_is_not_stopped(self, tmp_path):
+        """Regresi ujung-ke-ujung: `docker top` identik di dua jalan, tetapi cgroup mencatat CPU terpakai."""
+        state_file = tmp_path / "sandbox_idle.json"
+        sweep(FakeDocker(cpu={"aaa": 5_000_000}), state_file, now=0.0)
+        docker = FakeDocker(cpu={"aaa": 5_900_000})                              # +0,9 dtk CPU; TIME (1 dtk) sama
+        code, text = sweep(docker, state_file, now=7 * HOUR)
+        assert code == 0 and "aaa" not in docker.stopped() and set(docker.stopped()) == {"bbb", "ccc"}
+        assert "be-andi (hermes-be-andi): aktif atau belum cukup lama diam (0.0 jam)" in text
+        assert json.loads(state_file.read_text())["aaa"] == {
+            "fingerprint": idle.cpu_fingerprint(TOP_QUIET), "cpu_usec": 5_900_000, "since": 7 * HOUR,
+            "profile": "be-andi"}
+
+    def test_profile_with_recent_conversation_is_not_stopped(self, tmp_path):
+        state_file = tmp_path / "sandbox_idle.json"
+        root = tmp_path / "hermes"
+        for profile, age in (("be-andi", 20 * 60), ("be-budi", 9 * HOUR)):
+            home = root / "profiles" / profile
+            home.mkdir(parents=True)
+            (home / "state.db").write_text("x")
+            os.utime(home / "state.db", (8 * HOUR - age, 8 * HOUR - age))
+        sweep(FakeDocker(), state_file, now=0.0, hermes_root=root)
+        docker = FakeDocker()
+        code, text = sweep(docker, state_file, now=8 * HOUR, hermes_root=root)
+        assert code == 0 and docker.stopped() == ["bbb", "ccc"]                  # andi bercakap 20 menit lalu
+        assert "be-andi (hermes-be-andi): profile dipakai 0.3 jam lalu (state.db) → aktif" in text
+        assert "be-budi (hermes-be-budi): diam 8.0 jam → dihentikan" in text     # min(CPU 8 jam, state.db 9 jam)
+
+    def test_unreadable_cgroup_or_state_db_leaves_container_alone(self, tmp_path):
+        state_file = tmp_path / "sandbox_idle.json"
+        sweep(FakeDocker(), state_file, now=0.0)
+        docker = FakeDocker(cpu={"aaa": None})
+        code, text = sweep(docker, state_file, now=9 * HOUR)
+        assert "aaa" not in docker.stopped() and "be-andi (hermes-be-andi): pemakaian CPU" in text
+
+        def denied(path):
+            if "be-budi" in str(path):
+                raise PermissionError("Permission denied")
+            return None
+
+        sweep(FakeDocker(), state_file, now=0.0, hermes_root=tmp_path, mtime=denied)
+        docker = FakeDocker()
+        code, text = sweep(docker, state_file, now=9 * HOUR, hermes_root=tmp_path, mtime=denied)
+        assert "bbb" not in docker.stopped() and "state.db profile tidak bisa diperiksa" in text
+
+    def test_host_cgroup_is_used_without_touching_the_container(self, tmp_path):
+        state_file = tmp_path / "sandbox_idle.json"
+        usage = {"aaa": 100, "bbb": 100, "ccc": 100}
+
+        def read(path):
+            for cid, usec in usage.items():
+                if path == f"/sys/fs/cgroup/system.slice/docker-{cid}.scope/cpu.stat":
+                    return CPU_STAT.format(usec=usec)
+            return None
+
+        sweep(FakeDocker(), state_file, now=0.0, read_file=read)
+        usage["bbb"] = 101                                                       # 1 µs saja → aktif
+        docker = FakeDocker()
+        sweep(docker, state_file, now=7 * HOUR, read_file=read)
+        assert docker.stopped() == ["aaa", "ccc"] and not any(c[1] == "exec" for c in docker.calls)
 
     def test_dry_run_reports_but_never_stops(self, tmp_path):
         state_file = tmp_path / "sandbox_idle.json"
@@ -434,22 +611,28 @@ class TestSandboxIdleSweep:
         sweep(FakeDocker(), state_file, now=0.0)
         docker = FakeDocker(tops={"aaa": None})
         code, text = sweep(docker, state_file, now=9 * HOUR)
-        assert "aaa" not in docker.stopped() and "pemakaian CPU tidak terbaca" in text
+        assert "aaa" not in docker.stopped() and "tidak terbaca → dibiarkan" in text
 
     def test_main_defaults_to_dry_run_and_needs_apply(self, tmp_path, capsys):
         state_file = tmp_path / "sandbox_idle.json"
         state_file.write_text(json.dumps({cid: {"fingerprint": idle.cpu_fingerprint(TOP_QUIET), "since": 0.0,
-                                                "profile": "x"} for cid in ("aaa", "bbb", "ccc")}))
+                                                "cpu_usec": 5_000_000, "profile": "x"}
+                                          for cid in ("aaa", "bbb", "ccc")}))
+        root = tmp_path / "hermes"                                               # tanpa state.db → hanya CPU
+        base = ["--state-file", str(state_file), "--hermes-root", str(root)]
         docker = FakeDocker()
-        assert idle.main(["--state-file", str(state_file)], run=docker) == 0
+        assert idle.main(base, run=docker) == 0
         assert docker.stopped() == [] and "dry-run" in capsys.readouterr().out
         docker = FakeDocker()
-        assert idle.main(["--state-file", str(state_file), "--dry-run", "--idle-hours", "1"], run=docker) == 0
+        assert idle.main(base + ["--dry-run", "--idle-hours", "1"], run=docker) == 0
         assert docker.stopped() == []
+        home = root / "profiles" / "be-budi"
+        home.mkdir(parents=True)
+        (home / "state.db").write_text("x")                                      # budi baru saja bercakap
         docker = FakeDocker()
-        assert idle.main(["--state-file", str(state_file), "--apply", "--exclude", "team-admin, be-budi"],
-                         run=docker) == 0
+        assert idle.main(base + ["--apply", "--exclude", "team-admin"], run=docker) == 0
         assert docker.stopped() == ["aaa"]
+        assert idle.main(base + ["--cpu-noise-ms", "-1"], run=docker) == 2
         assert idle.main(["--idle-hours", "0"], run=docker) == 2
         with pytest.raises(SystemExit):
             idle.main(["--apply", "--dry-run"], run=docker)

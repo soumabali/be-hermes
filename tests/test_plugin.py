@@ -378,6 +378,67 @@ class TestEnvNamePolicy:
         ok, why = secrets.check_env_name("PROD_DB_PASSWORD", deny=["PROD_DB_PASSWORD"], allow=["PROD_DB_PASSWORD"])
         assert not ok and "deny_names" in why
 
+    @pytest.mark.parametrize("name", [
+        # adapter platform lain (menyalakan platform untuk profile sendiri = melewati gerbang Discord)
+        "NTFY_TOPIC", "NTFY_ALLOWED_USERS", "NTFY_SERVER_URL", "IRC_SERVER", "IRC_CHANNEL", "LINE_CHANNEL_SECRET",
+        "WEIXIN_TOKEN", "A2A_BEARER_TOKEN", "A2A_PEER_TOKENS", "WEBHOOK_ENABLED", "MSGRAPH_WEBHOOK_ENABLED",
+        "TWILIO_AUTH_TOKEN", "SMS_ALLOWED_USERS", "WECOM_BOT_ID", "PHOTON_PROJECT_SECRET", "BUZZ_PRIVATE_KEY",
+        "GOOGLE_CHAT_PROJECT_ID", "FEISHU_APP_ID", "DINGTALK_CLIENT_ID", "QQ_APP_ID", "SIMPLEX_WS_URL",
+        # pembelokan lalu lintas LLM / provider
+        "ANTHROPIC_BASE_URL", "OPENAI_API_BASE", "OLLAMA_BASE_URL", "LM_API_KEY", "OPENROUTER_BASE_URL",
+        "KIMI_API_KEY", "MODEL_API_KEY", "LLM_MODEL", "TOOL_GATEWAY_URL", "AWS_REGION", "GITHUB_APP_ID",
+        # bentuk setelan pada namespace yang BELUM dikenal (platform/provider baru di hulu)
+        "NEWPLAT_ALLOWED_USERS", "NEWPLAT_ALLOWED_CHANNELS", "NEWPLAT_ALLOW_ALL_USERS", "NEWPLAT_ENABLED",
+        "NEWPLAT_PORT", "NEWPLAT_HOST", "NEWPLAT_HOME_CHANNEL", "NEWPLAT_HOME_CHANNEL_NAME", "NEWPLAT_WEBHOOK_URL",
+        "NEWPLAT_WEBHOOK", "X_WEBHOOK_SECRET", "NEWLLM_BASE_URL", "NEWLLM_API_BASE",
+        "NEWPLAT_PROXY", "NEWPLAT_REQUIRE_MENTION", "NEWPLAT_FREE_RESPONSE_CHANNELS",
+        # runtime / sistem
+        "HERMES_ANYTHING", "GATEWAY_ANYTHING", "TERMINAL_ANYTHING", "PYTHONSTARTUP", "LD_AUDIT", "PATH", "HOME",
+        "CONDA_PREFIX", "NOTIFY_SOCKET", "GIT_CONFIG_GLOBAL",
+    ])
+    def test_hermes_namespaces_and_setting_shapes_are_rejected_by_pattern(self, name):
+        """Regresi: kebijakan lama berupa daftar tolak statis — 106 dari 184 nama env gateway hulu lolos."""
+        ok, why = secrets.check_env_name(name)
+        assert not ok, name
+        assert "`MY_" in why or "`GH_PAT`" in why                             # selalu ada saran nama aman
+
+    @pytest.mark.parametrize("name", ["GH_PAT", "MY_NTFY_TOPIC", "MY_OPENAI_BASE_URL", "MY_DEPLOY_WEBHOOK_URL",
+                                      "MY_DB_HOST", "STRIPE_API_KEY", "JIRA_TOKEN", "NPM_TOKEN", "SENTRY_DSN",
+                                      "API_TOKEN", "DB_PASSWORD", "DEPLOY_KEY_B64", "HOSTING_TOKEN", "PORTAL_PASS",
+                                      "SUPPORT_KEY", "REPORTING_SECRET"])
+    def test_safe_namespace_and_ordinary_secret_names_stay_allowed(self, name):
+        assert secrets.check_env_name(name) == (True, "")
+
+    def test_suggested_name_always_passes_the_policy(self):
+        for name in sorted(secrets.HERMES_NAMES) + [p + "X" for p in secrets.HERMES_PREFIXES] + [
+                "NEWPLAT_ALLOWED_USERS", "X_WEBHOOK_URL", "DB_HOST", "HERMES_" + "A" * 57, "NEWLLM_BASE_URL"]:
+            if not secrets.ENV_NAME_RE.match(name) or name in secrets.SYSTEM_NAMES:
+                continue
+            ok, why = secrets.check_env_name(name)
+            alt = secrets.suggest_name(name)
+            assert not ok and f"`{alt}`" in why, name
+            assert secrets.check_env_name(alt) == (True, ""), (name, alt)
+
+    def test_allow_names_is_the_admin_escape_hatch_and_deny_is_additive(self):
+        for name in ("NTFY_TOPIC", "NEWPLAT_ENABLED", "ANTHROPIC_BASE_URL", "PYTHONPATH"):
+            assert secrets.check_env_name(name, allow=[name]) == (True, "")
+            assert not secrets.check_env_name(name, allow=[name], deny=[name])[0]
+        assert not secrets.check_env_name("MY_OK_NAME", deny=["MY_OK_NAME"])[0]
+        assert not secrets.check_env_name("NTFY_TOKEN", allow=["NTFY_TOPIC"])[0]      # hanya nama persis
+
+    def test_safe_prefix_never_opens_system_or_reserved_names(self):
+        assert not secrets.check_env_name("MY_TEAM_KEY", reserved=["MY_TEAM_KEY"])[0]
+        assert not secrets.check_env_name("MY_X", upstream=lambda n: True)[0]
+
+    def test_embedded_prefix_data_is_wellformed(self):
+        assert len(secrets.HERMES_PREFIXES) == len(set(secrets.HERMES_PREFIXES)) >= 80
+        assert all(p.endswith("_") and p.upper() == p for p in secrets.HERMES_PREFIXES)
+        assert not any(secrets.SAFE_PREFIX.startswith(p) or p.startswith(secrets.SAFE_PREFIX)
+                       for p in secrets.HERMES_PREFIXES + secrets.SYSTEM_PREFIXES)
+        for must in ("HERMES_", "GATEWAY_", "TERMINAL_", "DISCORD_", "NTFY_", "IRC_", "LINE_", "WEIXIN_", "A2A_",
+                     "ANTHROPIC_", "OPENAI_", "WEBHOOK_"):
+            assert must in secrets.HERMES_PREFIXES
+
     def test_upstream_blocklist_is_consulted_and_fail_safe(self):
         assert not secrets.check_env_name("VENDOR_X_KEY", upstream=lambda n: n == "VENDOR_X_KEY")[0]
         assert secrets.check_env_name("VENDOR_Y_KEY", upstream=lambda n: 1 / 0)[0]
@@ -575,6 +636,34 @@ class TestEnvCommands:
         assert "`GH_PAT`" in text and "`DB_PASSWORD`" in text and "2/40" in text
         assert SECRET not in text and "hunter2" not in text
         assert "Belum ada secret" in run(commands.do_env_list(self._roster(env), "be-be1"))
+        assert "⚠️" not in text
+
+    def test_env_list_flags_stored_names_that_are_now_rejected_without_deleting(self, env):
+        """Nama yang disimpan sebelum kebijakan diperketat tidak dihapus diam-diam: ditandai + saran ganti nama."""
+        store = secrets.SecretStore(env.home("be-budi"), extra_env=())
+        store.set("GH_PAT", SECRET)
+        store.set("NTFY_TOPIC", "topik-rahasia-1")                            # lolos kebijakan lama
+        store.set("DEPLOY_WEBHOOK_URL", "https://hooks.example/abc")
+        roster = self._roster(env)
+        text = run(commands.do_env_list(roster, "be-budi"))
+        assert "• `NTFY_TOPIC` ⚠️" in text and "• `DEPLOY_WEBHOOK_URL` ⚠️" in text and "• `GH_PAT`\n" in text
+        assert "`NTFY_TOPIC` → `MY_NTFY_TOPIC`" in text and "`DEPLOY_WEBHOOK_URL` → `MY_DEPLOY_WEBHOOK_URL`" in text
+        assert "/env-set" in text and "/env-unset" in text and "TIDAK dihapus otomatis" in text
+        assert "topik-rahasia" not in text and "hooks.example" not in text
+        assert store.names() == ["DEPLOY_WEBHOOK_URL", "GH_PAT", "NTFY_TOPIC"]          # tidak ada yang dihapus
+        assert store.read_env()["NTFY_TOPIC"] == "topik-rahasia-1"
+        # tidak bisa diperbarui dengan nama lama, tetapi bisa dihapus dan disimpan ulang dengan nama baru
+        ok, why = run(commands.do_env_set(roster, "be-budi", "NTFY_TOPIC", "nilai-baru-123", S.U_BUDI, store=store))
+        assert not ok and "MY_NTFY_TOPIC" in why and store.read_env()["NTFY_TOPIC"] == "topik-rahasia-1"
+        async def runner(argv, environ):
+            return 0, ""
+
+        assert run(commands.do_env_set(roster, "be-budi", "MY_NTFY_TOPIC", "topik-rahasia-1", S.U_BUDI,
+                                       store=store, runner=runner))[0]
+        assert run(commands.do_env_unset(roster, "be-budi", "NTFY_TOPIC", store=store, runner=runner))[0]
+        assert "⚠️ nama tidak lagi" in run(commands.do_env_list(roster, "be-budi"))      # masih ada satu lagi
+        env.set("settings", allow_names=["DEPLOY_WEBHOOK_URL"])                # admin membukanya → tidak ditandai
+        assert "⚠️" not in run(commands.do_env_list(self._roster(env), "be-budi"))
 
     def test_env_unset(self, env):
         store = secrets.SecretStore(env.home("be-budi"), extra_env=())
@@ -2901,6 +2990,199 @@ class TestMetricsAndAlerts(ScaleBase):
 
 
 # ============================================================================= integrasi (butuh Hermes)
+def upstream_env_names(root) -> dict:
+    """Nama env yang dikenal Hermes, dibaca STATIS dari pohon sumbernya (tanpa menjalankan kode hulu) — cara
+    yang sama dengan yang dipakai menurunkan `secrets.HERMES_PREFIXES` (lihat komentar di secrets.py)."""
+    import ast
+    import glob
+    import re
+    root = str(root)
+    env_call = re.compile(r"""(?:getenv|environ\.get|environ\.pop|environ\.setdefault|env\.get|_env|env_var|"""
+                          r"""get_env_value|getenv_bool|env_bool|env_int|env_str)\(\s*[frb]?["']([A-Z][A-Z0-9_]{2,})["']""")
+    env_sub = re.compile(r"""environ\[\s*["']([A-Z][A-Z0-9_]{2,})["']\s*\]""")
+    literal = re.compile(r"""["']([A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+)["']""")
+    shaped = re.compile(r"[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+")
+    groups: dict = {}
+
+    def read(path):
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            return fh.read()
+
+    def add(group, names):
+        groups.setdefault(group, set()).update(names)
+
+    def lits(node):
+        return [n.value for n in ast.walk(node) if isinstance(n, ast.Constant) and isinstance(n.value, str)
+                and shaped.fullmatch(n.value)]
+
+    def is_test(path):
+        return "/tests/" in path or os.path.basename(path).startswith("test_")
+
+    for path in glob.glob(root + "/plugins/platforms/*/**/*.py", recursive=True):
+        if is_test(path):
+            continue
+        text = read(path)
+        add("platform", env_call.findall(text) + env_sub.findall(text))
+        if os.path.basename(path) == "gateway_env.py":
+            add("platform", literal.findall(text))
+    for path in glob.glob(root + "/plugins/platforms/*/plugin.yaml"):
+        add("platform", re.findall(r"\b([A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+)\b", read(path)))
+    add("platform", [os.path.basename(os.path.dirname(p)).upper() + "_ENABLED"
+                     for p in glob.glob(root + "/plugins/platforms/*/")
+                     if not os.path.basename(os.path.dirname(p)).startswith("_")])
+    for path in ([root + "/gateway/platform_env.py", root + "/gateway/config_env.py"]
+                 + glob.glob(root + "/gateway/platforms/*.py")):
+        if not os.path.exists(path):
+            continue
+        text = read(path)
+        add("gateway", env_call.findall(text) + env_sub.findall(text))
+        if os.path.basename(path) in ("platform_env.py", "config_env.py"):
+            add("gateway", literal.findall(text))
+    for path in (root + "/hermes_cli/config_defaults.py", root + "/hermes_cli/config.py"):
+        if not os.path.exists(path):
+            continue
+        for node in ast.walk(ast.parse(read(path))):
+            target = value = None
+            if isinstance(node, ast.Assign):
+                target, value = node.targets[0], node.value
+            elif isinstance(node, ast.AnnAssign):
+                target, value = node.target, node.value
+            if not isinstance(target, ast.Name) or value is None:
+                continue
+            if target.id == "OPTIONAL_ENV_VARS":
+                table = value.args[0] if isinstance(value, ast.Call) and value.args else value
+                if isinstance(table, ast.Dict):
+                    add("optional", [k.value for k in table.keys
+                                     if isinstance(k, ast.Constant) and isinstance(k.value, str)])
+            elif target.id == "_EXTRA_ENV_KEYS":
+                add("optional", lits(value))
+    keywords = {"api_key_env_vars", "base_url_env_var", "api_key_env_var", "base_url_env_vars", "env_vars",
+                "extra_env_vars"}
+    for sub_dir in ("hermes_cli", "providers", "plugins", "agent"):
+        for path in glob.glob(f"{root}/{sub_dir}/**/*.py", recursive=True):
+            if is_test(path):
+                continue
+            try:
+                tree = ast.parse(read(path))
+            except SyntaxError:
+                continue
+            for node in ast.walk(tree):
+                if isinstance(node, ast.keyword) and node.arg in keywords:
+                    add("provider", lits(node.value))
+                elif isinstance(node, ast.Dict):
+                    for key, value in zip(node.keys, node.values):
+                        if isinstance(key, ast.Constant) and key.value in keywords:
+                            add("provider", lits(value))
+    for path in glob.glob(root + "/tools/environments/local_env_policy*.py"):
+        add("envpolicy", lits(ast.parse(read(path))))
+    return groups
+
+
+class TestIntegrationEnvNames:
+    """Pergeseran hulu: SETIAP nama env yang dikenal Hermes harus ditolak /env-set. Sumber Hermes diambil dari
+    `HERMES_SOURCE_DIR` (pohon sumber, hanya dibaca) atau dari Hermes yang terpasang; tanpa keduanya DILEWATI."""
+
+    @pytest.fixture
+    def source(self):
+        root = os.environ.get("HERMES_SOURCE_DIR")
+        if not root:
+            gateway = pytest.importorskip("gateway", reason="Hermes tidak terpasang — uji integrasi dijalankan di CI")
+            root = os.path.dirname(os.path.dirname(os.path.abspath(gateway.__file__)))
+        if not os.path.isdir(os.path.join(root, "plugins", "platforms")):
+            pytest.skip(f"pohon sumber Hermes tidak lengkap di {root}")
+        return root
+
+    def test_every_upstream_env_name_is_rejected(self, source):
+        groups = upstream_env_names(source)
+        assert len(groups.get("platform", ())) > 150 and len(groups.get("optional", ())) > 100, \
+            "enumerasi hulu menyusut — struktur sumber Hermes berubah, perbarui upstream_env_names()"
+        names = set().union(*groups.values())
+        accepted = sorted(n for n in names if secrets.check_env_name(n)[0])
+        assert accepted == [], (f"{len(accepted)} dari {len(names)} nama env Hermes lolos /env-set — tambahkan "
+                                f"prefiksnya ke secrets.HERMES_PREFIXES / HERMES_NAMES: {accepted}")
+
+    def test_runtime_tables_of_installed_hermes_are_rejected_too(self):
+        """Dengan Hermes terpasang: tabel yang dibangun saat jalan (registri provider, blocklist sandbox)."""
+        pytest.importorskip("gateway", reason="Hermes tidak terpasang — uji integrasi dijalankan di CI")
+        names: set = set()
+        try:
+            from hermes_cli.config import OPTIONAL_ENV_VARS
+            names |= {str(k) for k in OPTIONAL_ENV_VARS}
+        except Exception:
+            pass
+        try:
+            from hermes_cli.auth import PROVIDER_REGISTRY
+            for cfg in PROVIDER_REGISTRY.values():
+                names |= {str(v) for v in getattr(cfg, "api_key_env_vars", ()) or ()}
+                if getattr(cfg, "base_url_env_var", None):
+                    names.add(str(cfg.base_url_env_var))
+        except Exception:
+            pass
+        try:
+            from tools.environments.local_env_policy import _HERMES_PROVIDER_ENV_BLOCKLIST
+            names |= {str(n) for n in _HERMES_PROVIDER_ENV_BLOCKLIST}
+        except Exception:
+            pass
+        names = {n for n in names if secrets.ENV_NAME_RE.match(n)}
+        assert len(names) > 100, "tabel env Hermes tidak bisa dibaca — perbarui uji ini"
+        accepted = sorted(n for n in names if secrets.check_env_name(n)[0])
+        assert accepted == [], accepted
+
+
+class TestIntegrationCommands:
+    """Daftar izin perintah kendali (dispatch.EXEMPT_COMMANDS) diperiksa terhadap sumber Hermes: tiap nama
+    harus perintah gateway yang ditangani handler biasa (bukan yang menulis ulang pesan menjadi giliran)."""
+
+    source = TestIntegrationEnvNames.source
+
+    @staticmethod
+    def _tuple(text, name):
+        import ast
+        import re
+        match = re.search(rf"{name}\s*=\s*(?:frozenset\()?([\(\{{][^\)\}}]*[\)\}}])", text)
+        assert match, f"{name} tidak ditemukan di sumber Hermes"
+        return set(ast.literal_eval(match.group(1)))
+
+    def test_exempt_commands_are_plain_handlers_upstream(self, source):
+        import ast
+        with open(os.path.join(source, "hermes_cli", "commands.py"), encoding="utf-8") as fh:
+            tree = ast.parse(fh.read())
+        canonical: dict = {}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and getattr(node.func, "id", "") == "CommandDef" and node.args \
+                    and isinstance(node.args[0], ast.Constant):
+                name = node.args[0].value
+                canonical[name] = name
+                for kw in node.keywords:
+                    if kw.arg == "aliases":
+                        for alias in ast.literal_eval(kw.value):
+                            canonical[alias] = name
+        with open(os.path.join(source, "gateway", "run_busy.py"), encoding="utf-8") as fh:
+            busy = fh.read()
+        with open(os.path.join(source, "gateway", "run_inbound.py"), encoding="utf-8") as fh:
+            inbound = fh.read()
+        handled = self._tuple(busy, "_PLAIN_COMMANDS") | self._tuple(busy, "_IDLE_COMMANDS")
+        rewriting = self._tuple(inbound, "_HM_CANONICAL_COMMANDS") - {"new", "start", "egress"}
+        starts_turn = rewriting | {"btw", "bg", "retry", "goal", "subgoal", "loop", "heartbeat", "refine", "review",
+                                   "compress", "kanban"}
+        for name in sorted(dispatch.EXEMPT_COMMANDS):
+            assert name in canonical, f"/{name} bukan perintah Hermes lagi"
+            target = canonical[name]
+            assert target in handled or target == "new", f"/{name} tidak lagi ditangani handler biasa"
+            assert target not in starts_turn, f"/{name} memulai giliran LLM — keluarkan dari daftar izin"
+        for name in ("queue", "q", "steer", "btw", "bg", "retry", "plan", "goal", "moa", "learn", "undo"):
+            assert name not in dispatch.EXEMPT_COMMANDS
+
+    def test_parser_matches_real_message_event(self):
+        pytest.importorskip("gateway", reason="Hermes tidak terpasang — uji integrasi dijalankan di CI")
+        from gateway.platforms.event import MessageEvent
+        for text in ("/stop", "  /Stop x", "/approve@hermes always", "/", "/ kerjakan", "/tmp/a jelaskan", "/a/b",
+                     "halo /stop", "", "@file:/tmp/x.txt\n/status", "/btw apa", "/skill-x lakukan"):
+            real = MessageEvent(text=text)
+            assert dispatch.parse_command(text) == real.get_command(), text
+            assert dispatch.event_command(real) == real.get_command(), text
+
+
 class TestIntegrationWithRealHermes:
     """DILEWATI bila Hermes tidak terpasang. Memeriksa asumsi plugin terhadap upstream yang sebenarnya:
     resolver rute, nama hook/middleware, skema manifest, dan pemuat plugin."""
@@ -2982,5 +3264,6 @@ class TestIntegrationWithRealHermes:
         from gateway.run import GatewayRunner, _multiplex_profile_homes
         assert GATEWAY_SERVICE_RESTART_EXIT_CODE == 75 and callable(rescan_gateway_profiles)
         assert callable(_multiplex_profile_homes)
-        for name in ("_running_agent_count", "request_restart", "_hm_pre_gateway_dispatch_hook"):
+        for name in ("_running_agent_count", "request_restart", "_hm_pre_gateway_dispatch_hook",
+                     "_is_session_running", "_session_key_for_source"):
             assert callable(getattr(GatewayRunner, name, None)), name
