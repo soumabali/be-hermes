@@ -328,3 +328,18 @@ def api(discord):
     client = ht.DiscordAPI(BOT_TOKEN, sleep=naps.append)
     client.naps = naps
     return client
+
+
+def pytest_sessionstart(session):
+    """KIT_REQUIRE_HERMES=1 (job integrasi CI): Hermes WAJIB bisa di-import. Tanpa ini uji integrasi
+    diam-diam dilewati dan CI tampak hijau padahal kecocokan dengan Hermes tidak pernah diperiksa."""
+    if os.environ.get("KIT_REQUIRE_HERMES") != "1":
+        return
+    missing = []
+    for name in ("discord", "gateway", "toolsets", "hermes_cli.config_defaults", "hermes_cli.commands"):
+        try:
+            __import__(name)
+        except Exception as exc:
+            missing.append(f"{name} ({type(exc).__name__}: {exc})")
+    if missing:
+        pytest.exit("KIT_REQUIRE_HERMES=1 tetapi Hermes tidak bisa di-import: " + "; ".join(missing), returncode=4)

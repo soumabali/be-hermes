@@ -34,7 +34,8 @@ jobs:
       - run: python -m pytest tests -q
 
   integration:
-    # Uji yang butuh Hermes asli (resolver rute, loader plugin). Di mesin tanpa Hermes uji ini dilewati.
+    # Uji yang butuh Hermes asli (resolver rute, loader plugin, daftar toolset/config). Hermes dipasang
+    # dengan uv dari lockfile-nya sendiri: pip biasa tidak bisa menyelesaikan dependensinya.
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -43,13 +44,23 @@ jobs:
     continue-on-error: ${{ matrix.hermes == 'main' }}
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
         with:
-          python-version: "3.14"   # Hermes hanya mendukung 3.14
-      - name: Pasang Hermes
-        env:
-          REF: ${{ matrix.hermes == 'main' && 'main' || (inputs.hermes_ref || env.HERMES_REF) }}
+          repository: NousResearch/hermes-agent
+          ref: ${{ matrix.hermes == 'main' && 'main' || (inputs.hermes_ref || env.HERMES_REF) }}
+          path: .hermes-src
+      - uses: astral-sh/setup-uv@v5
+      - name: Pasang Hermes (uv, lockfile upstream)
+        working-directory: .hermes-src
         run: |
-          pip install -r requirements-dev.txt
-          pip install "hermes-agent[discord] @ git+https://github.com/NousResearch/hermes-agent.git@${REF}"
-      - run: python -m pytest tests -q -rs
+          uv sync --frozen --extra discord --python 3.14
+          uv pip install --python .venv/bin/python -r ../requirements-dev.txt
+      - name: Hermes bisa di-import
+        run: .hermes-src/.venv/bin/python -c "import gateway, toolsets, hermes_cli.plugins; print('ok')"
+        env:
+          PYTHONPATH: ${{ github.workspace }}/.hermes-src
+      - name: Uji (integrasi tidak boleh dilewati)
+        run: .hermes-src/.venv/bin/python -m pytest tests -q -rs -p no:cacheprovider
+        env:
+          PYTHONPATH: ${{ github.workspace }}/.hermes-src
+          KIT_REQUIRE_HERMES: "1"
