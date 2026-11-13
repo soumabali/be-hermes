@@ -4,9 +4,10 @@ Satu instalasi Hermes, satu bot Discord, satu gateway (mode multiplex), dan **sa
 orang**. Tiap channel dirutekan ke profile-nya, jadi memory, skill, SOUL.md, config, model,
 secret (`.env`), sesi, dan sandbox Docker tiap orang terpisah.
 
-> **Status:** hampir 1.000 uji lulus memakai Discord tiruan dan stub API plugin. Kit **belum pernah
-> dijalankan** terhadap Hermes, Discord, atau Docker sungguhan. Ikuti panduan ini di server uji
-> dulu, dan jalankan `tests/selftest.sh` (Langkah 9) sebelum dipakai tim.
+> **Status:** seluruh uji lulus di CI, termasuk uji integrasi yang memuat plugin dan memeriksa rute,
+> toolset, key konfigurasi, dan perintah slash terhadap **kode Hermes asli** (versi yang dipin dan `main`).
+> Yang **belum pernah dijalankan**: gateway Hermes yang hidup, server Discord sungguhan, sandbox Docker,
+> dan endpoint LLM. Ikuti panduan ini di server uji dulu, dan jalankan `tests/selftest.sh` (Langkah 9).
 
 **Isi:** [Gambaran sistem](#gambaran-sistem) · [Instalasi dari nol](#panduan-instalasi-dari-nol) ·
 [Bila ada yang tidak jalan](#bila-ada-yang-tidak-jalan) · [Upgrade](#upgrade-dari-v30) · [Fitur](#fitur) ·
@@ -1054,9 +1055,9 @@ Yang perlu diketahui admin saat naik dari v3.0:
 - `hold_stream` (opsional, default mati): menahan jawaban AI sampai disamarkan; tanpa itu balasan yang
   mengandung secret bisa terlihat sesaat saat streaming.
 
-> **Belum pernah dijalankan terhadap Hermes/Discord sungguhan.** Seluruh uji lulus memakai Discord tiruan dan stub
-> API plugin; 14 uji integrasi (resolver rute, loader plugin, daftar toolset/config Hermes) hanya jalan di CI
-> atau `selftest.sh` di server yang punya Hermes. Jalankan itu dulu, lalu tes manual §11 di server uji.
+> **Batas pembuktian.** Uji memakai Discord tiruan dan stub API plugin; uji integrasi di CI memakai kode
+> Hermes asli tetapi tidak menyalakan gateway. Perilaku di gateway yang hidup, Discord, dan Docker baru
+> terbukti lewat `selftest.sh` di server dan tes manual Langkah 11 di server uji.
 
 ## 13. Batasan
 
