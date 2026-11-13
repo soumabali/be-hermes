@@ -214,6 +214,10 @@ class TestFakeLlm:
         usage = body["usage"]
         assert usage["completion_tokens"] == 7 and usage["prompt_tokens"] >= 1
         assert usage["total_tokens"] == usage["prompt_tokens"] + usage["completion_tokens"]
+        # Server mencatat token SETELAH jawaban terkirim, jadi klien bisa lebih dulu sampai di sini.
+        deadline = time.time() + 5
+        while server.stats()["tokens"] != usage["total_tokens"] and time.time() < deadline:
+            time.sleep(0.01)
         assert server.stats()["requests"] == 1 and server.stats()["tokens"] == usage["total_tokens"]
 
     def test_streaming_ends_with_usage_and_done(self, server):
