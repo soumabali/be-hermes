@@ -175,7 +175,9 @@ class DiscordAPI:
                 if exc.code == 429 and attempt < last:
                     self.sleep(min(self._retry_after(exc.headers, payload) + 0.2, self.MAX_WAIT))
                     continue
-                if exc.code in self.RETRY_STATUSES and attempt < last:
+                # 5xx: server mungkin SUDAH menjalankan permintaan; hanya method idempoten yang diulang
+                # (POST/PATCH yang diulang bisa membuat channel/role/pesan dobel).
+                if exc.code in self.RETRY_STATUSES and method in self.IDEMPOTENT and attempt < last:
                     self.sleep(min(0.5 * (2 ** attempt), 8.0))
                     continue
                 raise DiscordHTTPError(method, path, exc.code, payload.get("code"),

@@ -707,6 +707,14 @@ class TestDiscordClient:
         assert len(api.guild_roles(fd.GUILD)) == len(discord.roles)
         assert api.naps == [0.5, 1.0]
 
+    @pytest.mark.parametrize("status", [502, 503, 504])
+    def test_post_is_not_retried_on_5xx(self, api, discord, status):
+        """Server mungkin sudah membuat channel sebelum menjawab 5xx; mengulang POST = channel dobel."""
+        discord.fault("POST", f"/guilds/{fd.GUILD}/channels", status=status, times=1)
+        with pytest.raises(ht.DiscordHTTPError) as err:
+            api.request("POST", f"/guilds/{fd.GUILD}/channels", {"name": "x", "type": 0})
+        assert err.value.status == status and api.naps == []
+
     def test_persistent_5xx_raises_http_error(self, api, discord):
         discord.fault("GET", "/users/@me", status=503, times=10)
         with pytest.raises(ht.DiscordHTTPError) as err:
