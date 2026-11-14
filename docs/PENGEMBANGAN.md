@@ -9,7 +9,7 @@ sambungan antar komponen punya uji yang gagal bila satu sisi berubah sendirian
 | Lokasi | Tanggung jawab |
 |---|---|
 | `kit_config.py` | Skema `team.yaml`: tabel `FIELDS` (key, tipe, bawaan, batas, apakah ditegakkan plugin). Validasi, peringatan salah ketik, `roster["settings"]`, dan [Referensi konfigurasi](KONFIGURASI.md) diturunkan darinya |
-| `kit/` | Logika kit, satu tanggung jawab per modul: `constants`, `templates` (SOUL di `kit/templates/*.md`), `profiles` (`PROFILE_KINDS`), `util`, `config`, `derive` (menurunkan config Hermes dan roster), `hermes_cli` (pembungkus CLI `hermes`), `skills`, `provision` (`apply`), `membership` (anggota), `cli` (argparse) |
+| `kit/` | Logika kit, satu tanggung jawab per modul: `constants`, `templates` (SOUL di `kit/templates/*.md`), `profiles` (`PROFILE_KINDS`, tampilan `SYSTEM_KINDS`/`MODEL_TARGETS`), `util`, `config`, `derive` (menurunkan config Hermes dan roster), `hermes_cli` (pembungkus CLI `hermes`), `skills`, `provision` (`apply`), `membership` (anggota), `cli` (argparse) |
 | `hermes_team.py` | Titik masuk CLI + fasad yang mempertahankan semua nama lama (`import hermes_team as ht`) |
 | `kit_base.py`, `kit_discord.py`, `kit_paths.py` | Dasar tanpa dependensi, klien Discord REST, lokasi berkas |
 | `teamctl_mcp.py`, `teamctl/` | Server MCP admin: `protocol`, `confirm`, `registry` (`@tool`), `tools_team`, `tools_discord`, `tools_usage`, `discord_guard` |
@@ -19,17 +19,25 @@ sambungan antar komponen punya uji yang gagal bila satu sisi berubah sendirian
 
 ## Menambah satu setelan di `team.yaml`
 
-Satu baris di `FIELDS` (`kit_config.py`), ditambah tempat setelan itu dipakai.
+Intinya satu baris di `FIELDS` (`kit_config.py`) plus titik pakainya, tetapi beberapa berkas lain HARUS ikut
+disentuh. Daftar jujurnya (uji yang gagal memberi tahu langkah yang kurang):
 
 ```python
 _plugin("scale.foo", "int", 5, "Deskripsi singkat.", key="foo", min=1)   # ditegakkan plugin → masuk roster["settings"]["foo"]
 _row("scale.bar", "int", 3, "Deskripsi.", min=0)                         # hanya dipakai kit
 ```
 
-Lalu: `python3 hermes_team.py config-doc > docs/KONFIGURASI.md`, tambahkan baris berkomentar di
-`team.example.yaml` (uji `check_example` menolak bila ada field yang tidak terdokumentasi), dan baca nilainya
-di plugin lewat `roster.settings.get("foo")`. Uji `tests/test_contract.py` memastikan setiap key yang dibaca plugin
-memang dihasilkan kit.
+| # | Berkas | Bila | Diingatkan oleh |
+|---|---|---|---|
+| 1 | `kit_config.py` — baris di `FIELDS` | selalu | — |
+| 2 | titik pakai: kode kit (`team["scale"]["bar"]`) atau plugin (`roster.settings.get("foo")`) | selalu | uji plugin: `settings.get("x")` yang tidak dihasilkan kit |
+| 3 | `plugins/team-guard/roster.py` — `SETTINGS_DEFAULTS` / `ONBOARDING_DEFAULTS` | hanya baris `_plugin` | `tests/test_kit_units.py::TestExtensionGuides` mencetak BARIS PERSIS yang ditambahkan |
+| 4 | `team.example.yaml` — baris (boleh berkomentar `# foo: 5`) | selalu | `TestConfigSchema::test_example_file_documents_exactly_the_schema`; bahan: `python3 kit_config.py --emit-example-section scale` |
+| 5 | `docs/KONFIGURASI.md` | selalu | `tests/test_release.py` mencetak perintahnya: `python3 hermes_team.py config-doc --write docs/KONFIGURASI.md` |
+| 6 | uji yang menghitung setelan dengan tangan (mis. daftar `NEW_SETTINGS` di `tests/test_contract.py`) | bila ada yang gagal | pesan kegagalan uji itu |
+
+Duplikasi bawaan di plugin (butir 3) disengaja: plugin tidak boleh meng-import kit. Yang diturunkan otomatis dari
+satu baris: validasi + pesan galat, peringatan salah ketik, isi `roster.json`, tabel `KONFIGURASI.md`.
 
 ## Menambah tool admin
 
@@ -60,8 +68,42 @@ Kelas dengan `check(ctx) -> Verdict | None` di `plugins/team-guard/limiters.py`,
 
 ## Menambah jenis profile
 
-Satu entri di `PROFILE_KINDS` (`kit/profiles.py`): fungsi setelan, templat SOUL, apakah butuh channel,
-toolset yang dimatikan, nama yang dicadangkan.
+Daftarkan satu `ProfileKind` di `PROFILE_KINDS` (`kit/profiles.py`). Argumen `soul` (teks `SOUL.md`, dengan
+placeholder `{team_name}`) WAJIB: ia tidak bisa diturunkan, jadi tambahkan `kit/templates/soul_<jenis>.md` dan
+ekspor lewat `kit/templates/__init__.py` (atau pakai ulang teks yang ada). Contoh:
+
+```python
+OPS = ProfileKind("ops", SOUL_OPS, _shared_settings, needs_channel=True, reserved=True, model_target=True,
+                  note="ops, @mention", channel_label="channel ops", model_label="ops")
+# role="admin" / admin_routes=True / free_response=True bila channel-nya khusus admin & tanpa @mention
+```
+
+Yang IKUT OTOMATIS dari entri itu (diuji di `TestRegisteredKindWorksEndToEnd` dengan jenis palsu):
+blok `ops: {profile, channel_id, auto_skills}` di `team.yaml` dan baris `llm.ops_model` (skema dibangun dari
+registri), peringatan salah ketik, rute gateway (satu rute per admin bila `admin_routes`), `allowed_channels` /
+`free_response_channels`, `channel_skill_bindings`, `models:` di `members.yaml` + alias `set-model`/`llm-key`,
+`channels` + `kind` di `roster.json`, `check`/`describe`/`status`, cek channel `kit_doctor`, urutan provisioning
+(`apply` membuat profile + SOUL + setelan), keunikan channel/profile, ID contoh (`placeholder_ids`), nama yang
+dicadangkan, plafon RAM sandbox.
+
+Yang TIDAK otomatis (cek satu per satu; tidak ada uji yang mengingatkan, kecuali disebut):
+
+1. `team.example.yaml` + `docs/KONFIGURASI.md` — tambahkan blok contoh; tabel dokumen dibangkitkan (lihat di atas).
+   `test_example_file_documents_exactly_the_schema` hanya memeriksa jenis bawaan.
+2. `teamctl/tools_team.py` (~L176): daftar target `set_model` ditulis harfiah (`shared`, `admin`, `lobby`).
+3. `teamctl/discord_guard.py` (~L129): `team_channels` hanya mengenal channel shared dan admin; channel jenis baru
+   tidak dilindungi guard Discord admin sampai ditambahkan.
+4. `plugins/team-guard`: plugin menafsirkan `kind` channel `personal`/`admin` (`hooks.py`, `livereload.py`) dan
+   hanya mengenal `shared_channel`/`admin_channel` di roster (placeholder sambutan). Jenis baru diperlakukan
+   seperti channel biasa tanpa perilaku khusus.
+5. `kit/skills.py` — berbagi skill ke `shared` ditulis harfiah (itu memang otak bersama, bukan jenis generik).
+6. `kit/derive.py::host_settings` — `DISCORD_HOME_CHANNEL` dan `no_thread_channels` memakai channel `admin`.
+7. Pesan/doc yang menyebut "shared + admin" secara harfiah (README, docs/FITUR.md).
+8. Uji yang mengunci registri bawaan (`TestProfileKinds::test_registry_shape`) bila jenis ditambah permanen.
+
+Uji jenis palsu memakai fixture `register_kind` (`tests/conftest.py`): ia mendaftarkan di salinan-uji registri dan
+memanggil `kit_config.rebuild_schema()`; `SYSTEM_KINDS`/`MODEL_TARGETS`/`RESERVED_NAMES` adalah tampilan malas, jadi
+tidak ada salinan basi.
 
 ## Menyentuh internal Hermes
 

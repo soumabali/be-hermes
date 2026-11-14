@@ -39,8 +39,8 @@ Key yang salah ketik tidak diabaikan diam-diam: `check`, `apply`, dan `status` m
 | `llm.providers` | custom | `{}` |  | Provider LLM OpenAI-compatible: nama → {api, key_env, ...}. |
 | `llm.models` | custom | `{}` |  | Katalog model: alias → {provider, model, [compression_threshold_tokens, proactive_prune_tokens]}. |
 | `llm.default_model` | custom | `""` |  | Model anggota tanpa `model` di members.yaml. |
-| `llm.admin_model` | custom | `""` |  | Model profile admin. |
 | `llm.shared_model` | custom | `""` |  | Model profile bersama. |
+| `llm.admin_model` | custom | `""` |  | Model profile admin. |
 | `llm.lobby_model` | custom | `""` |  | Model profile default (lobby). |
 | `llm.aux_model` | custom | `""` |  | Model murah untuk tugas auxiliary (kompresi, judul, review, cron). |
 | `llm.fallback` | custom | `[]` |  | Rantai model cadangan saat model utama error/throttle. |

@@ -104,7 +104,7 @@ versi diterima. Bentuk tabel SQL tidak bisa dibaca "sebisanya", jadi perubahan m
 * **Skema:** satu tabel, `kit_config.FIELDS` (path YAML, tipe, default, batas/pilihan, deskripsi, `plugin_key`).
   Satu validator (`kit_config.parse_section` / `parse_top_level`) menghasilkan nilai bertipe dan pesan `TeamError`
   yang menyebut key-nya; `unknown_key_warnings` memberi saran "maksudnya …?".
-* **Dokumentasi otomatis:** `python3 hermes_team.py config-doc` (tabel Markdown), `python3 kit_config.py
+* **Dokumentasi otomatis:** `python3 hermes_team.py config-doc` (tabel Markdown; `--write docs/KONFIGURASI.md` memperbarui berkasnya), `python3 kit_config.py
   --emit-example-section <bagian>` (cuplikan YAML). `tests/test_kit_units.py::TestConfigSchema` gagal bila
   `team.example.yaml` tidak mendokumentasikan sebuah field atau memuat key yang tidak ada di skema.
 * **Alat ringan** (`usage_ledger`, `usage_report`, `tools/usage_post.py`, `kit_doctor`) membaca YAML lewat SATU
