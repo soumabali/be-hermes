@@ -8,6 +8,7 @@ import shutil
 from typing import Union
 
 import hermes_team as ht
+from kit.profiles import MODEL_TARGETS
 
 from .confirm import Plan, PlanFn, Planner, _clean, _q
 from .discord_guard import TYPE_NAMES, VIEW, Server
@@ -63,6 +64,42 @@ def list_models(ctl, args: dict) -> str:
     return "\n".join(lines)
 
 
+def _kind_choices(names: list) -> str:
+    """'a, b, atau c' (satu nama: 'a'); dipakai pesan target set_model yang diturunkan dari PROFILE_KINDS."""
+    return names[0] if len(names) < 2 else ", ".join(names[:-1]) + ", atau " + names[-1]
+
+
+def _check_add_member_args(team: dict, name: str, user_id: str, model: str, channel_id: str) -> None:
+    if not ht.NAME_RE.match(name):
+        raise ToolError("name harus huruf kecil/angka/-/_ (mis. citra, be1)")
+    if not ht.ID_RE.match(user_id):
+        raise ToolError("discord_user_id harus angka 15–21 digit (klik kanan user → Copy User ID)")
+    if team["llm"] and model and model not in team["llm"]["models"]:
+        raise ToolError(f"model {_q(model, 60)} tidak ada; pilihan: {', '.join(team['llm']['models'])}")
+    if any(m["name"] == name or m["user_id"] == user_id for m in team["members"]):
+        raise ToolError("nama atau user ID itu sudah terdaftar")
+    if channel_id and not ht.ID_RE.match(channel_id):
+        raise ToolError("channel_id harus ID channel (angka 15–21 digit)")
+
+
+def _existing_channel_note(srv, channel_id: str, member: dict, user_id: str, who: str) -> str:
+    """Pagar + pratinjau untuk channel yang SUDAH ADA yang dipakai sebagai channel pribadi anggota."""
+    ch = srv.channel(channel_id)   # harus ada DI SERVER INI
+    kind = srv.channel_kind(ch)
+    if kind:
+        raise ToolError(f"{srv.channel_label(ch)} adalah {kind} — tidak bisa dijadikan channel pribadi "
+                        "anggota lain")
+    if ch.get("type") != 0:
+        raise ToolError(f"{srv.channel_label(ch)} bukan channel teks biasa "
+                        f"({TYPE_NAMES.get(ch.get('type'), ch.get('type'))})")
+    sees = bool(srv.channel_perms(ch, member.get("roles") or [], user_id) & VIEW)
+    return (
+        f"pakai channel yang SUDAH ADA {srv.channel_label(ch)} sebagai channel pribadinya. PERINGATAN: "
+        f"izin channel itu TIDAK diubah; saat ini bisa dilihat oleh: {'; '.join(srv.viewers(ch))}. "
+        "Semua yang bisa melihatnya bisa membaca percakapan pribadinya dengan Hermes"
+        + ("" if sees else f"; {who} sendiri BELUM bisa melihat channel itu") + ".")
+
+
 @tool(
     "add_member",
     description="Tambah anggota dengan nama/model/channel tertentu: buat channel Discord privat #hermes-<name> "
@@ -93,16 +130,7 @@ def add_member(ctl, args: dict) -> PlanFn:
 
     def plan() -> Plan:
         team = ctl.team()
-        if not ht.NAME_RE.match(name):
-            raise ToolError("name harus huruf kecil/angka/-/_ (mis. citra, be1)")
-        if not ht.ID_RE.match(user_id):
-            raise ToolError("discord_user_id harus angka 15–21 digit (klik kanan user → Copy User ID)")
-        if team["llm"] and model and model not in team["llm"]["models"]:
-            raise ToolError(f"model {_q(model, 60)} tidak ada; pilihan: {', '.join(team['llm']['models'])}")
-        if any(m["name"] == name or m["user_id"] == user_id for m in team["members"]):
-            raise ToolError("nama atau user ID itu sudah terdaftar")
-        if channel_id and not ht.ID_RE.match(channel_id):
-            raise ToolError("channel_id harus ID channel (angka 15–21 digit)")
+        _check_add_member_args(team, name, user_id, model, channel_id)
         srv = Server(team, ctl.api())
         member = srv.member(user_id)
         if (member.get("user") or {}).get("bot"):
@@ -110,20 +138,7 @@ def add_member(ctl, args: dict) -> PlanFn:
         who = srv.member_label(member)
         effective = model or (team["llm"]["default_model"] if team["llm"] else "-")
         if channel_id:
-            ch = srv.channel(channel_id)   # harus ada DI SERVER INI
-            kind = srv.channel_kind(ch)
-            if kind:
-                raise ToolError(f"{srv.channel_label(ch)} adalah {kind} — tidak bisa dijadikan channel pribadi "
-                                "anggota lain")
-            if ch.get("type") != 0:
-                raise ToolError(f"{srv.channel_label(ch)} bukan channel teks biasa "
-                                f"({TYPE_NAMES.get(ch.get('type'), ch.get('type'))})")
-            sees = bool(srv.channel_perms(ch, member.get("roles") or [], user_id) & VIEW)
-            channel_note = (
-                f"pakai channel yang SUDAH ADA {srv.channel_label(ch)} sebagai channel pribadinya. PERINGATAN: "
-                f"izin channel itu TIDAK diubah; saat ini bisa dilihat oleh: {'; '.join(srv.viewers(ch))}. "
-                "Semua yang bisa melihatnya bisa membaca percakapan pribadinya dengan Hermes"
-                + ("" if sees else f"; {who} sendiri BELUM bisa melihat channel itu") + ".")
+            channel_note = _existing_channel_note(srv, channel_id, member, user_id, who)
         else:
             channel_note = f"buat channel privat #{team['channel_prefix']}{name} (hanya dia + bot);"
         preview = (f"Tambah anggota {_q(display, 64)} ({name}), Discord user {who}: {channel_note} "
@@ -173,9 +188,9 @@ def set_model(ctl, args: dict) -> PlanFn:
         if alias not in team["llm"]["models"]:
             raise ToolError(f"model {_q(alias, 60)} tidak ada; pilihan: {', '.join(team['llm']['models'])}")
         names = {m["name"] for m in team["members"]}
-        if target not in names | {"all", "semua", "all-members", "shared", "admin", "lobby"}:
-            raise ToolError(f"target {_q(target, 60)} tidak dikenal; pakai nama anggota, all, shared, admin, "
-                            "atau lobby")
+        if target not in names | {"all", "semua", "all-members"} | set(MODEL_TARGETS):
+            raise ToolError(f"target {_q(target, 60)} tidak dikenal; pakai nama anggota, all, "
+                            + _kind_choices(list(MODEL_TARGETS)))
         spec = team["llm"]["models"][alias]
         scope = (f"SEMUA anggota ({len(names)} orang)" if target in ("all", "semua", "all-members") else target)
         preview = (f"Ganti model {scope} → {alias} ({_clean(spec['provider'], 60)} / {_clean(spec['model'], 80)}). "
@@ -413,6 +428,30 @@ def onboarding_status(ctl, args: dict) -> str:
     return "\n".join(lines)
 
 
+def _onboard_what(ctl, team: dict, label: str, existing, user: dict, uid: str, name: str, model: str) -> str:
+    """Kalimat pratinjau onboarding: anggota aktif tanpa role / aktifkan lagi / anggota baru."""
+    if existing and existing["active"]:
+        return f"{label} sudah anggota aktif ({existing['profile']})."
+    if existing:
+        return (f"Aktifkan lagi {label} ({existing['name']}): ia diberi akses lagi ke channel pribadinya "
+                f"{ctl._channel_note(team, existing['channel_id'])} (dibuat ulang bila sudah tidak ada); "
+                f"profile {existing['profile']} dengan memory & secret lamanya.")
+    preview_name = name or ht.derive_member_name(str(user.get("username") or ""), uid,
+                                                 ht.taken_names(team, ctl.hermes()))
+    effective = model or (team["llm"]["default_model"] if team["llm"] else "-")
+    return (f"Jadikan {label} anggota: channel privat #{team['channel_prefix']}{preview_name} (hanya dia + "
+            f"bot), profile {team['prefix']}{preview_name} (memory, .env, sandbox sendiri), model {effective}.")
+
+
+def _grant_member_role(srv, team: dict, uid: str) -> str:
+    """Beri role anggota; kembalikan catatan hasil (kegagalan bukan fatal)."""
+    try:
+        srv.api.add_role(team["guild_id"], uid, team["member_role"], reason=srv.reason("onboarding oleh admin"))
+        return "role @backend diberikan"
+    except ht.TeamError as exc:
+        return f"role @backend belum diberikan ({exc}); berikan manual"
+
+
 @tool(
     "onboard_member",
     description="Jadikan user Discord anggota tim sekarang: channel privat #hermes-<nama> (hanya dia + bot), "
@@ -452,18 +491,7 @@ def onboard_member(ctl, args: dict) -> PlanFn:
         has_role = team["member_role"] in (member.get("roles") or [])
         if existing and existing["active"] and has_role:
             return f"{label} sudah anggota aktif: <#{existing['channel_id']}>, profile {existing['profile']}."
-        if existing and existing["active"]:
-            what = f"{label} sudah anggota aktif ({existing['profile']})."
-        elif existing:
-            what = (f"Aktifkan lagi {label} ({existing['name']}): ia diberi akses lagi ke channel pribadinya "
-                    f"{ctl._channel_note(team, existing['channel_id'])} (dibuat ulang bila sudah tidak ada); "
-                    f"profile {existing['profile']} dengan memory & secret lamanya.")
-        else:
-            preview_name = name or ht.derive_member_name(str(user.get("username") or ""), uid,
-                                                         ht.taken_names(team, ctl.hermes()))
-            effective = model or (team["llm"]["default_model"] if team["llm"] else "-")
-            what = (f"Jadikan {label} anggota: channel privat #{team['channel_prefix']}{preview_name} (hanya dia + "
-                    f"bot), profile {team['prefix']}{preview_name} (memory, .env, sandbox sendiri), model {effective}.")
+        what = _onboard_what(ctl, team, label, existing, user, uid, name, model)
         member_role = next((r for r in srv.roles() if str(r["id"]) == team["member_role"]), None)
         role_text = srv.role_label(member_role) if member_role else f"role anggota ({team['member_role']})"
         preview = (what + ("" if has_role else f" Beri {role_text}.")
@@ -476,12 +504,7 @@ def onboard_member(ctl, args: dict) -> PlanFn:
                                        display_name=display, name=name, model=model, api=srv.api)
             notes = list(result.get("notes", []))
             if not has_role:
-                try:
-                    srv.api.add_role(team["guild_id"], uid, team["member_role"],
-                                     reason=srv.reason("onboarding oleh admin"))
-                    notes.append("role @backend diberikan")
-                except ht.TeamError as exc:
-                    notes.append(f"role @backend belum diberikan ({exc}); berikan manual")
+                notes.append(_grant_member_role(srv, team, uid))
             m = result["member"]
             status = {"created": "dibuat", "reactivated": "diaktifkan lagi", "exists": "sudah ada"}.get(
                 result["status"], result["status"])

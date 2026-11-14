@@ -84,22 +84,23 @@ registri), peringatan salah ketik, rute gateway (satu rute per admin bila `admin
 `free_response_channels`, `channel_skill_bindings`, `models:` di `members.yaml` + alias `set-model`/`llm-key`,
 `channels` + `kind` di `roster.json`, `check`/`describe`/`status`, cek channel `kit_doctor`, urutan provisioning
 (`apply` membuat profile + SOUL + setelan), keunikan channel/profile, ID contoh (`placeholder_ids`), nama yang
-dicadangkan, plafon RAM sandbox.
+dicadangkan, plafon RAM sandbox, target `set_model` di teamctl (dari `MODEL_TARGETS`), dan perlindungan channel
+tim di guard Discord admin (`Server.team_channels` dari `SYSTEM_KINDS`; label `channel_label` + " tim"). Dua yang
+terakhir diuji di `tests/test_teamctl_kinds.py` dengan jenis palsu; deskripsi/skema tool `set_model` tetap teks
+tetap (di-pin hash), jadi tidak menyebut jenis baru.
 
 Yang TIDAK otomatis (cek satu per satu; tidak ada uji yang mengingatkan, kecuali disebut):
 
 1. `team.example.yaml` + `docs/KONFIGURASI.md` — tambahkan blok contoh; tabel dokumen dibangkitkan (lihat di atas).
    `test_example_file_documents_exactly_the_schema` hanya memeriksa jenis bawaan.
-2. `teamctl/tools_team.py` (~L176): daftar target `set_model` ditulis harfiah (`shared`, `admin`, `lobby`).
-3. `teamctl/discord_guard.py` (~L129): `team_channels` hanya mengenal channel shared dan admin; channel jenis baru
-   tidak dilindungi guard Discord admin sampai ditambahkan.
-4. `plugins/team-guard`: plugin menafsirkan `kind` channel `personal`/`admin` (`hooks.py`, `livereload.py`) dan
-   hanya mengenal `shared_channel`/`admin_channel` di roster (placeholder sambutan). Jenis baru diperlakukan
-   seperti channel biasa tanpa perilaku khusus.
-5. `kit/skills.py` — berbagi skill ke `shared` ditulis harfiah (itu memang otak bersama, bukan jenis generik).
-6. `kit/derive.py::host_settings` — `DISCORD_HOME_CHANNEL` dan `no_thread_channels` memakai channel `admin`.
-7. Pesan/doc yang menyebut "shared + admin" secara harfiah (README, docs/FITUR.md).
-8. Uji yang mengunci registri bawaan (`TestProfileKinds::test_registry_shape`) bila jenis ditambah permanen.
+2. `plugins/team-guard` (sisi plugin sudah generik dan diuji, `TestRegisteredKindInPlugin`): cron guard, rute contoh
+   live reload, dan placeholder sambutan `{<jenis>_channel}` membaca roster, bukan nama jenis. Yang masih manual:
+   `kit/derive.py::roster_data` belum menulis kunci opsional `role` / `cron_exempt` di entri channel (lihat
+   docs/KONTRAK.md), jadi jenis baru diperlakukan seperti `shared` (bukan admin, kena batas cron) sampai itu ditambah.
+   `commands.py::resolve_env_target` (kind `personal` = anggota) tidak berubah.
+3. `kit/derive.py::host_settings` — `DISCORD_HOME_CHANNEL` dan `no_thread_channels` memakai channel `admin`.
+4. Pesan/doc yang menyebut "shared + admin" secara harfiah (README, docs/FITUR.md).
+5. Uji yang mengunci registri bawaan (`TestProfileKinds::test_registry_shape`) bila jenis ditambah permanen.
 
 Uji jenis palsu memakai fixture `register_kind` (`tests/conftest.py`): ia mendaftarkan di salinan-uji registri dan
 memanggil `kit_config.rebuild_schema()`; `SYSTEM_KINDS`/`MODEL_TARGETS`/`RESERVED_NAMES` adalah tampilan malas, jadi

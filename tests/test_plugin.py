@@ -4260,3 +4260,65 @@ class TestApproveDenyExemption(ScaleBase):
             assert "resolve_gateway_approval" in called and "_blocking_approval_or_stale" in called, name
             assert not called & {"_run_agent", "handle_message", "create_task", "ensure_future", "run_agent",
                                  "_handle_message", "start_turn"}, (name, called)
+
+
+# ============================================================================= jenis profile dari registri (roster)
+class TestRegisteredKindInPlugin:
+    """Jenis baru (mis. `ops`) hanya tampil di roster.json; plugin menafsirkan lewat kunci opsional entri channel
+    (`role`, `cron_exempt`) dan `kind` -> `{<kind>_channel}`, tanpa nama jenis yang ditulis harfiah."""
+    OPS_CH, OPS_PROFILE = "700000000000000099", "team-ops"
+    CRON = {"action": "create", "schedule": "every 5m", "prompt": "cek server"}
+
+    def _add_ops(self, env, **extra):
+        env.roster["channels"][self.OPS_CH] = {"profile": self.OPS_PROFILE, "kind": "ops", **extra}
+        env.set("settings", cron_min_interval_minutes=15)
+
+    def _cron(self, env, profile):
+        return env.register(profile).fire("pre_tool_call", tool_name="cronjob_manage", args=self.CRON, task_id="t")
+
+    def test_cron_guard_follows_cron_exempt_of_the_kind(self, env):
+        self._add_ops(env)                                       # tanpa kunci: kena batas seperti shared
+        got = self._cron(env, self.OPS_PROFILE)
+        assert got and got[0]["action"] == "block"
+        self._add_ops(env, cron_exempt=True)
+        assert self._cron(env, self.OPS_PROFILE) == []
+        # jenis bawaan tak berubah: shared diblok, admin lolos (roster lama tanpa kunci baru)
+        assert self._cron(env, "team-shared")[0]["action"] == "block"
+        assert self._cron(env, "team-admin") == []
+
+    def test_cron_exempt_key_overrides_legacy_admin_fallback(self, env):
+        env.set("settings", cron_min_interval_minutes=15)
+        env.roster["channels"][S.CH_ADMIN]["cron_exempt"] = False
+        env.save()
+        assert self._cron(env, "team-admin")[0]["action"] == "block"
+
+    def test_expected_routes_user_follows_role(self, env):
+        self._add_ops(env, role="admin")
+        routes = {cid: user for cid, _p, user in livereload.expected_routes(env.rt().roster())}
+        assert routes[self.OPS_CH] == S.ADMIN
+        self._add_ops(env, role="member")
+        routes = {cid: user for cid, _p, user in livereload.expected_routes(env.rt().roster())}
+        assert routes[self.OPS_CH] == S.U_BE1
+        self._add_ops(env)                                       # tanpa `role`: bukan admin (perilaku lama)
+        routes = {cid: user for cid, _p, user in livereload.expected_routes(env.rt().roster())}
+        assert routes[self.OPS_CH] == S.U_BE1
+        assert routes[S.CH_ADMIN] == S.ADMIN and routes[S.CH_SHARED] == S.U_BE1
+
+    def test_welcome_gets_kind_channel_placeholder(self, env):
+        onboarding = S.sub(P, "onboarding")
+        self._add_ops(env)
+        roster = env.rt().roster()
+        assert roster.kind_channel("ops") == self.OPS_CH and roster.kind_channel("nope") == ""
+        assert roster.kinds() == {"shared", "admin", "ops"}
+        fields = onboarding.welcome_fields(roster, S.U_BUDI, {})
+        assert fields["ops_channel"] == f"<#{self.OPS_CH}>"
+        assert fields["shared_channel"] == f"<#{S.CH_SHARED}>" and fields["admin_channel"] == f"<#{S.CH_ADMIN}>"
+        text = onboarding.render_welcome("Ops: {ops_channel}; {tidak_ada}", **fields)
+        assert text == f"Ops: <#{self.OPS_CH}>; {{tidak_ada}}"
+
+    def test_profile_kind_and_env_target_for_new_kind(self, env):
+        self._add_ops(env)
+        roster = env.rt().roster()
+        assert roster.profile_kind(self.OPS_PROFILE) == "ops"
+        assert commands.resolve_env_target(roster, S.U_BUDI, [self.OPS_CH])[1] == commands.MSG_ADMIN_ONLY
+        assert commands.resolve_env_target(roster, S.ADMIN, [self.OPS_CH]) == (self.OPS_PROFILE, "")

@@ -3374,3 +3374,41 @@ class TestExtensionGuides:
 
     def test_regenerate_command_is_one_command(self):
         assert kit_config.REGENERATE_DOC == "python3 hermes_team.py config-doc --write docs/KONFIGURASI.md"
+
+
+# =========================================================================== skill bersama mengikuti registri
+class TestSharedSkillTargetsFollowRegistry:
+    """kit/skills.py tidak lagi menulis `shared` harfiah: otak bersama = jenis ber-channel ber-role member."""
+
+    def _ops(self, kit, register_kind, **kw):
+        register_kind(kit_profiles.ProfileKind(
+            "ops", ht.SOUL_SHARED, kit_profiles._shared_settings, needs_channel=True, reserved=True, **kw))
+        kit.write_team(ops={"profile": "team-ops", "channel_id": OPS_CH})
+        kit.write_members([BE1, BUDI])
+        return kit.team()
+
+    def test_builtin_kinds_unchanged(self, kit):
+        from kit import skills as kit_skills
+        kit.write_members([BE1, BUDI])
+        team = kit.team()
+        assert kit_skills.shared_brain_kinds(team) == [("shared", team["shared"]["profile"])]
+        owner = {"name": "be1"}
+        profiles, scope_all = kit_skills._share_targets(team, owner, ["all"])
+        assert scope_all and profiles[-1] == ("shared", team["shared"]["profile"])
+        assert ("be1", "be-be1") not in profiles
+        assert kit_skills._share_targets(team, owner, ["shared"])[0] == [("shared", team["shared"]["profile"])]
+        with pytest.raises(ht.TeamError, match="tidak ada atau nonaktif"):
+            kit_skills._share_targets(team, owner, ["admin"])         # admin bukan penerima
+
+    def test_member_role_kind_receives_shared_skills(self, kit, register_kind):
+        from kit import skills as kit_skills
+        team = self._ops(kit, register_kind)
+        assert kit_skills.shared_brain_kinds(team) == [("shared", "team-shared"), ("ops", "team-ops")]
+        profiles, _ = kit_skills._share_targets(team, {"name": "be1"}, ["all"])
+        assert profiles[-2:] == [("shared", "team-shared"), ("ops", "team-ops")]
+        assert kit_skills._share_targets(team, {"name": "be1"}, ["ops"])[0] == [("ops", "team-ops")]
+
+    def test_admin_role_kind_does_not(self, kit, register_kind):
+        from kit import skills as kit_skills
+        team = self._ops(kit, register_kind, role="admin", admin_routes=True, free_response=True)
+        assert kit_skills.shared_brain_kinds(team) == [("shared", "team-shared")]

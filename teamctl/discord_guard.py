@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 import hermes_team as ht
+from kit.profiles import PROFILE_KINDS, SYSTEM_KINDS
 
 from .confirm import _clean, _name, _q
 from .errors import ToolError
@@ -126,8 +127,8 @@ class Server:
         self.conf = team["server_admin"]
         self.personal = {m["channel_id"]: m for m in team["members"]}       # aktif & nonaktif
         self.removed = load_tombstones(team)                                # anggota yang sudah dikeluarkan permanen
-        self.team_channels = {team["shared"]["channel_id"]: "channel bersama tim",
-                              team["admin"]["channel_id"]: "channel admin tim"}
+        self.team_channels = {team[k]["channel_id"]: f"{PROFILE_KINDS[k].channel_label or 'channel ' + k} tim"
+                              for k in SYSTEM_KINDS}               # shared, admin, + jenis terdaftar lain
         report = str(((team.get("usage") or {}).get("report_channel_id")) or "")
         if report:
             self.team_channels.setdefault(report, "channel laporan pemakaian tim")

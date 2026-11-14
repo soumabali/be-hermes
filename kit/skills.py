@@ -20,6 +20,7 @@ from kit.util import atomic_write, now_iso
 from kit.config import _lock_depth, reload_team, team_lock
 from kit.derive import active_members
 from kit.hermes_cli import Hermes
+from kit.profiles import PROFILE_KINDS, SYSTEM_KINDS
 
 
 # --------------------------------------------------------------------------- skill
@@ -335,6 +336,14 @@ def share_skill(team: dict, hermes: Hermes, skill: str, from_member: str, to: It
 RESERVED_SKILL_NAMES = {"registry.json", ".staging", ".team-shared.json"}
 
 
+def shared_brain_kinds(team: dict) -> list[tuple[str, str]]:
+    """[(nama jenis, profile)] otak bersama penerima skill yang dibagikan: jenis ber-channel yang dilihat role
+    `member` (di bawaan: `shared`). Admin (role admin) tidak ikut; jenis baru `needs_channel` + `role="member"`
+    otomatis ikut."""
+    return [(k, team[k]["profile"]) for k in SYSTEM_KINDS
+            if PROFILE_KINDS[k].role == "member" and (team.get(k) or {}).get("profile")]
+
+
 def _share_targets(team: dict, owner: dict, to: Iterable[str]) -> tuple[list[tuple[str, str]], bool]:
     """Tujuan berbagi skill → ([(nama, profile)], scope_all). "all"/"semua" = semua anggota aktif + shared."""
     targets = [str(t).strip().lower() for t in to if str(t).strip()]
@@ -342,11 +351,12 @@ def _share_targets(team: dict, owner: dict, to: Iterable[str]) -> tuple[list[tup
     profiles: list[tuple[str, str]] = []
     if scope_all:
         profiles = [(m["name"], m["profile"]) for m in active_members(team) if m["name"] != owner["name"]]
-        profiles.append(("shared", team["shared"]["profile"]))
+        profiles.extend(shared_brain_kinds(team))
     else:
+        brains = dict(shared_brain_kinds(team))
         for t in targets:
-            if t == "shared":
-                profiles.append(("shared", team["shared"]["profile"]))
+            if t in brains:
+                profiles.append((t, brains[t]))
                 continue
             member = next((m for m in active_members(team) if m["name"] == t), None)
             if member is None:
@@ -446,7 +456,7 @@ def _unshare_skill(team: dict, hermes: Hermes, skill: str, targets: Iterable[str
         raise TeamError(f"skill '{skill}' tidak ada di daftar skill yang dibagikan")
     wanted = [str(t).strip().lower() for t in targets]
     everyone = any(t in ("all", "semua") for t in wanted)
-    candidates = [(m["name"], m["profile"]) for m in team["members"]] + [("shared", team["shared"]["profile"])]
+    candidates = [(m["name"], m["profile"]) for m in team["members"]] + shared_brain_kinds(team)
     results = {}
     for name, profile in candidates:
         if not everyone and name not in wanted:

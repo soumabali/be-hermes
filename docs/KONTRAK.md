@@ -38,6 +38,9 @@ di [`kit_contracts.py`](../kit_contracts.py) (stdlib saja), dan diuji di `tests/
   `guild_id`, `hermes_root`, `hermes_bin`, `admins`, `roles`, `shared_channel`, `admin_channel`, `category_id`,
   `channels` (channel → profile/kind), `users`, `inactive_users`, `reserved_env`, `gateway` (rute + channel yang
   diinginkan), `live_reload`, `restart_fallback`, `onboarding`, `kit`, `settings`, `usage`.
+* **Kunci opsional entri `channels` (aditif, `schema` tetap 1):** `role` (`"admin"` bila jenis ber-role admin; hilang =
+  bukan admin) dan `cron_exempt` (`true` = boleh membuat cron rapat). Hilang pada roster lama: plugin jatuh ke perilaku
+  lama (hanya `kind: "admin"`). Plugin juga membentuk placeholder `{<kind>_channel}` dari `kind` di `channels`.
 * **`settings`, `onboarding`, `usage`, `live_reload`, `restart_fallback` DITURUNKAN dari tabel**
   `kit_config.FIELDS`: hanya baris yang punya `plugin_key` (dan `plugin_section` yang sesuai) yang masuk. Menambah
   setelan yang ditegakkan plugin = satu baris di tabel + titik pakainya di plugin; tidak ada daftar kunci lain yang

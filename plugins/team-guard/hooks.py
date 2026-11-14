@@ -107,7 +107,8 @@ class ProfileHooks:
             found = check_tool_call(tool_name, args, names)
             if found:
                 return {"action": "block", "message": found}
-        # Jadwal cron terlalu rapat (tiap job = percakapan LLM di luar antrean). Profile yang `cron_exempt` di roster (admin) dikecualikan.
+        # Jadwal cron terlalu rapat (tiap job = percakapan LLM di luar antrean).
+        # Profile `cron_exempt` di roster (admin) dikecualikan.
         if not roster.profile_cron_exempt(self.profile):
             try:
                 found = check_cron_call(tool_name, args, roster.settings.get("cron_min_interval_minutes"))
