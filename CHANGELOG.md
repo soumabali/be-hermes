@@ -28,6 +28,9 @@ Versi plugin (`plugins/team-guard/plugin.yaml`) dan `pyproject.toml` mengikutiny
   salinan di folder lain, juga dengan `python -I` / `PYTHONSAFEPATH` (`tests/test_entrypoints.py`).
 - `tools/usage_post.py` memvalidasi `usage.*` dengan skema kit (jam tanpa kutip kini ditolak, sama dengan `check`).
 
+- `usage.db`: pembaca dan penulis menolak buku besar berskema lebih baru (pesan jelas, tanpa menulis).
+- `kit_doctor.check_discord_setup` (108 baris) dipecah menjadi fungsi kecil.
+
 ### Keamanan
 - **PERILAKU BERUBAH:** `/env-set` memakai allowlist nama: berawalan `MY_`, salah satu dari 27 nama alat dev
   umum (`GH_PAT`, `NPM_TOKEN`, …), atau `secrets.allow_names`. Daftar tolak lama tetap sebagai lapis kedua.

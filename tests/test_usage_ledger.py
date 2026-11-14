@@ -437,3 +437,48 @@ def test_cli_uses_team_folder_defaults(env, tmp_path, monkeypatch, capsys):
     assert ul.main(["--hermes-root", str(root), "report", "--period", "month", "--format", "json", "--no-collect"]) == 0
     users = json.loads(capsys.readouterr().out)["users"]
     assert [(u["user_key"], u["display_name"]) for u in users] == [(ANDI, "Andi P")]
+
+
+# ----------------------------------------------------------------------------- versi skema
+def _ledger_with_version(path, version):
+    con = ul.open_ledger(path)
+    con.execute("INSERT OR REPLACE INTO meta VALUES ('schema_version', ?)", (str(version),))
+    con.commit()
+    con.close()
+
+
+def test_reader_refuses_a_newer_ledger_with_a_clear_message(env):
+    _root, ledger = env
+    _ledger_with_version(ledger, ul.SCHEMA_VERSION + 1)
+    with pytest.raises(ul.LedgerError, match="lebih baru"):
+        ul.open_ledger(ledger, readonly=True)
+    with pytest.raises(ul.LedgerError, match="perbarui kit"):
+        ul.query(ledger, date(2026, 11, 1), date(2026, 11, 30))
+
+
+def test_writer_refuses_to_touch_a_newer_ledger(env):
+    root, ledger = env
+    _ledger_with_version(ledger, ul.SCHEMA_VERSION + 3)
+    before = ledger.read_bytes()
+    with pytest.raises(ul.LedgerError):
+        ul.collect(ledger, root, now=1_800_000_000.0)
+    assert ledger.read_bytes() == before                      # tidak ada yang ditulis
+
+
+def test_same_or_older_or_missing_version_is_accepted(env):
+    _root, ledger = env
+    con = ul.open_ledger(ledger)
+    con.execute("DELETE FROM meta WHERE key='schema_version'")          # berkas lama tanpa baris versi
+    con.commit()
+    con.close()
+    ul.open_ledger(ledger, readonly=True).close()
+    _ledger_with_version(ledger, ul.SCHEMA_VERSION)
+    ul.open_ledger(ledger, readonly=True).close()
+    _ledger_with_version(ledger, 0)
+    ul.open_ledger(ledger, readonly=True).close()
+
+
+def test_garbage_version_value_is_treated_as_version_one(env):
+    _root, ledger = env
+    _ledger_with_version(ledger, "bukan-angka")
+    ul.open_ledger(ledger, readonly=True).close()

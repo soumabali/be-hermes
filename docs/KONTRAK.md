@@ -82,9 +82,10 @@ Pembaca (plugin) mengabaikan `event` yang tidak dikenal dan kunci tambahan.
 ## `state/usage.db`
 
 SQLite; tabel `meta` menyimpan `schema_version` (`usage_ledger.SCHEMA_VERSION`, kini 1), dicatat saat berkas dibuat.
-Pembaca saat ini BELUM memeriksanya (celah yang diketahui): bentuk tabel SQL tidak bisa dibaca "sebisanya", jadi
-perubahan merusak harus menaikkan `SCHEMA_VERSION` dan menambah pemeriksaan di pembaca bersamaan. Satu-satunya
-penulis adalah kolektor `usage_ledger.py` (kunci tulis `usage.db.lock`).
+**Pembaca dan penulis memeriksanya** (`usage_ledger._check_schema_version`): buku besar dengan versi LEBIH BARU
+ditolak dengan `LedgerError` ("perbarui kit"), tanpa menulis apa pun; versi sama, lebih lama, atau tanpa baris
+versi diterima. Bentuk tabel SQL tidak bisa dibaca "sebisanya", jadi perubahan merusak harus menaikkan
+`SCHEMA_VERSION`. Satu-satunya penulis adalah kolektor `usage_ledger.py` (kunci tulis `usage.db.lock`).
 
 ## `team.yaml` dan `members.yaml`
 

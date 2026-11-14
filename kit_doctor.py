@@ -566,19 +566,26 @@ def channel_permissions(base: int, channel: dict, guild_id: str, role_ids: Any, 
     return perms
 
 
-def check_discord_setup(team: dict, rep: Report, ht: Any, api: Any) -> bool:
-    """Preflight tingkat TIM (bukan per anggota): cukup token bot, gateway tidak perlu jalan.
-    Kembalikan False bila pemeriksaan lanjutan tidak mungkin (token salah / bot tidak di server)."""
+ROLES_MENU = "Discord → Server Settings → Roles"
+
+
+class GuildState:
+    """Keadaan server yang dibaca sekali: id bot, role bot, semua role, semua channel."""
+
+    def __init__(self, bot_id: str, my_roles: list, roles: dict, channels: dict):
+        self.bot_id, self.my_roles, self.roles, self.channels = bot_id, my_roles, roles, channels
+
+
+def _fetch_guild_state(team: dict, rep: Report, ht: Any, api: Any) -> Optional[GuildState]:
+    """Token valid dan bot ada di server? Bila tidak: catat galat beserta perbaikannya dan kembalikan None."""
     guild = team["guild_id"]
-    view, send = ht.PERM["VIEW_CHANNEL"], ht.PERM["SEND_MESSAGES"]
-    roles_menu = "Discord → Server Settings → Roles"
     try:
         bot_id = str(api.bot_user_id())
     except ht.TeamError as exc:
         rep.add(ERROR, "discord", f"token bot ditolak atau Discord tidak terjangkau: {exc}",
                 "periksa DISCORD_BOT_TOKEN di ~/.hermes/.env (Developer Portal → Applications → Bot → Reset Token), "
                 "lalu ulangi")
-        return False
+        return None
     try:
         me = api.guild_member(guild, bot_id) or {}
         roles = {str(r.get("id")): r for r in api.guild_roles(guild)}
@@ -587,90 +594,123 @@ def check_discord_setup(team: dict, rep: Report, ht: Any, api: Any) -> bool:
         rep.add(ERROR, "discord", f"bot belum ada di server guild_id {guild} (atau guild_id salah): {exc}",
                 "undang bot: Developer Portal → OAuth2 → URL Generator (scope bot + applications.commands) → buka "
                 "URL-nya dan pilih server tim; pastikan guild_id di team.yaml = ID server itu")
-        return False
-    my_roles = [str(r) for r in me.get("roles") or []]
-    # role
-    wanted_roles = [("roles.member", team["member_role"]), ("roles.admin", team["admin_role"])]
+        return None
+    return GuildState(bot_id, [str(r) for r in me.get("roles") or []], roles, channels)
+
+
+def _check_roles(team: dict, rep: Report, state: GuildState) -> None:
+    """Role tim ada, dan role tertinggi bot berada di ATAS role yang harus ia beri/cabut."""
+    wanted = [("roles.member", team["member_role"]), ("roles.admin", team["admin_role"])]
     if team.get("entry_role"):
-        wanted_roles.append(("roles.entry", team["entry_role"]))
-    for key, rid in wanted_roles:
-        if rid not in roles:
+        wanted.append(("roles.entry", team["entry_role"]))
+    for key, rid in wanted:
+        if rid not in state.roles:
             rep.add(ERROR, "discord", f"role {key} ({rid}) tidak ada di server",
-                    f"{roles_menu} → klik kanan role yang benar → Copy ID → isi {key} di team.yaml")
-    top = max((int((roles.get(r) or {}).get("position") or 0) for r in my_roles), default=0)
-    for key, rid in wanted_roles:
-        if key == "roles.admin" or rid not in roles:
+                    f"{ROLES_MENU} → klik kanan role yang benar → Copy ID → isi {key} di team.yaml")
+    top = max((int((state.roles.get(r) or {}).get("position") or 0) for r in state.my_roles), default=0)
+    for key, rid in wanted:
+        if key == "roles.admin" or rid not in state.roles:
             continue
-        if int(roles[rid].get("position") or 0) >= top:
+        role = state.roles[rid]
+        if int(role.get("position") or 0) >= top:
             rep.add(ERROR, "discord", f"role tertinggi bot (posisi {top}) tidak berada di ATAS {key} "
-                    f"'{roles[rid].get('name')}' (posisi {roles[rid].get('position')}): bot tidak bisa memberi "
+                    f"'{role.get('name')}' (posisi {role.get('position')}): bot tidak bisa memberi "
                     "atau mencabut role itu",
-                    f"{roles_menu} → seret (drag-and-drop) role bot ke ATAS role '{roles[rid].get('name')}' → "
+                    f"{ROLES_MENU} → seret (drag-and-drop) role bot ke ATAS role '{role.get('name')}' → "
                     "Save Changes")
-    # izin server
-    base = guild_permissions(guild, my_roles, roles, ht)
+
+
+def _check_guild_permissions(team: dict, rep: Report, ht: Any, state: GuildState) -> int:
+    """Izin tingkat server yang dibutuhkan kit; mengembalikan bit izin dasar bot (dipakai pemeriksaan channel)."""
+    base = guild_permissions(team["guild_id"], state.my_roles, state.roles, ht)
     for bit, label, why, needed in BOT_GUILD_PERMISSIONS:
         if base & ht.PERM[bit]:
             continue
         level = ERROR if needed is None or needed(team) else WARN
         rep.add(level, "discord", f"bot tidak punya izin {label} ({why})",
-                f"{roles_menu} → role bot → Permissions → aktifkan {label} (atau undang ulang bot dengan izin itu)")
-    # kategori
+                f"{ROLES_MENU} → role bot → Permissions → aktifkan {label} (atau undang ulang bot dengan izin itu)")
+    return base
+
+
+def _check_category(team: dict, rep: Report, state: GuildState) -> None:
     category = team.get("category_id")
-    if category:
-        cat = channels.get(category)
-        if cat is None:
-            rep.add(ERROR, "discord", f"category_id {category} tidak ada di server (channel pribadi baru tidak bisa dibuat)",
-                    "klik kanan kategori tujuan → Copy ID → isi category_id di team.yaml")
-        elif cat.get("type") != 4:
-            rep.add(ERROR, "discord", f"category_id {category} bukan kategori (tipe {cat.get('type')})",
-                    "isi category_id dengan ID KATEGORI, bukan channel")
-        else:
-            used = sum(1 for c in channels.values() if str(c.get("parent_id")) == category)
-            if used >= CATEGORY_CHANNEL_LIMIT:
-                rep.add(ERROR, "discord", f"kategori {category} sudah berisi {used} channel (batas Discord "
-                        f"{CATEGORY_CHANNEL_LIMIT}): onboarding berikutnya gagal membuat channel",
-                        "buat kategori baru dan isi category_id dengan ID-nya (channel lama boleh tetap di kategori lama)")
-            elif used >= CATEGORY_CHANNEL_LIMIT - 5:
-                rep.add(WARN, "discord", f"kategori {category} hampir penuh: {used}/{CATEGORY_CHANNEL_LIMIT} channel",
-                        "siapkan kategori baru sebelum penuh")
-    # channel bersama, admin, laporan
-    everyone_base = _bits((roles.get(guild) or {}).get("permissions"))
+    if not category:
+        return
+    cat = state.channels.get(category)
+    if cat is None:
+        rep.add(ERROR, "discord", f"category_id {category} tidak ada di server (channel pribadi baru tidak bisa dibuat)",
+                "klik kanan kategori tujuan → Copy ID → isi category_id di team.yaml")
+    elif cat.get("type") != 4:
+        rep.add(ERROR, "discord", f"category_id {category} bukan kategori (tipe {cat.get('type')})",
+                "isi category_id dengan ID KATEGORI, bukan channel")
+    else:
+        used = sum(1 for c in state.channels.values() if str(c.get("parent_id")) == category)
+        if used >= CATEGORY_CHANNEL_LIMIT:
+            rep.add(ERROR, "discord", f"kategori {category} sudah berisi {used} channel (batas Discord "
+                    f"{CATEGORY_CHANNEL_LIMIT}): onboarding berikutnya gagal membuat channel",
+                    "buat kategori baru dan isi category_id dengan ID-nya (channel lama boleh tetap di kategori lama)")
+        elif used >= CATEGORY_CHANNEL_LIMIT - 5:
+            rep.add(WARN, "discord", f"kategori {category} hampir penuh: {used}/{CATEGORY_CHANNEL_LIMIT} channel",
+                    "siapkan kategori baru sebelum penuh")
+
+
+def _team_channel_targets(team: dict) -> list:
+    """[(key di team.yaml, id channel, harus privat?)] untuk channel bersama, admin, dan laporan."""
     targets = [(f"{k}.channel_id", team[k]["channel_id"], True) for k in SYSTEM_KINDS]
     report_channel = (team.get("usage") or {}).get("report_channel_id")
     if report_channel and report_channel not in (team[k]["channel_id"] for k in SYSTEM_KINDS):
         targets.append(("usage.report_channel_id", report_channel, False))
-    for key, cid, must_be_private in targets:
-        ch = channels.get(cid)
-        if ch is None:
-            try:
-                other = api.get_channel(cid)
-            except ht.TeamError:
-                other = None
-            if other is None:
-                rep.add(ERROR, "discord", f"channel {key} ({cid}) tidak ada (atau bot tidak bisa melihatnya)",
-                        f"klik kanan channel yang benar → Copy ID → isi {key} di team.yaml")
-            else:
-                rep.add(ERROR, "discord", f"channel {key} ({cid}) bukan di server tim (guild {other.get('guild_id')})",
-                        f"isi {key} dengan channel di server {guild}")
-            continue
-        if ch.get("type") not in TEXT_CHANNEL_TYPES:
-            rep.add(ERROR, "discord", f"channel {key} ({cid}) bukan channel teks (tipe {ch.get('type')})",
-                    f"isi {key} dengan ID channel teks")
-            continue
-        edit = f"Edit Channel #{ch.get('name') or cid} → Permissions"
-        if must_be_private and channel_permissions(everyone_base, ch, guild, [], "", ht) & view:
-            who = "role member" if key.startswith("shared") else "role admin"
-            rep.add(ERROR, "discord", f"channel {key} #{ch.get('name')} bisa dilihat @everyone: siapa pun di server "
-                    "dilayani profile itu",
-                    f"{edit} → @everyone: matikan View Channel; lalu beri View Channel ke {who} dan ke bot")
-        mine = channel_permissions(base, ch, guild, my_roles, bot_id, ht)
-        # Aturan Discord: tanpa View Channel, Send Messages ikut tidak berlaku (izin implisit).
-        lacking = [label for bit, label in ((view, "View Channel"), (send, "Send Messages"))
-                   if not mine & bit or not mine & view]
-        if lacking:
-            rep.add(ERROR, "discord", f"bot tidak bisa {' / '.join(lacking)} di {key} #{ch.get('name')}",
-                    f"{edit} → tambah bot (atau role-nya) → izinkan View Channel dan Send Messages")
+    return targets
+
+
+def _check_one_team_channel(team: dict, rep: Report, ht: Any, api: Any, state: GuildState, base: int,
+                            key: str, cid: str, must_be_private: bool) -> None:
+    guild = team["guild_id"]
+    view, send = ht.PERM["VIEW_CHANNEL"], ht.PERM["SEND_MESSAGES"]
+    ch = state.channels.get(cid)
+    if ch is None:
+        try:
+            other = api.get_channel(cid)
+        except ht.TeamError:
+            other = None
+        if other is None:
+            rep.add(ERROR, "discord", f"channel {key} ({cid}) tidak ada (atau bot tidak bisa melihatnya)",
+                    f"klik kanan channel yang benar → Copy ID → isi {key} di team.yaml")
+        else:
+            rep.add(ERROR, "discord", f"channel {key} ({cid}) bukan di server tim (guild {other.get('guild_id')})",
+                    f"isi {key} dengan channel di server {guild}")
+        return
+    if ch.get("type") not in TEXT_CHANNEL_TYPES:
+        rep.add(ERROR, "discord", f"channel {key} ({cid}) bukan channel teks (tipe {ch.get('type')})",
+                f"isi {key} dengan ID channel teks")
+        return
+    edit = f"Edit Channel #{ch.get('name') or cid} → Permissions"
+    everyone_base = _bits((state.roles.get(guild) or {}).get("permissions"))
+    if must_be_private and channel_permissions(everyone_base, ch, guild, [], "", ht) & view:
+        who = "role member" if key.startswith("shared") else "role admin"
+        rep.add(ERROR, "discord", f"channel {key} #{ch.get('name')} bisa dilihat @everyone: siapa pun di server "
+                "dilayani profile itu",
+                f"{edit} → @everyone: matikan View Channel; lalu beri View Channel ke {who} dan ke bot")
+    mine = channel_permissions(base, ch, guild, state.my_roles, state.bot_id, ht)
+    # Aturan Discord: tanpa View Channel, Send Messages ikut tidak berlaku (izin implisit).
+    lacking = [label for bit, label in ((view, "View Channel"), (send, "Send Messages"))
+               if not mine & bit or not mine & view]
+    if lacking:
+        rep.add(ERROR, "discord", f"bot tidak bisa {' / '.join(lacking)} di {key} #{ch.get('name')}",
+                f"{edit} → tambah bot (atau role-nya) → izinkan View Channel dan Send Messages")
+
+
+def check_discord_setup(team: dict, rep: Report, ht: Any, api: Any) -> bool:
+    """Preflight tingkat TIM (bukan per anggota): cukup token bot, gateway tidak perlu jalan.
+    Kembalikan False bila pemeriksaan lanjutan tidak mungkin (token salah / bot tidak di server)."""
+    state = _fetch_guild_state(team, rep, ht, api)
+    if state is None:
+        return False
+    _check_roles(team, rep, state)
+    base = _check_guild_permissions(team, rep, ht, state)
+    _check_category(team, rep, state)
+    for key, cid, must_be_private in _team_channel_targets(team):
+        _check_one_team_channel(team, rep, ht, api, state, base, key, cid, must_be_private)
     return True
 
 

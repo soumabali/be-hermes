@@ -167,12 +167,38 @@ def _writer_lock(path: Path):
         os.close(fh)
 
 
+def _check_schema_version(con: sqlite3.Connection, path: Path) -> None:
+    """Buku besar ditulis kit versi lebih baru → pembaca lama menolak dengan pesan jelas, bukan membaca kolom yang
+    mungkin sudah berubah arti. Tanpa baris versi (berkas lama) dianggap versi 1."""
+    try:
+        row = con.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
+    except sqlite3.Error:
+        return
+    try:
+        found = int(row[0]) if row else 1
+    except (TypeError, ValueError):
+        found = 1
+    if found > SCHEMA_VERSION:
+        con.close()
+        raise LedgerError(f"buku besar {path} berskema {found}, lebih baru dari yang dipahami kit ini "
+                          f"({SCHEMA_VERSION}); perbarui kit (VERSION {kit_paths_version()}) sebelum membacanya")
+
+
+def kit_paths_version() -> str:
+    try:
+        from kit_base import KIT_VERSION
+        return KIT_VERSION
+    except Exception:       # noqa: BLE001 — hanya untuk pesan galat
+        return "?"
+
+
 def open_ledger(path: Path, *, readonly: bool = False) -> sqlite3.Connection:
     path = Path(path).expanduser()
     if readonly:
         if not path.exists():
             raise LedgerError(f"buku besar belum ada di {path} — jalankan `usage_ledger.py collect` dulu")
         con = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=10)
+        _check_schema_version(con, path)
     else:
         path.parent.mkdir(parents=True, exist_ok=True)
         fresh = not path.exists()
@@ -182,6 +208,7 @@ def open_ledger(path: Path, *, readonly: bool = False) -> sqlite3.Connection:
         with contextlib.suppress(OSError):
             os.chmod(path, 0o600)
         con.executescript(SCHEMA)
+        _check_schema_version(con, path)       # sebelum menulis apa pun ke buku besar milik kit yang lebih baru
         con.execute("INSERT OR IGNORE INTO meta VALUES ('schema_version', ?)", (str(SCHEMA_VERSION),))
         con.commit()
     con.row_factory = sqlite3.Row
