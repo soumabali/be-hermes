@@ -145,4 +145,5 @@ log, atau argumen perintah.
 | [Panduan pengembang](docs/PENGEMBANGAN.md) | Peta kode; cara menambah setelan, tool admin, pembatas, jenis profile; uji dan rilis |
 | [Kontrak antar komponen](docs/KONTRAK.md) | Berkas dan baris yang dipertukarkan kit, plugin, teamctl, dan tools |
 | [Rencana skala](docs/RENCANA-SKALA.md) | Celah skala yang diketahui dan status perbaikannya |
+| [Akseptansi](docs/AKSEPTANSI.md) | Daftar pemeriksaan di server sungguhan untuk menilai kit 10/10, dan pekerjaan kode yang tersisa |
 | [CHANGELOG](CHANGELOG.md) | Perubahan per versi |

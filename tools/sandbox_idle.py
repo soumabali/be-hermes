@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """sandbox_idle.py — hentikan (docker stop) container sandbox Hermes yang menganggur.
 
+TERBUKTI dengan Docker sungguhan (Docker 29.9.2, container berlabel `hermes-profile`): container diam dihentikan pada
+sapuan kedua, container yang sibuk tidak disentuh, dan yang dihentikan tetap ada (Exited; tidak dihapus).
+
 !!! BELUM TERBUKTI — UJI DI SERVER STAGING DULU !!!
 Apakah Hermes menyalakan lagi container sandbox yang sudah dihentikan (status Exited) saat profile itu
 dipakai berikutnya BELUM DIVERIFIKASI. Dokumentasi Hermes hanya menyebut ia "menempel ke container yang

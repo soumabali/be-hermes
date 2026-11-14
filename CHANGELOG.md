@@ -7,6 +7,7 @@ Versi plugin (`plugins/team-guard/plugin.yaml`) dan `pyproject.toml` mengikutiny
 ## [Belum dirilis]
 
 ### Perbaikan hasil audit putaran kedua
+- `docs/AKSEPTANSI.md`: daftar pemeriksaan server sungguhan (B1–B20) dan pekerjaan kode tersisa menuju 10/10; `sandbox_idle` kini terbukti memakai Docker dengan benar (hentikan yang diam, biarkan yang sibuk, tidak `rm`).
 - **Wizard `setup.sh`**: kesiapan gateway diperiksa lewat `systemctl --user is-active` + polling 60 dtk + cek stabil
   (bukan sekadar perintah start sukses); `--kit-dir` divalidasi; penulisan sebagai root tanpa mengikuti symlink;
   `--from X` menandai langkah sesudahnya belum selesai; role/channel yang sudah ada tidak diadopsi tanpa
