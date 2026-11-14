@@ -8,6 +8,7 @@
 | Ganti model | Chat atau `set-model`; berlaku di sesi baru |
 | Ubah batas skala / sandbox / provider | Edit `team.yaml` → `apply` → `managed` → pasang ulang `/etc/hermes/config.yaml` → `/restart` |
 | Update kit | Lihat [Upgrade](INSTALL.md#upgrade-dari-v30): perbarui `/opt/hermes-team` → `apply` → `managed --install` → `apply` → `/restart`; perubahan ada di `CHANGELOG.md` |
+| Pasang kebijakan managed | `sudo python3 /opt/hermes-team/hermes_team.py managed --install …` dari salinan kit milik root (bukan dari folder user); selain itu ditolak |
 | Hapus anggota permanen | Nonaktifkan dulu, lalu `hermes_team.py remove-member <nama> --delete-profile --delete-channel` (`--dry-run` untuk melihat dulu) |
 | Cek berkas managed | `hermes_team.py managed --diff` |
 | Versi kit | `hermes_team.py --version` |
@@ -49,6 +50,8 @@ pakai `hermes_team.py llm-key <nama>`.
 python3 /opt/hermes-team/hermes_team.py remove-member budi --delete-profile --delete-channel --dry-run
 python3 /opt/hermes-team/hermes_team.py remove-member budi --delete-profile --delete-channel
 ```
+`remove-member` mencatat channel anggota di `state/removed_channels.json` sebelum mengubah `members.yaml`; channel itu tetap dilindungi dari tool admin sampai benar-benar terhapus.
+
 
 Perintah itu mencetak apa yang tidak ikut dihapus (container dan volume sandbox) beserta perintah Docker-nya.
 

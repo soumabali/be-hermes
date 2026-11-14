@@ -36,7 +36,11 @@ Tulis biasa, Hermes memanggil tool `teamctl`, menjelaskan rencananya, lalu menam
 Pagar yang tidak bisa dibujuk lewat chat (ditolak sebelum tombol konfirmasi muncul):
 
 - Channel pribadi anggota (dan thread di dalamnya) tidak bisa dibaca, diubah (nama, topik, posisi),
-  dikirimi pesan, diubah izinnya, atau dihapus. Channel bersama/admin dan kategori tim tidak bisa
+  dikirimi pesan, diubah izinnya, atau dihapus. "Channel pribadi" mencakup channel anggota aktif maupun
+  nonaktif, channel anggota yang sudah dihapus (dicatat di `state/removed_channels.json` oleh
+  `remove-member`, jadi tetap terlindungi walau channelnya tidak ikut dihapus), dan channel apa pun di
+  kategori tim yang berawalan `channel_prefix`. Thread di channel tim tidak bisa diubah/dihapus, dan
+  channel laporan pemakaian diperlakukan sebagai channel tim. Channel bersama/admin dan kategori tim tidak bisa
   dihapus, dipindah, atau diganti namanya (topik dan slowmode boleh), dan overwrite-nya tidak bisa
   dihapus; overwrite milik bot sendiri tidak bisa dihapus/ditolak. Role tim (`@backend`,
   `@hermes-admin`, `@entry`) tidak bisa dihapus dan izinnya tidak bisa diubah.
@@ -46,6 +50,8 @@ Pagar yang tidak bisa dibujuk lewat chat (ditolak sebelum tombol konfirmasi munc
   Role berizin tinggi juga tidak bisa dicabut, dihapus, atau diubah izinnya lewat Hermes, dan role
   tidak bisa dicabut dari admin/pemilik server. Role `@hermes-admin` hanya diberikan manual (dan user
   ID-nya di `admins`). Ubah dengan `server_admin.allow_elevated_permissions: true` bila perlu.
+- Tiga izin tambahan ikut diblokir untuk diberikan: `create_instant_invite`, `create_events`,
+  `use_external_apps`.
 - Admin tim, pemilik server, semua bot, dan pemegang izin tinggi tidak bisa di-timeout/kick. Ban selalu manual.
 - Pengguna harus disebut dengan ID, mention, atau username persis (nama tampilan/nickname tidak dicocokkan
   lagi, supaya tidak salah orang). Konfirmasi selalu memuat ID dan teks lengkap yang akan dikirim.
@@ -54,6 +60,11 @@ Pagar yang tidak bisa dibujuk lewat chat (ditolak sebelum tombol konfirmasi munc
 - Isi pesan yang dibaca dari Discord dibungkus penanda `<<<DATA-DISCORD …>>>` dengan nonce acak dan
   tiap baris diberi awalan, sehingga satu pesan tidak bisa memalsukan pesan lain; semuanya data,
   bukan instruksi. Argumen tool diperiksa tipenya secara ketat (ID harus string).
+- **Jaminan yang jujur.** Tool yang mengubah sesuatu selalu lewat konfirmasi admin (`run_tool`), dijaga
+  oleh lint bytecode saat tool didaftarkan dan klien Discord baca-saja saat tool baca berjalan. Ini TIDAK
+  mencakup fungsi bantu yang dipanggil tool, klien HTTP buatan sendiri, thread lain, atau penulisan
+  berkas lokal: tool baru wajib ditinjau manusia. Bila konfigurasi tim tak terbaca, grup `discord_*`
+  disembunyikan (gagal-tertutup).
 - Tidak ada lagi cara mematikan konfirmasi (`TEAMCTL_REQUIRE_CONSENT` dihapus; variabelnya diabaikan
   dengan peringatan). `TEAMCTL_MAX_MESSAGE_CHARS` (opsional) menurunkan batas 2000 karakter pesan.
 - `add_member` kini butuh Discord terjangkau dan user ada di server walau `channel_id` diberikan;

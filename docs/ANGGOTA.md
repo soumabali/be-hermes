@@ -33,6 +33,9 @@ Di channel pribadimu (atau thread di dalamnya):
   `GH_TOKEN=$GH_PAT gh pr list`, `AWS_ACCESS_KEY_ID=$MY_AWS_KEY_ID aws s3 ls`.
   `/env-list` menandai nama lama yang kini tidak memenuhi aturan beserta saran gantinya; tidak ada yang
   dihapus dan nilainya tetap bekerja.
+- **Aturan nilai.** Nilai ditolak bila berisi lebih dari satu baris, karakter kontrol atau pemisah baris
+  Unicode (TAB boleh), atau `${` (mencegah ekspansi variabel). Nama harus huruf besar ASCII
+  (`^[A-Z][A-Z0-9_]{1,63}$`). Setelah ditulis, nilai dibaca ulang; bila tidak cocok, perubahan dibatalkan.
 - Nilai multi-baris (private key) simpan sebagai base64 dengan nama berakhiran `_B64`.
 
 Lapisan perlindungan:

@@ -104,18 +104,24 @@ Perintah yang berguna:
 ```bash
 sudo bash setup.sh --list       # status tiap langkah
 sudo bash setup.sh --dry-run    # tampilkan yang akan dilakukan, tanpa mengubah apa pun
-sudo bash setup.sh --from llm   # ulangi mulai langkah tertentu
+sudo bash setup.sh --from llm   # ulangi mulai langkah tertentu (langkah sesudahnya ditandai belum selesai)
+sudo bash setup.sh --no-systemd # server tanpa systemd: lewati langkah yang butuh systemd (tanpa ini, wizard berhenti)
 sudo bash setup.sh --reset      # lupakan kemajuan (tidak menghapus yang sudah terpasang)
 ```
 
 Tanpa tanya-jawab (mis. untuk server kedua): `HERMES_SETUP_BOT_TOKEN=… HERMES_SETUP_LLM_KEY=… sudo -E bash
 setup.sh --non-interactive --answers jawaban.yaml`. Token dan key hanya dibaca dari variabel lingkungan;
-berkas jawaban yang memuatnya ditolak.
+berkas jawaban yang memuatnya ditolak. Kunci jawaban yang menyangkut keamanan: `adopt_existing_roles` dan
+`adopt_existing_channels` (memakai ulang role/channel yang sudah ada di server butuh persetujuan eksplisit),
+`admin_allow_bot` (admin berupa bot), dan `allow_http_llm` (endpoint LLM `http://` ditolak tanpa ini).
+Kode keluar: 0 sukses, 1 gagal di satu langkah, 2 state/jawaban rusak, 3 wizard lain sedang berjalan, 130 dibatalkan.
+Wizard menyalin kit ke `/opt/hermes-team` hanya dari daftar berkas yang diizinkan, dan menolak `--kit-dir`
+yang bukan path absolut, folder sistem, atau folder yang bukan salinan kit sebelumnya.
 
 Token bot dan API key tidak pernah ditulis ke berkas state wizard (`/var/lib/hermes-team-setup/state.json`),
 log, atau argumen perintah.
 
-> Wizard ini diuji terhadap Discord tiruan dan perintah tiruan (57 uji). Ia **belum pernah dijalankan di
+> Wizard ini diuji terhadap Discord tiruan dan perintah tiruan (ratusan uji). Ia **belum pernah dijalankan di
 > server sungguhan**. Pakai di server uji dulu; bila satu langkah gagal, pesan galatnya menyebut penyebab
 > yang paling mungkin dan cara melanjutkan. Panduan manual di bawah menjelaskan apa yang dikerjakan tiap langkah.
 

@@ -6,6 +6,28 @@ Versi plugin (`plugins/team-guard/plugin.yaml`) dan `pyproject.toml` mengikutiny
 
 ## [Belum dirilis]
 
+### Perbaikan hasil audit putaran kedua
+- **Wizard `setup.sh`**: kesiapan gateway diperiksa lewat `systemctl --user is-active` + polling 60 dtk + cek stabil
+  (bukan sekadar perintah start sukses); `--kit-dir` divalidasi; penulisan sebagai root tanpa mengikuti symlink;
+  `--from X` menandai langkah sesudahnya belum selesai; role/channel yang sudah ada tidak diadopsi tanpa
+  persetujuan; pencarian admin hanya persis/ID; HTTP tanpa redirect, `http://` butuh `allow_http_llm`;
+  berhenti bila tanpa systemd kecuali `--no-systemd`; kunci `flock` (instance kedua keluar 3); state rusak
+  dipindah ke `.corrupt-<waktu>` (keluar 2); POST tidak diulang pada 5xx; salinan kit memakai allowlist.
+- **Discord (`kit_discord.py`)**: POST/PATCH tidak lagi diulang pada 502/503/504 (bisa membuat channel/role/pesan dobel).
+- **Plugin `team-guard`**: nilai `/env-set` ditolak bila multi-baris, berisi karakter kontrol/pemisah baris Unicode
+  atau `${`; nama harus huruf besar ASCII; tulis-lalu-baca-ulang dengan rollback dan kunci per profile;
+  pembatas pembuatan cron (maks `max(3, 60 // cron_min_interval_minutes)` per profile per jam, admin bebas);
+  pembacaan sumber Hermes diperkeras.
+- **`teamctl`**: definisi "channel pribadi" mencakup channel anggota nonaktif, tombstone `removed_channels.json`, dan
+  channel berawalan `channel_prefix` di kategori tim; thread channel tim dan channel laporan pemakaian dilindungi;
+  lint registry berbasis bytecode + klien Discord baca-saja saat tool baca berjalan; grup `discord_*` disembunyikan
+  bila konfigurasi tim tak terbaca; izin `create_instant_invite`, `create_events`, `use_external_apps` ikut diblokir.
+- **Inti kit**: jenis profile yang didaftarkan di `PROFILE_KINDS` kini terhubung penuh (rute, skema, model);
+  `hermes_team.py config-doc --write docs/KONFIGURASI.md`; nilai kosong untuk profile/`auto_skills` kembali diterima
+  (memakai bawaan); `remove-member` menulis `state/removed_channels.json`; `managed --install` sebagai root menolak
+  kit yang bisa ditulis user (`--allow-user-owned-kit` untuk pengecualian).
+- Ledger pemakaian menolak skema yang lebih baru dari kit (`LedgerError`: perbarui kit); `kit_doctor.check_discord_setup` dipecah.
+
 ### Struktur dan kemudahan dikembangkan (hasil audit arsitektur)
 - **`hermes_team.py` (3.700 baris) dipecah** menjadi paket `kit/` (`constants`, `templates`, `profiles`, `util`,
   `config`, `derive`, `hermes_cli`, `skills`, `provision`, `membership`, `cli`); `hermes_team.py` tinggal titik

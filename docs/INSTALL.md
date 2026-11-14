@@ -281,7 +281,10 @@ python3 $H apply                  # pertama kali: beberapa menit
 `apply` membuat profile template, shared, admin, dan anggota; menulis rute gateway; memasang plugin
 `team-guard`. Aman diulang: hanya nilai yang berbeda yang ditulis.
 
-Pasang kebijakan *managed* (dipin untuk semua profile, tidak bisa diubah anggota):
+Pasang kebijakan *managed* (dipin untuk semua profile, tidak bisa diubah anggota). Perintah ini
+menjalankan kode kit sebagai root, jadi kit harus berada di tempat milik root dan tidak bisa ditulis
+group/other (wizard memakai `/opt/hermes-team`); dari salinan milik user, perintah ditolak.
+`--allow-user-owned-kit` hanya untuk uji atau pengaturan tak lazim:
 
 ```bash
 sudo python3 /opt/hermes-team/hermes_team.py managed --install --config ~hermes/.hermes-team/team.yaml

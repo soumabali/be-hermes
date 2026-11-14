@@ -24,3 +24,7 @@
 - Jangan jalankan gateway dengan log level DEBUG untuk `discord.py`: pada level itu discord.py
   mencatat payload mentah dari Discord, termasuk isi form `/env-set`.
 - Satu bot = satu nama/avatar dan satu menu `/`. Skill pribadi dipanggil dengan bahasa biasa.
+- Jaminan konfirmasi tool admin (`teamctl`) adalah lint bytecode + klien Discord baca-saja; keduanya tidak menjangkau
+  fungsi bantu, klien HTTP buatan sendiri, thread lain, atau penulisan berkas lokal. Tool baru perlu ditinjau manusia.
+- Wizard `setup.sh`, gateway, Discord, dan Docker belum pernah dijalankan di server sungguhan; yang teruji adalah
+  tiruan dan CI terhadap Hermes sungguhan (unit + integrasi).
