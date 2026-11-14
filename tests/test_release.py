@@ -55,4 +55,26 @@ def test_configuration_reference_is_generated_from_the_schema():
     out = subprocess.run([sys.executable, str(KIT / "hermes_team.py"), "config-doc"], capture_output=True, text=True)
     assert out.returncode == 0
     doc = (KIT / "docs" / "KONFIGURASI.md").read_text(encoding="utf-8")
-    assert out.stdout.strip() in doc, "docs/KONFIGURASI.md usang: jalankan `python3 hermes_team.py config-doc` dan tempel tabelnya"
+    regenerate = "python3 hermes_team.py config-doc --write docs/KONFIGURASI.md"
+    assert out.stdout.strip() in doc, f"docs/KONFIGURASI.md usang. Perbarui dengan satu perintah:\n  {regenerate}"
+
+
+def test_config_doc_write_replaces_only_the_table(tmp_path):
+    doc = tmp_path / "doc.md"
+    doc.write_text("# Judul\n\nPengantar.\n\n| key | tipe | default | plugin | deskripsi |\n|---|---|---|---|---|\n"
+                   "| `lama` | int | `1` |  | usang |\n\nCatatan akhir.\n", encoding="utf-8")
+    out = subprocess.run([sys.executable, str(KIT / "hermes_team.py"), "config-doc", "--write", str(doc)],
+                         capture_output=True, text=True)
+    assert out.returncode == 0, out.stderr
+    text = doc.read_text(encoding="utf-8")
+    table = subprocess.run([sys.executable, str(KIT / "hermes_team.py"), "config-doc"],
+                           capture_output=True, text=True).stdout.strip()
+    assert text.startswith("# Judul\n\nPengantar.\n\n") and table in text and "`lama`" not in text
+    assert text.endswith("\n\nCatatan akhir.\n")
+    again = subprocess.run([sys.executable, str(KIT / "hermes_team.py"), "config-doc", "--write", str(doc)],
+                           capture_output=True, text=True)
+    assert again.returncode == 0 and doc.read_text(encoding="utf-8") == text         # idempoten
+    doc.write_text("tanpa tabel\n", encoding="utf-8")
+    bad = subprocess.run([sys.executable, str(KIT / "hermes_team.py"), "config-doc", "--write", str(doc)],
+                         capture_output=True, text=True)
+    assert bad.returncode != 0 and "tabel konfigurasi tidak ditemukan" in bad.stderr

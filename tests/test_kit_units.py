@@ -3264,3 +3264,96 @@ class TestRemovedChannelTombstone:
             ht.remove_member(applied.team(), applied.hermes(), "budi")
         assert BUDI_CH in self.tombstone(applied)["channels"]                         # nisan sudah ada
         assert [m["name"] for m in applied.members_yaml()] == ["be1", "budi"]         # entri belum hilang
+
+
+# =========================================================================== audit 5: managed --install sebagai root
+class _Stat:
+    def __init__(self, uid, mode):
+        self.st_uid, self.st_mode = uid, mode
+
+
+def _fake_stat(owner_uid, *, writable=None):
+    """stat tiruan: semua path milik `owner_uid`; path yang memuat salah satu string di `writable` dapat ditulis grup."""
+    def stat_fn(path):
+        mode = 0o40775 if writable and any(w in path for w in writable) else 0o40755
+        return _Stat(owner_uid, mode)
+    return stat_fn
+
+
+class TestManagedInstallKitTrust:
+    def test_root_with_user_owned_kit_is_refused(self, kit):
+        team = kit.team()
+        with pytest.raises(ht.TeamError) as err:
+            ht.install_managed(team, target_dir=kit.managed_dir / "x", euid=0, stat_fn=_fake_stat(1000))
+        text = str(err.value)
+        assert "ditolak" in text and "/opt/hermes-team" in text and "--allow-user-owned-kit" in text
+        assert "uid 1000" in text
+        assert not (kit.managed_dir / "x" / "config.yaml").exists()
+
+    def test_root_with_group_writable_kit_is_refused(self, kit):
+        with pytest.raises(ht.TeamError, match="bisa ditulis grup/lain"):
+            ht.install_managed(kit.team(), target_dir=kit.managed_dir / "x", euid=0,
+                               stat_fn=_fake_stat(0, writable=[str(ht.KIT_DIR / "kit")]))
+
+    def test_root_with_root_owned_kit_proceeds(self, kit):
+        path = ht.install_managed(kit.team(), target_dir=kit.managed_dir / "x", euid=0, stat_fn=_fake_stat(0))
+        assert path.read_text() == ht.managed_yaml(kit.team())
+
+    def test_escape_hatch_skips_the_check(self, kit):
+        path = ht.install_managed(kit.team(), target_dir=kit.managed_dir / "x", euid=0, stat_fn=_fake_stat(1000),
+                                  allow_user_owned_kit=True)
+        assert path.is_file()
+
+    def test_non_root_still_gets_the_sudo_command_before_any_ownership_check(self, kit):
+        def never(path):
+            raise AssertionError("tidak boleh memeriksa kepemilikan tanpa root")
+        with pytest.raises(ht.TeamError, match="harus sebagai root") as err:
+            ht.install_managed(kit.team(), euid=1000, stat_fn=never)
+        assert "sudo" in str(err.value) and "managed --install" in str(err.value)
+
+    def test_cli_refuses_then_flag_allows(self, kit, monkeypatch, capsys, patch_kit):
+        monkeypatch.setattr(ht.os, "geteuid", lambda: 0)
+        patch_kit("_kit_stat", _fake_stat(1000))
+        with pytest.raises(SystemExit) as exit_info:
+            ht.main(cli(kit, "managed", "--install"))
+        assert "ditolak" in str(exit_info.value.code) and not (kit.managed_dir / "config.yaml").exists()
+        ht.main(cli(kit, "managed", "--install", "--allow-user-owned-kit"))
+        assert "ditulis (0644)" in capsys.readouterr().out and (kit.managed_dir / "config.yaml").is_file()
+
+    def test_real_stat_flags_a_user_writable_copy(self, tmp_path):
+        """Tanpa tiruan: salinan kit yang bisa ditulis grup/lain selalu terdeteksi (jalan sebagai root maupun bukan)."""
+        copy = tmp_path / "salinan"
+        (copy / "kit").mkdir(parents=True)
+        (copy / "hermes_team.py").write_text("# x\n")
+        (copy / "kit" / "a.py").write_text("# x\n")
+        os.chmod(copy / "kit" / "a.py", 0o666)
+        bad = ht.untrusted_kit_paths(copy)
+        assert any("a.py" in line and "bisa ditulis" in line for line in bad)
+
+    def test_uid_lookups_are_injectable_so_tests_pass_unprivileged_too(self, tmp_path):
+        copy = tmp_path / "kit-root"
+        (copy / "kit").mkdir(parents=True)
+        (copy / "hermes_team.py").write_text("# x\n")
+        assert ht.untrusted_kit_paths(copy, stat_fn=_fake_stat(0)) == []
+        assert ht.untrusted_kit_paths(copy, stat_fn=_fake_stat(1234))
+
+
+# =========================================================================== audit 2: menambah setelan = langkah jelas
+class TestExtensionGuides:
+    def test_plugin_defaults_match_the_schema_and_say_exactly_what_to_add(self):
+        import plugin_stubs
+        plugin = plugin_stubs.load_plugin("_kitunits_roster")
+        roster = plugin_stubs.sub(plugin, "roster")
+        problems = kit_config.plugin_default_problems(roster.SETTINGS_DEFAULTS, roster.ONBOARDING_DEFAULTS)
+        assert not problems, "\n".join(problems)
+
+    def test_missing_plugin_default_prints_the_exact_line(self, monkeypatch):
+        row = kit_config.Field("scale.demo_limit", "int", 7, "contoh", min=1, plugin_key="demo_limit")
+        monkeypatch.setattr(kit_config, "FIELDS", kit_config.FIELDS + (row,))
+        problems = kit_config.plugin_default_problems({}, {})
+        assert any('SETTINGS_DEFAULTS:  "demo_limit": 7,' in line and "scale.demo_limit" in line for line in problems)
+        stray = kit_config.plugin_default_problems({"rate_per_minute": 6, "hantu": 1}, {})
+        assert any("SETTINGS_DEFAULTS['hantu']" in line for line in stray)
+
+    def test_regenerate_command_is_one_command(self):
+        assert kit_config.REGENERATE_DOC == "python3 hermes_team.py config-doc --write docs/KONFIGURASI.md"
