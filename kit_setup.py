@@ -4,7 +4,7 @@
     sudo bash setup.sh                      # interaktif; bisa dihentikan dan dilanjutkan kapan saja
     sudo bash setup.sh --list               # daftar langkah dan statusnya
     sudo bash setup.sh --dry-run            # hanya menampilkan rencana, tidak mengubah apa pun
-    sudo bash setup.sh --from llm           # ulangi mulai satu langkah
+    sudo bash setup.sh --from llm           # ulangi langkah itu DAN semua langkah sesudahnya (jawaban dipertahankan)
     sudo bash setup.sh --only verify        # satu langkah saja
     sudo HERMES_SETUP_BOT_TOKEN=... HERMES_SETUP_LLM_KEY=... \\
         bash setup.sh --non-interactive --answers jawaban.yaml
@@ -47,12 +47,16 @@ from __future__ import annotations
 
 import argparse
 import copy
+import errno
+import fcntl
 import getpass
+import ipaddress
 import json
 import os
 import platform
 import re
 import shutil
+import stat as statmod
 import subprocess
 import sys
 import time
@@ -70,7 +74,8 @@ if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
 from kit_base import ID_RE, KIT_VERSION, TeamError, parse_env_text, rewrite_env_text
-from kit_discord import BOT_ALLOW, MEMBER_ALLOW, PERM, DiscordAPI, DiscordHTTPError, permission_bits, permission_names
+from kit_discord import (BOT_ALLOW, ELEVATED_PERMISSIONS, MEMBER_ALLOW, PERM, DiscordAPI, DiscordHTTPError, permission_bits,
+                         permission_names)
 
 STATE_FILE = Path("/var/lib/hermes-team-setup/state.json")
 ENV_BOT_TOKEN = "HERMES_SETUP_BOT_TOKEN"
@@ -80,6 +85,14 @@ HERMES_INSTALL_URL = "https://hermes-agent.nousresearch.com/install.sh"
 DISCORD_PROBE_URL = "https://discord.com/api/v10/gateway"
 PORTAL_URL = "https://discord.com/developers/applications"
 RESUME_HINT = "sudo bash setup.sh"
+CURL_SECURE = ["--proto", "=https", "--tlsv1.2"]       # unduhan skrip yang dijalankan root: hanya HTTPS, TLS >= 1.2
+# Wizard TIDAK membaca TEAMCTL_DISCORD_API: env milik root tidak boleh bisa membelokkan token bot ke host lain.
+DISCORD_API_BASE = "https://discord.com/api/v10"
+KIT_MARKER = ".kit-installed"          # ditulis wizard di instalasi kit yang selesai
+KIT_STAGING_MARKER = ".kit-staging"    # ditulis wizard di direktori kerja sementara
+# Kode keluar: 0 sukses · 1 langkah gagal / bukan root · 2 salah pakai (argumen, jawaban, state rusak, --kit-dir) ·
+# 3 wizard lain sedang berjalan · 130 dihentikan (Ctrl+C).
+EXIT_BUSY = 3
 
 # --------------------------------------------------------------------------- Discord: izin & intent
 # Izin bot yang diminta lewat tautan undangan (docs/INSTALL.md Langkah 3). Nama = kunci kit_discord.PERMISSIONS.
@@ -160,6 +173,14 @@ def user_command(info: UserInfo, argv: List[str], extra_env: Optional[Dict[str, 
     return ["runuser", "-u", info.name, "--", "env", "-i"] + [f"{k}={v}" for k, v in env.items()] + list(argv)
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):      # noqa: D401 — None = jangan ikuti
+        return None
+
+
+_NO_REDIRECT_OPENER = urllib.request.build_opener(_NoRedirect)
+
+
 # --------------------------------------------------------------------------- akses ke mesin (bisa diganti di uji)
 class HostSystem:
     """Semua sentuhan ke mesin di luar berkas milik wizard. Uji menggantinya dengan tiruan."""
@@ -197,6 +218,15 @@ class HostSystem:
     def chown(self, path: Path, user: str, group: str) -> None:
         shutil.chown(str(path), user=user, group=group)
 
+    def fchown(self, fd: int, user: str, group: str) -> None:
+        """chown lewat descriptor yang sudah dibuka (bukan lewat path): tidak bisa dibelokkan symlink."""
+        import grp
+        import pwd
+        os.fchown(fd, pwd.getpwnam(user).pw_uid, grp.getgrnam(group).gr_gid)
+
+    def user_bus_ready(self, uid: int) -> bool:
+        return os.path.exists(f"/run/user/{uid}/bus")
+
     def sleep(self, seconds: float) -> None:
         time.sleep(seconds)
 
@@ -228,7 +258,8 @@ class HostSystem:
             return None
 
     def has_systemd(self) -> bool:
-        return Path("/run/systemd/system").is_dir()
+        """PID 1 adalah systemd (cara sd_booted()) dan `systemctl` ada. Kontainer/WSL tanpa systemd → False."""
+        return Path("/run/systemd/system").is_dir() and shutil.which("systemctl") is not None
 
     def system_timezone(self) -> str:
         try:
@@ -260,9 +291,16 @@ class HostSystem:
         if data is not None:
             req.add_header("Content-Type", "application/json")
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
+            with _NO_REDIRECT_OPENER.open(req, timeout=timeout) as resp:
                 status, raw = getattr(resp, "status", 200), resp.read()
         except urllib.error.HTTPError as exc:
+            if 300 <= exc.code < 400:
+                # urllib akan mengirim ulang header Authorization ke host mana pun yang dituju Location; wizard
+                # membawa API key LLM, jadi redirect TIDAK diikuti — hanya dilaporkan.
+                target = urllib.parse.urljoin(url, exc.headers.get("Location", "") if exc.headers else "")
+                host = urllib.parse.urlsplit(target).netloc or "(tidak diketahui)"
+                return exc.code, (f"dialihkan (redirect {exc.code}) ke host {host}; TIDAK diikuti supaya API key tidak "
+                                  "terkirim ke host lain — pakai URL akhir langsung sebagai URL dasar")
             status, raw = exc.code, exc.read()
         except Exception as exc:  # noqa: BLE001
             return 0, f"{type(exc).__name__}: {getattr(exc, 'reason', exc)}"
@@ -273,6 +311,35 @@ class HostSystem:
 
 
 # --------------------------------------------------------------------------- state
+STATE_STR_KEYS = (
+    "linux_user", "kit_dir", "guild_id", "guild_name", "bot_id", "app_id", "app_name", "invite_url", "role_entry_id",
+    "role_member_id", "role_admin_id", "role_entry_name", "role_member_name", "role_admin_name", "category_id",
+    "category_name", "shared_channel_id", "shared_channel_name", "admin_channel_id", "admin_channel_name",
+    "usage_channel_id", "usage_channel_name", "sandbox_image")
+
+
+def validate_state_shape(raw: Any) -> List[str]:
+    """Daftar masalah bentuk berkas state (kosong = sah). Berkas ini bisa disunting tangan."""
+    if not isinstance(raw, dict):
+        return [f"isi berkas harus objek JSON, bukan {type(raw).__name__}"]
+    problems: List[str] = []
+    completed = raw.get("completed")
+    if completed is not None and not (isinstance(completed, list) and all(isinstance(x, str) for x in completed)):
+        problems.append("'completed' harus daftar nama langkah (teks)")
+    for key in ("answers", "data"):
+        if raw.get(key) is not None and not isinstance(raw.get(key), dict):
+            problems.append(f"'{key}' harus berupa objek (kunci → nilai), bukan {type(raw.get(key)).__name__}")
+    data = raw.get("data")
+    if isinstance(data, dict):
+        for key in STATE_STR_KEYS:
+            if data.get(key) is not None and not isinstance(data.get(key), str):
+                problems.append(f"data.{key} harus teks, bukan {type(data.get(key)).__name__}")
+        admins = data.get("admins")
+        if admins is not None and not (isinstance(admins, list) and all(isinstance(x, str) for x in admins)):
+            problems.append("data.admins harus daftar user ID (teks)")
+    return problems
+
+
 class State:
     """Langkah selesai + jawaban non-rahasia + ID yang dikumpulkan. Berkas 0600 milik root."""
 
@@ -283,21 +350,46 @@ class State:
         self.data: Dict[str, Any] = {}
         self.readable = True
 
-    def load(self) -> "State":
+    def _corrupt(self, detail: str, keep_copy: bool) -> StepError:
+        copy_note = ""
+        if keep_copy:
+            stamp = time.strftime("%Y%m%d-%H%M%S")
+            for n in range(100):
+                target = self.path.with_name(f"{self.path.name}.corrupt-{stamp}" + (f"-{n}" if n else ""))
+                try:
+                    fd = os.open(str(target), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+                except FileExistsError:
+                    continue
+                except OSError:
+                    break
+                with os.fdopen(fd, "wb") as fh:
+                    fh.write(self.path.read_bytes())
+                copy_note = f"salinan berkas rusak disimpan di {target}"
+                break
+        return StepError(f"berkas state {self.path} rusak: {detail}", cause=copy_note,
+                         fix="perbaiki berkasnya dengan tangan, atau mulai ulang dengan --reset "
+                             "(jawaban dan daftar langkah yang tersimpan hilang; yang sudah terpasang tidak dihapus)")
+
+    def load(self, keep_copy: bool = True) -> "State":
         try:
-            raw = json.loads(self.path.read_text(encoding="utf-8"))
+            text = self.path.read_text(encoding="utf-8")
         except FileNotFoundError:
             return self
         except PermissionError:
             self.readable = False
             return self
-        except (OSError, ValueError) as exc:
-            raise StepError(f"berkas state {self.path} rusak: {exc}",
-                            fix="perbaiki berkasnya, atau mulai ulang dengan --reset")
-        if isinstance(raw, dict):
-            self.completed = [str(s) for s in raw.get("completed") or []]
-            self.answers = dict(raw.get("answers") or {})
-            self.data = dict(raw.get("data") or {})
+        except (OSError, UnicodeDecodeError) as exc:
+            raise self._corrupt(f"tidak bisa dibaca: {exc}", keep_copy)
+        try:
+            raw = json.loads(text)
+        except ValueError as exc:
+            raise self._corrupt(f"bukan JSON yang valid ({exc})", keep_copy)
+        problems = validate_state_shape(raw)
+        if problems:
+            raise self._corrupt("; ".join(problems), keep_copy)
+        self.completed = [str(s) for s in raw.get("completed") or []]
+        self.answers = dict(raw.get("answers") or {})
+        self.data = dict(raw.get("data") or {})
         return self
 
     def save(self, secrets: Tuple[str, ...] = ()) -> None:
@@ -329,8 +421,8 @@ class State:
 
 
 def _atomic_write(path: Path, text: str, mode: int) -> None:
-    tmp = path.with_name(f".{path.name}.tmp-{os.getpid()}")
-    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    tmp = path.with_name(f".{path.name}.tmp-{os.getpid()}-{os.urandom(6).hex()}")
+    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write(text)
@@ -344,6 +436,33 @@ def _atomic_write(path: Path, text: str, mode: int) -> None:
         raise
 
 
+class WizardBusy(StepError):
+    """Wizard lain memegang kunci."""
+
+
+def acquire_lock(path: Path):
+    """Kunci eksklusif non-blocking (flock) supaya dua wizard tidak berjalan bersamaan. Kembalikan objek file yang
+    HARUS tetap dipegang (close() melepas kunci)."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd = os.open(str(path), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    handle = os.fdopen(fd, "r+")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as exc:
+        handle.close()
+        if exc.errno in (errno.EWOULDBLOCK, errno.EAGAIN, errno.EACCES):
+            raise WizardBusy("wizard lain sedang berjalan (kunci " + str(path) + " dipegang)",
+                            fix="tunggu sampai selesai, atau hentikan proses wizard yang satunya; "
+                                "jangan jalankan dua wizard bersamaan")
+        raise
+    handle.seek(0)
+    handle.truncate()
+    handle.write(f"{os.getpid()}\n")
+    handle.flush()
+    return handle
+
+
 # --------------------------------------------------------------------------- jawaban & prompt
 SECRET_KEY_RE = re.compile(r"(token|secret|password|passwd|passphrase|credential|api[_\-]?key|private[_\-]?key|"
                            r"llm[_\-]?key|bearer|authorization)", re.I)
@@ -355,6 +474,7 @@ ANSWER_KEYS = {
     "llm_model_simple", "llm_on_failure", "team_name", "timezone", "threads_personal", "usage_reports",
     "usage_channel", "report_daily", "report_weekly", "report_monthly", "install_hermes",
     "overwrite_team_yaml", "build_sandbox", "sandbox_tag", "usage_timer", "report_timer", "run_selftest",
+    "adopt_existing_roles", "adopt_existing_channels", "admin_allow_bot", "allow_http_llm",
 }
 TRUE_WORDS = {"y", "ya", "yes", "true", "1", "iya", "on"}
 FALSE_WORDS = {"t", "tidak", "n", "no", "false", "0", "off"}
@@ -545,17 +665,77 @@ class Prompter:
             self._read(f"  {message} — tekan Enter untuk lanjut ")
 
 
+class UnsafePath(StepError):
+    """Jalur berkas yang dibelokkan symlink atau bukan berkas biasa (root tidak boleh menulis/membaca ke sana)."""
+
+    def __init__(self, message: str, cause: str = "", fix: str = ""):
+        super().__init__(message, cause, fix)
+
+
+def _open_dir_nofollow(base: str, parts: Tuple[str, ...], follow_base: bool = True, create: bool = False,
+                       on_create: Optional[Callable[[int], None]] = None) -> int:
+    """Buka direktori `base/parts...` komponen demi komponen dengan openat(O_NOFOLLOW): tidak ada symlink yang diikuti
+    di bawah `base` (juga bila user menukarnya di tengah jalan). Dengan `create`, komponen yang belum ada dibuat (0700)
+    lalu diserahkan ke `on_create(fd)` untuk chown/chmod lewat descriptor."""
+    flags = os.O_RDONLY | os.O_DIRECTORY
+    bad = (errno.ELOOP, errno.ENOTDIR)
+    try:
+        fd = os.open(base, flags | (0 if follow_base else os.O_NOFOLLOW))
+    except OSError as exc:
+        if exc.errno in bad:
+            raise UnsafePath(f"{base} adalah symlink atau bukan direktori", fix=f"periksa jalurnya, lalu ulangi: {RESUME_HINT}")
+        raise
+    try:
+        for part in parts:
+            try:
+                nxt = os.open(part, flags | os.O_NOFOLLOW, dir_fd=fd)
+            except FileNotFoundError:
+                if not create:
+                    raise
+                os.mkdir(part, 0o700, dir_fd=fd)
+                nxt = os.open(part, flags | os.O_NOFOLLOW, dir_fd=fd)
+                if on_create:
+                    on_create(nxt)
+            except OSError as exc:
+                if exc.errno in bad:
+                    raise UnsafePath(f"komponen jalur '{part}' di {base} adalah symlink atau bukan direktori",
+                                     fix="hapus/pindahkan symlink itu (dibuat oleh siapa?), lalu ulangi: " + RESUME_HINT)
+                raise
+            os.close(fd)
+            fd = nxt
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+class WizardDiscordAPI(DiscordAPI):
+    """Klien Discord untuk wizard. POST TIDAK diulang otomatis saat 5xx: jawaban 502/503/504 bisa datang setelah Discord
+    sudah membuat objeknya, dan ulangan membuat channel/role ganda. Pemulihannya ada di `create_recovering`."""
+
+    def request(self, method, path, body=None, reason=None, query=None):
+        if method != "POST":
+            return super().request(method, path, body, reason, query)
+        saved, self.RETRY_STATUSES = self.RETRY_STATUSES, ()
+        try:
+            return super().request(method, path, body, reason, query)
+        finally:
+            self.RETRY_STATUSES = saved
+
+
 # --------------------------------------------------------------------------- konteks
 class Context:
     def __init__(self, system: HostSystem, state: State, prompter: Prompter, *, user: str = "hermes",
                  kit_dir: Path = Path("/opt/hermes-team"), source_dir: Optional[Path] = None,
                  etc_dir: Path = Path("/etc/hermes"), linger_dir: Path = Path("/var/lib/systemd/linger"),
-                 dry_run: bool = False, out: Callable[[str], None] = print):
+                 dry_run: bool = False, out: Callable[[str], None] = print,
+                 discord_base: str = DISCORD_API_BASE, no_systemd: bool = False):
         self.sys, self.state, self.prompt = system, state, prompter
         self.user_name = user
         self.kit_dir = Path(kit_dir)
         self.source_dir = Path(source_dir) if source_dir else Path(__file__).resolve().parent
         self.etc_dir, self.linger_dir = Path(etc_dir), Path(linger_dir)
+        self.discord_base, self.no_systemd = str(discord_base).rstrip("/"), bool(no_systemd)
         self.dry_run = dry_run
         self._out = out
         self.secrets: List[str] = []
@@ -634,43 +814,122 @@ class Context:
         return next((p for p in candidates if p.exists()), candidates[0])
 
     # ---- berkas
+    # Direktori ~hermes dimiliki user tanpa hak istimewa, sedangkan wizard berjalan sebagai root: semua baca/tulis di
+    # bawah home itu lewat descriptor direktori + O_NOFOLLOW (tidak bisa dibelokkan symlink), nama sementara acak
+    # dengan O_EXCL, dan chown/chmod lewat descriptor berkas (bukan lewat path).
+    def _target(self, path: Path) -> Tuple[str, Tuple[str, ...], str, bool]:
+        """(direktori dasar, komponen di bawahnya, nama berkas, dasar-boleh-diikuti-symlink)."""
+        path = Path(os.path.abspath(str(path)))
+        home = self.home()
+        if home is not None:
+            try:
+                rel = path.parent.relative_to(os.path.abspath(str(home)))
+            except ValueError:
+                pass
+            else:
+                return os.path.realpath(str(home)), tuple(rel.parts), path.name, True
+        return str(path.parent), (), path.name, False
+
+    def _open_parent(self, path: Path, create: bool = False, on_create: Optional[Callable[[int], None]] = None) -> int:
+        base, parts, _name, follow_base = self._target(path)
+        try:
+            return _open_dir_nofollow(base, parts, follow_base, create, on_create)
+        except UnsafePath as exc:
+            raise UnsafePath(f"{path}: {exc.message}", fix=exc.fix)
+
     def write_file(self, path: Path, text: str, mode: int, owner: str = "root", group: str = "root") -> None:
         path = Path(path)
-        tmp = path.with_name(f".{path.name}.tmp-{os.getpid()}")
-        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        name = path.name
+        dfd = self._open_parent(path)
+        tmp = f".{name}.tmp-{os.urandom(8).hex()}"
         try:
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                fh.write(text)
-            self.sys.chown(tmp, owner, group)
-            os.chmod(tmp, mode)
-            os.replace(tmp, path)
-        except BaseException:
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=dfd)
             try:
-                os.unlink(tmp)
-            except OSError:
-                pass
-            raise
+                with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    fh.write(text)
+                    fh.flush()
+                    self.sys.fchown(fh.fileno(), owner, group)
+                    os.fchmod(fh.fileno(), mode)
+                try:
+                    st = os.stat(name, dir_fd=dfd, follow_symlinks=False)
+                except FileNotFoundError:
+                    st = None
+                if st is not None and not statmod.S_ISREG(st.st_mode):
+                    kind = "symlink" if statmod.S_ISLNK(st.st_mode) else "bukan berkas biasa"
+                    raise UnsafePath(f"{path} adalah {kind}; wizard tidak menimpanya",
+                                     fix=f"periksa {path} (siapa yang membuatnya?), pindahkan/hapus, lalu ulangi: {RESUME_HINT}")
+                os.replace(tmp, name, src_dir_fd=dfd, dst_dir_fd=dfd)
+            except BaseException:
+                try:
+                    os.unlink(tmp, dir_fd=dfd)
+                except OSError:
+                    pass
+                raise
+        finally:
+            os.close(dfd)
+
+    def read_text(self, path: Path, limit: int = 4 * 1024 * 1024) -> str:
+        """Baca berkas teks tanpa mengikuti symlink (FileNotFoundError bila tidak ada)."""
+        path = Path(path)
+        dfd = self._open_parent(path)
+        try:
+            try:
+                fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dfd)
+            except OSError as exc:
+                if exc.errno == errno.ELOOP:
+                    raise UnsafePath(f"{path} adalah symlink; wizard tidak membacanya",
+                                     fix=f"periksa {path} (siapa yang membuatnya?), hapus symlink itu, lalu ulangi: {RESUME_HINT}")
+                raise
+            with os.fdopen(fd, "rb") as fh:
+                if not statmod.S_ISREG(os.fstat(fh.fileno()).st_mode):
+                    raise UnsafePath(f"{path} bukan berkas biasa", fix=f"periksa {path}, lalu ulangi: {RESUME_HINT}")
+                return fh.read(limit).decode("utf-8")
+        finally:
+            os.close(dfd)
 
     def make_dir(self, path: Path, mode: int, owner: str = "root", group: str = "root") -> None:
         path = Path(path)
+
+        def fix_new(fd: int) -> None:
+            self.sys.fchown(fd, owner, group)
+            os.fchmod(fd, mode)
+
+        base, parts, name, follow_base = self._target(path / "x")      # `path` sendiri ikut sebagai komponen
+        if follow_base:
+            try:
+                os.close(_open_dir_nofollow(base, parts, True, True, fix_new))
+            except UnsafePath as exc:
+                raise UnsafePath(f"{path}: {exc.message}", fix=exc.fix)
+            return
+        if path.is_symlink():
+            raise UnsafePath(f"{path} adalah symlink; wizard tidak memakainya", fix=f"hapus symlink itu, lalu ulangi: {RESUME_HINT}")
         if not path.is_dir():
             path.mkdir(parents=True)
             self.sys.chown(path, owner, group)
             os.chmod(path, mode)
 
+    def backup_file(self, source: Path, backup: Path, owner: str, group: str) -> Path:
+        """Cadangan berkas milik user: baca tanpa mengikuti symlink, tulis ke nama baru (tidak menimpa cadangan lain)."""
+        text = self.read_text(source)
+        target, n = Path(backup), 0
+        while os.path.lexists(target):
+            n += 1
+            target = Path(f"{backup}-{n}")
+        self.write_file(target, text, 0o600, owner, group)
+        return target
+
     def set_env_value(self, path: Path, key: str, value: str, mode: int, owner: str, group: str) -> None:
         """Tulis satu baris KEY=value ke berkas .env (baris lain dipertahankan), langsung dari memori."""
         try:
-            old = Path(path).read_text(encoding="utf-8")
+            old = self.read_text(path)
         except FileNotFoundError:
             old = ""
         self.write_file(path, rewrite_env_text(old, key, value), mode, owner, group)
 
-    @staticmethod
-    def read_env_value(path: Path, key: str) -> str:
+    def read_env_value(self, path: Path, key: str) -> str:
         try:
-            return parse_env_text(Path(path).read_text(encoding="utf-8")).get(key, "")
-        except OSError:
+            return parse_env_text(self.read_text(path)).get(key, "")
+        except (OSError, UnicodeDecodeError):
             return ""
 
     # ---- perintah
@@ -681,7 +940,8 @@ class Context:
         if self.dry_run:
             raise RuntimeError("bug wizard: perintah dijalankan saat --dry-run")
         argv = [str(a) for a in argv]
-        env = {k: v for k, v in os.environ.items() if not k.startswith("HERMES_SETUP_")}
+        env = {k: v for k, v in os.environ.items()
+               if not k.startswith("HERMES_SETUP_") and k != "TEAMCTL_DISCORD_API"}
         cwd = None
         shown = " ".join(argv)
         if as_user:
@@ -715,7 +975,7 @@ class Context:
 
     def discord(self) -> DiscordAPI:
         if self._api is None:
-            self._api = DiscordAPI(self.bot_token(), sleep=self.sys.sleep)
+            self._api = WizardDiscordAPI(self.bot_token(), base=self.discord_base, sleep=self.sys.sleep)
         return self._api
 
     def llm_key(self, key_env: str, ask: bool = True, fresh: bool = False) -> str:
@@ -777,6 +1037,7 @@ class Preflight(Step):
     def plan(self, ctx):
         return ["baca /etc/os-release, RAM, dan ruang disk",
                 f"coba hubungi {DISCORD_PROBE_URL} dan {HERMES_INSTALL_URL}",
+                "pastikan systemd berjalan (/run/systemd/system) — kecuali --no-systemd",
                 "jalankan: timedatectl show -p NTPSynchronized --value"]
 
     def run(self, ctx):
@@ -805,8 +1066,18 @@ class Preflight(Step):
             ctx.warn(f"ruang disk kosong {free:.1f} GB (di bawah 20 GB): image sandbox dan Docker butuh ruang")
         else:
             ctx.say(f"  ✓ Disk kosong: {free:.1f} GB")
-        if not ctx.sys.has_systemd():
-            ctx.warn("systemd tidak terdeteksi: layanan gateway dan timer (langkah 12–13) tidak akan bisa dipasang")
+        if ctx.sys.has_systemd():
+            ctx.say("  ✓ systemd berjalan (PID 1)")
+        elif ctx.no_systemd:
+            ctx.warn("systemd tidak terdeteksi; lanjut karena --no-systemd: gateway dan timer TIDAK dipasang sebagai layanan "
+                     "(perintah manualnya dicetak di langkah gateway)")
+        else:
+            raise StepError("systemd tidak berjalan di server ini (tidak ada /run/systemd/system atau tidak ada systemctl)",
+                            cause="gateway dan timer pemakaian dipasang sebagai unit systemd user; di kontainer/WSL tanpa systemd "
+                                  "langkah 12–13 pasti gagal — setelah role, channel, dan token di Discord sudah dibuat",
+                            fix="jalankan di server dengan systemd (VM atau bare metal), atau di WSL aktifkan systemd=true di "
+                                f"/etc/wsl.conf; atau terima konsekuensinya: {RESUME_HINT} --no-systemd "
+                                "(gateway dan timer dijalankan manual)")
         ok, detail = ctx.sys.net_check(DISCORD_PROBE_URL)
         if not ok:
             raise StepError("discord.com tidak terjangkau dari server ini", cause=detail,
@@ -857,12 +1128,12 @@ class Packages(Step):
                     what="pemasangan paket", fix=fix)
         if not ctx.sys.which("docker"):
             ctx.say("  Docker belum ada. Cara pasang resmi tercepat adalah skrip get.docker.com, yang berjalan sebagai root:")
-            ctx.say(f"    curl -fsSL {DOCKER_SCRIPT_URL} | sh")
+            ctx.say(f"    curl --proto '=https' --tlsv1.2 -fsSL {DOCKER_SCRIPT_URL} | sh")
             manual = "pasang Docker sendiri (https://docs.docker.com/engine/install/), lalu ulangi: " + RESUME_HINT
             if not ctx.prompt.confirm("install_docker", "Unduh dan jalankan skrip itu sekarang?", None):
                 raise StepError("Docker wajib ada (sandbox tiap anggota berjalan di container)", fix=manual)
             script = ctx.state.path.parent / "get-docker.sh"
-            ctx.run(["curl", "-fsSL", DOCKER_SCRIPT_URL, "-o", str(script)], what="unduh skrip Docker", fix=manual)
+            ctx.run(["curl"] + CURL_SECURE + ["-fsSL", DOCKER_SCRIPT_URL, "-o", str(script)], what="unduh skrip Docker", fix=manual)
             ctx.run(["sh", str(script)], stream=True, what="pemasangan Docker", fix=manual)
             if not ctx.sys.which("docker"):
                 raise StepError("skrip Docker selesai tetapi perintah `docker` tetap tidak ditemukan", fix=manual)
@@ -1057,44 +1328,176 @@ def find_role(roles: List[dict], name: str) -> Optional[dict]:
     return hits[0] if hits else None
 
 
-def ensure_role(ctx: Context, api: DiscordAPI, guild_id: str, roles: List[dict], name: str) -> Tuple[dict, bool]:
+AMBIGUOUS_STATUSES = (500, 502, 503, 504)
+
+
+def create_recovering(ctx: Context, create: Callable[[], dict], relist: Callable[[], Optional[dict]], what: str,
+                      attempts: int = 3) -> dict:
+    """POST pembuatan bisa dijawab 502/503/504 SETELAH Discord membuat objeknya (atau koneksi putus di tengah). Klien
+    wizard tidak mengulang POST sendiri; di sini, setelah jawaban yang ambigu, daftar dibaca ulang dulu: kalau objeknya
+    sudah ada, itulah hasilnya; baru bila belum ada, POST diulang."""
+    last: Optional[Exception] = None
+    for attempt in range(attempts):
+        try:
+            return create()
+        except DiscordHTTPError as exc:
+            if exc.status not in AMBIGUOUS_STATUSES:
+                raise
+            last = exc
+        except TeamError as exc:           # koneksi putus: tidak diketahui apakah sudah dikerjakan Discord
+            last = exc
+        ctx.say(f"  · pembuatan {what} dijawab galat sementara; memeriksa dulu apakah sudah terbuat ...")
+        ctx.sys.sleep(min(2 ** attempt, 8))
+        found = relist()
+        if found is not None:
+            ctx.say(f"  · {what} ternyata sudah terbuat; dipakai, tidak dibuat ulang")
+            return found
+    assert last is not None
+    raise last
+
+
+def perm_words(bits: int) -> str:
+    out = []
+    for name in permission_names(bits):
+        label = name.replace("_", " ")
+        if name == "administrator":
+            label = "ADMINISTRATOR (akses penuh ke seluruh server, melewati semua batasan channel)"
+        elif name in ELEVATED_PERMISSIONS:
+            label += " (izin tinggi)"
+        out.append(label)
+    return ", ".join(out)
+
+
+def review_role_adoption(ctx: Context, found: Dict[str, dict], names: Dict[str, str]) -> None:
+    """Role yang sudah ada tapi punya izin tidak diadopsi diam-diam: admin tim akan mewarisi izin itu. Dipanggil SEBELUM
+    ada satu pun penulisan ke Discord."""
+    risky = [(key, role, int(role.get("permissions") or 0)) for key, role in found.items()
+             if int(role.get("permissions") or 0)]
+    if not risky:
+        return
+    summary = []
+    for key, role, bits in risky:
+        line = f"@{role.get('name')} ({role.get('id')}): {perm_words(bits)}"
+        summary.append(line)
+        ctx.say(f"  ! role yang sudah ada {line}")
+    ctx.say("    Role tim seharusnya TANPA izin; anggota/admin yang diberi role ini akan memperoleh izin di atas di seluruh server.")
+    question = ("Pakai role yang sudah ada ini apa adanya? " + "; ".join(summary))
+    if not ctx.prompt.confirm("adopt_existing_roles", question, None):
+        raise StepError("role yang sudah ada punya izin dan tidak dipakai: " + ", ".join(f"@{r.get('name')}" for _k, r, _b in risky),
+                        cause="atas permintaanmu (adopt_existing_roles tidak disetujui); tidak ada yang diubah di Discord",
+                        fix="pakai nama role lain (role_entry / role_member / role_admin di --answers, atau ketik nama lain saat "
+                            f"ditanya) lalu {RESUME_HINT} --from discord_server; atau kosongkan izin role itu di Server Settings → Roles")
+
+
+def ensure_role(ctx: Context, api: DiscordAPI, guild_id: str, roles: List[dict], name: str,
+                approved: bool = False) -> Tuple[dict, bool]:
     role = find_role(roles, name)
     if role is not None:
+        if not approved:
+            review_role_adoption(ctx, {name: role}, {name: name})
         return role, False
-    role = api.create_role(guild_id, {"name": name, "permissions": "0", "mentionable": False},
-                           reason="Hermes setup: role tim")
+    role = create_recovering(
+        ctx, lambda: api.create_role(guild_id, {"name": name, "permissions": "0", "mentionable": False},
+                                     reason="Hermes setup: role tim"),
+        lambda: find_role(api.guild_roles(guild_id), name), f"role @{name}")
     roles.append(role)
     return role, True
 
 
-def ensure_category(api: DiscordAPI, guild_id: str, channels: List[dict], name: str) -> Tuple[dict, bool]:
-    for ch in channels:
-        if ch.get("type") == 4 and _name_key(ch.get("name")) == _name_key(name):
-            return ch, False
-    cat = api.create_channel(guild_id, {"name": name, "type": 4}, reason="Hermes setup: kategori")
+def find_category(channels: List[dict], name: str) -> Optional[dict]:
+    return next((ch for ch in channels if ch.get("type") == 4 and _name_key(ch.get("name")) == _name_key(name)), None)
+
+
+def ensure_category(ctx: Context, api: DiscordAPI, guild_id: str, channels: List[dict], name: str) -> Tuple[dict, bool]:
+    found = find_category(channels, name)
+    if found is not None:
+        return found, False
+    cat = create_recovering(ctx, lambda: api.create_channel(guild_id, {"name": name, "type": 4}, reason="Hermes setup: kategori"),
+                            lambda: find_category(api.guild_channels(guild_id), name), f"kategori {name}")
     channels.append(cat)
     return cat, True
 
 
-def ensure_text_channel(ctx: Context, api: DiscordAPI, guild_id: str, channels: List[dict], name: str,
-                        parent_id: str, overwrites: List[dict], topic: str = "") -> Tuple[dict, bool]:
-    """Cari channel teks bernama `name` (utamakan yang di kategori Hermes) atau buat. Channel yang sudah
-    ada hanya disetel overwrite-nya yang berbeda; overwrite lain milik operator tidak disentuh."""
+def _text_hits(channels: List[dict], name: str, parent_id: str) -> List[dict]:
     hits = [c for c in channels if c.get("type") == 0 and _name_key(c.get("name")) == _name_key(name)]
     hits.sort(key=lambda c: str(c.get("parent_id") or "") != str(parent_id))
+    return hits
+
+
+def _viewer_lines(api: DiscordAPI, guild_id: str, channels: List[dict], ch: dict, others: Dict[str, dict],
+                  everyone_open: bool) -> List[str]:
+    lines = []
+    if everyone_open:
+        lines.append("@everyone (semua anggota server): channel ini TIDAK menolak lihat untuk @everyone, jadi PUBLIK")
+    roles = None
+    for oid, over in others.items():
+        if int(over.get("type") or 0) == 0:
+            if roles is None:
+                roles = {str(r["id"]): r for r in api.guild_roles(guild_id)}
+            lines.append(f"role @{(roles.get(oid) or {}).get('name', '?')} ({oid})")
+        else:
+            try:
+                who = (api.guild_member(guild_id, oid).get("user") or {}).get("username", "?")
+            except DiscordHTTPError:
+                who = "?"
+            lines.append(f"anggota {who} ({oid})")
+    return lines
+
+
+def review_text_channel(ctx: Context, api: DiscordAPI, guild_id: str, channels: List[dict], name: str, parent_id: str,
+                        overwrites: List[dict]) -> Optional[dict]:
+    """Rencana untuk channel teks `name` (None = belum ada, akan dibuat). Channel yang sudah ada tapi di luar kategori
+    Hermes, atau yang bisa dilihat pihak lain di luar yang dimaksud, TIDAK diadopsi diam-diam: pelihatnya ditampilkan dan
+    wizard meminta persetujuan untuk MENGHAPUS izin lihat mereka. Tidak menulis apa pun ke Discord."""
+    hits = _text_hits(channels, name, parent_id)
     if not hits:
-        body = {"name": name, "type": 0, "parent_id": parent_id, "topic": topic[:1024],
-                "permission_overwrites": overwrites}
-        ch = api.create_channel(guild_id, body, reason=f"Hermes setup: #{name}")
+        return None
+    ch = hits[0]
+    current = {str(o.get("id")): o for o in ch.get("permission_overwrites") or []}
+    intended = {str(want["id"]) for want in overwrites}
+    others = {oid: o for oid, o in current.items() if oid not in intended and int(o.get("allow") or 0) & PERM["VIEW_CHANNEL"]}
+    outside = not parent_id or str(ch.get("parent_id") or "") != str(parent_id)
+    plan = {"channel": ch, "others": others, "outside": outside}
+    if not (outside or others):
+        return plan
+    ev = current.get(str(guild_id))
+    everyone_open = ev is None or not int(ev.get("deny") or 0) & PERM["VIEW_CHANNEL"]
+    viewers = _viewer_lines(api, guild_id, channels, ch, others, everyone_open)
+    where = next((c.get("name") for c in channels if str(c.get("id")) == str(ch.get("parent_id"))), None)
+    ctx.say(f"  ! #{name} ({ch['id']}) sudah ada" + (f" di luar kategori Hermes (kategori: {where or 'tanpa kategori'})" if outside else ""))
+    if viewers:
+        ctx.say("    Yang saat ini bisa melihat channel itu:")
+        for line in viewers:
+            ctx.say(f"      - {line}")
+    ctx.say("    Menyetujui = wizard MENGHAPUS izin lihat pihak-pihak di atas (selain yang dimaksud), lalu menyetel izin channel "
+            "sehingga hanya role tim + bot yang melihat. Channel tidak dipindah.")
+    question = (f"Pakai #{name} yang sudah ada? Dilihat oleh: " + ("; ".join(viewers) or "(tidak ada pelihat tambahan)"))
+    if not ctx.prompt.confirm("adopt_existing_channels", question, None):
+        raise StepError(f"channel #{name} yang sudah ada tidak dipakai",
+                        cause="atas permintaanmu (adopt_existing_channels tidak disetujui); tidak ada yang diubah di Discord",
+                        fix=f"pakai nama channel lain (shared_channel / admin_channel / usage_channel), atau rapikan izin #{name} "
+                            f"sendiri di Discord, lalu {RESUME_HINT} --from discord_server")
+    return plan
+
+
+def apply_text_channel(ctx: Context, api: DiscordAPI, guild_id: str, channels: List[dict], name: str, parent_id: str,
+                       overwrites: List[dict], topic: str, plan: Optional[dict]) -> Tuple[dict, bool]:
+    if plan is None:
+        body = {"name": name, "type": 0, "parent_id": parent_id, "topic": topic[:1024], "permission_overwrites": overwrites}
+        ch = create_recovering(
+            ctx, lambda: api.create_channel(guild_id, body, reason=f"Hermes setup: #{name}"),
+            lambda: next(iter(_text_hits(api.guild_channels(guild_id), name, parent_id)), None), f"channel #{name}")
         channels.append(ch)
         return ch, True
-    ch = hits[0]
-    if str(ch.get("parent_id") or "") != str(parent_id):
-        ctx.say(f"  · #{name} sudah ada di luar kategori Hermes; dipakai apa adanya (tidak dipindah)")
+    ch = plan["channel"]
+    if plan["outside"]:
+        ctx.say(f"  · #{name} dipakai di luar kategori Hermes (tidak dipindah)")
     current = {str(o.get("id")): o for o in ch.get("permission_overwrites") or []}
-    wanted_ids = set()
+    denied = StepError(f"bot tidak boleh mengatur izin #{name} (403)",
+                       cause="channel itu sudah privat dan bot tidak bisa melihat/mengelolanya",
+                       fix=f"di Discord: Edit Channel #{name} → Permissions → tambahkan bot dengan View Channel + "
+                           "Manage Permissions, lalu ulangi")
     for want in overwrites:
-        wanted_ids.add(want["id"])
         have = current.get(want["id"])
         if have and int(have.get("allow") or 0) == int(want["allow"]) and int(have.get("deny") or 0) == int(want["deny"]):
             continue
@@ -1104,22 +1507,47 @@ def ensure_text_channel(ctx: Context, api: DiscordAPI, guild_id: str, channels: 
         except DiscordHTTPError as exc:
             if exc.status != 403:
                 raise
-            raise StepError(f"bot tidak boleh mengatur izin #{name} (403)",
-                            cause="channel itu sudah privat dan bot tidak bisa melihat/mengelolanya",
-                            fix=f"di Discord: Edit Channel #{name} → Permissions → tambahkan bot dengan View Channel + "
-                                "Manage Permissions, lalu ulangi")
-    for other_id, other in current.items():
-        if other_id not in wanted_ids and int(other.get("allow") or 0) & PERM["VIEW_CHANNEL"]:
-            ctx.warn(f"#{name} punya izin lihat tambahan untuk ID {other_id} (tidak diubah wizard); pastikan memang disengaja")
+            raise denied
+    for other_id in plan["others"]:
+        try:
+            api.delete_overwrite(ch["id"], other_id, reason="Hermes setup: channel privat (izin lihat tambahan dicabut)")
+        except DiscordHTTPError as exc:
+            if exc.status != 403:
+                raise
+            raise denied
+        ctx.say(f"  · izin lihat {other_id} di #{name} dicabut (disetujui operator)")
     return ch, False
 
 
+def ensure_text_channel(ctx: Context, api: DiscordAPI, guild_id: str, channels: List[dict], name: str,
+                        parent_id: str, overwrites: List[dict], topic: str = "") -> Tuple[dict, bool]:
+    """Cari channel teks bernama `name` (utamakan yang di kategori Hermes) atau buat, dengan peninjauan di atas."""
+    plan = review_text_channel(ctx, api, guild_id, channels, name, parent_id, overwrites)
+    return apply_text_channel(ctx, api, guild_id, channels, name, parent_id, overwrites, topic, plan)
+
+
+MENTION_RE = re.compile(r"^<@!?(\d+)>$")
+
+
+def _confirm_not_bot(ctx: Context, member: dict) -> dict:
+    user = member.get("user") or {}
+    if user.get("bot"):
+        label = f"{user.get('username')} ({user.get('id')})"
+        if not ctx.prompt.confirm("admin_allow_bot", f"{label} adalah akun BOT. Beri role admin tim ke akun bot?", None):
+            raise StepError(f"akun bot {label} tidak dijadikan admin tim",
+                            fix="isi `admins` dengan user ID manusia (bukan bot), atau setujui dengan `admin_allow_bot: true`")
+    return member
+
+
 def resolve_admin(ctx: Context, api: DiscordAPI, guild_id: str, text: str) -> dict:
-    """ID user atau username → member. Hasil pencarian ganda: operator memilih (non-interaktif: gagal)."""
-    text = text.strip().lstrip("@")
+    """User ID / mention, atau username/global name PERSIS → member. Cocokan sebagian (awalan) tidak pernah dipakai
+    langsung: kandidat ditampilkan dengan ID-nya dan operator memilih. Mode non-interaktif hanya menerima ID/mention."""
+    text = text.strip()
+    mention = MENTION_RE.match(text)
+    text = mention.group(1) if mention else text.lstrip("@")
     if ID_RE.match(text):
         try:
-            return api.guild_member(guild_id, text)
+            return _confirm_not_bot(ctx, api.guild_member(guild_id, text))
         except DiscordHTTPError as exc:
             if exc.status == 404:
                 raise StepError(f"user ID {text} bukan anggota server ini", fix="minta orangnya masuk server dulu, atau periksa ID-nya")
@@ -1127,18 +1555,25 @@ def resolve_admin(ctx: Context, api: DiscordAPI, guild_id: str, text: str) -> di
     hits = [m for m in api.search_members(guild_id, text, limit=10) if not (m.get("user") or {}).get("bot")]
     if not hits:
         raise StepError(f"tidak ada anggota server yang namanya diawali '{text}'",
-                        fix="pakai username Discord persis, atau user ID (Developer Mode → klik kanan → Copy User ID)")
-    exact = [m for m in hits if _name_key(m["user"].get("username")) == _name_key(text)]
+                        fix="pakai user ID (Developer Mode → klik kanan → Copy User ID) atau username Discord persis")
+
+    def label(m: dict) -> str:
+        user = m["user"]
+        return f"{user.get('username')} — {user.get('global_name') or m.get('nick') or ''} ({user['id']})"
+
+    if ctx.prompt.non_interactive:
+        raise StepError(f"'{text}' bukan user ID; mode non-interaktif hanya menerima user ID atau mention (<@ID>). Kandidat: "
+                        + "; ".join(label(m) for m in hits),
+                        fix="tulis user ID-nya di `admins` (Developer Mode → klik kanan → Copy User ID)")
+    exact = [m for m in hits if text.casefold() in {_name_key(m["user"].get("username")), _name_key(m["user"].get("global_name"))}]
     if len(exact) == 1:
         return exact[0]
-    if len(hits) == 1:
-        return hits[0]
-    labels = [(str(m["user"]["id"]), f"{m['user'].get('username')} — {m['user'].get('global_name') or m.get('nick') or ''} "
-               f"({m['user']['id']})") for m in hits]
-    if ctx.prompt.non_interactive:
-        raise StepError(f"'{text}' cocok dengan {len(hits)} anggota: " + "; ".join(label for _v, label in labels),
-                        fix="tulis user ID-nya di `admins`")
-    choice = ctx.prompt.choose("admin_pick", f"'{text}' cocok dengan beberapa orang:", labels, record=False)
+    options = [(str(m["user"]["id"]), label(m)) for m in (exact or hits)]
+    options.append(("", "Bukan salah satu di atas — batal"))
+    choice = ctx.prompt.choose("admin_pick", f"'{text}' bukan username persis; pilih orang yang dimaksud (cek ID-nya):",
+                               options, record=False)
+    if not choice:
+        raise StepError(f"admin '{text}' dibatalkan", fix="tulis user ID-nya di `admins`")
     return next(m for m in hits if str(m["user"]["id"]) == choice)
 
 
@@ -1196,9 +1631,11 @@ class DiscordServer(Step):
         if len({_name_key(n) for n in names.values()}) < 3:
             raise StepError("ketiga nama role harus berbeda")
         found: Dict[str, dict] = {}
+        # Tinjau SEMUA role yang sudah ada lebih dulu (konfirmasi bila berizin) sebelum ada penulisan ke Discord.
+        review_role_adoption(ctx, {k: r for k, r in ((k, find_role(roles, n)) for k, n in names.items()) if r}, names)
         try:
             for key, role_name in names.items():
-                found[key], created = ensure_role(ctx, api, guild_id, roles, role_name)
+                found[key], created = ensure_role(ctx, api, guild_id, roles, role_name, approved=True)
                 ctx.data[f"role_{key}_id"], ctx.data[f"role_{key}_name"] = str(found[key]["id"]), role_name
                 ctx.say(f"  ✓ role @{role_name}: {found[key]['id']}" + (" (baru dibuat)" if created else " (sudah ada)"))
         except DiscordHTTPError as exc:
@@ -1225,15 +1662,22 @@ class DiscordServer(Step):
             raise StepError("channel bersama dan channel admin harus berbeda")
         try:
             channels = api.guild_channels(guild_id)
-            category, created = ensure_category(api, guild_id, channels, category_name)
-            ctx.data["category_id"], ctx.data["category_name"] = str(category["id"]), category_name
-            ctx.say(f"  ✓ kategori {category_name}: {category['id']}" + (" (baru dibuat)" if created else " (sudah ada)"))
+            existing_category = find_category(channels, category_name)
+            wanted = []
             for key, ch_name, role_key, topic in (
                     ("shared", shared_name, "member", "Hermes bersama tim: mention bot untuk memulai thread."),
                     ("admin", admin_name, "admin", "Hermes admin tim: kelola anggota, model, dan server.")):
-                ch, created = ensure_text_channel(
-                    ctx, api, guild_id, channels, ch_name, ctx.data["category_id"],
-                    private_channel_overwrites(guild_id, ctx.data[f"role_{role_key}_id"], bot_id), topic)
+                overwrites = private_channel_overwrites(guild_id, ctx.data[f"role_{role_key}_id"], bot_id)
+                # tinjau dan minta persetujuan untuk KEDUA channel sebelum menulis apa pun
+                plan = review_text_channel(ctx, api, guild_id, channels, ch_name,
+                                           str(existing_category["id"]) if existing_category else "", overwrites)
+                wanted.append((key, ch_name, overwrites, topic, plan))
+            category, created = ensure_category(ctx, api, guild_id, channels, category_name)
+            ctx.data["category_id"], ctx.data["category_name"] = str(category["id"]), category_name
+            ctx.say(f"  ✓ kategori {category_name}: {category['id']}" + (" (baru dibuat)" if created else " (sudah ada)"))
+            for key, ch_name, overwrites, topic, plan in wanted:
+                ch, created = apply_text_channel(ctx, api, guild_id, channels, ch_name, ctx.data["category_id"],
+                                                 overwrites, topic, plan)
                 ctx.data[f"{key}_channel_id"], ctx.data[f"{key}_channel_name"] = str(ch["id"]), ch_name
                 ctx.say(f"  ✓ #{ch_name}: {ch['id']}" + (" (baru dibuat)" if created else " (sudah ada, izin diselaraskan)"))
         except DiscordHTTPError as exc:
@@ -1286,11 +1730,36 @@ def valid_url(value: str) -> Optional[str]:
     return None
 
 
+# Variabel yang membentuk lingkungan proses (loader, interpreter, shell, lokasi) atau milik Hermes/wizard: tidak boleh
+# dipakai sebagai NAMA variabel key LLM (nilainya ditulis ke /etc/hermes/.env yang dibaca profile).
+BLOCKED_ENV_NAMES = {
+    "PATH", "HOME", "USER", "LOGNAME", "SHELL", "PWD", "OLDPWD", "IFS", "ENV", "TERM", "LANG", "LANGUAGE", "TZ", "TMPDIR",
+    "DISPLAY", "EDITOR", "VISUAL", "PAGER", "PS1", "HOSTALIASES", "LOCPATH", "NLSPATH", "GCONV_PATH", "RESOLV_HOST_CONF",
+    "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE",
+    "CURL_CA_BUNDLE", "NODE_OPTIONS", "NODE_PATH", "PERL5LIB", "PERL5OPT", "RUBYLIB", "RUBYOPT", "CLASSPATH",
+    "JAVA_TOOL_OPTIONS", "DISCORD_BOT_TOKEN", "OLDPATH",
+}
+BLOCKED_ENV_PREFIXES = ("LD_", "PYTHON", "BASH_", "SUDO_", "XDG_", "DBUS_", "MALLOC_", "GLIBC_", "LC_", "HERMES_", "DISCORD_",
+                        "TEAMCTL_", "SSH_", "GIT_", "DOCKER_")
+KEY_PREFIXES = ("SK-", "GHP_", "GHO_", "GHS_", "GHU_", "GITHUB_PAT_", "GLPAT-", "XOXB-", "XOXP-", "NVAPI-", "EYJ")
+
+
 def valid_env_name(value: str) -> Optional[str]:
+    """Nama variabel env tempat API key disimpan. Nilai yang diketik TIDAK dikutip di pesan (bisa jadi key sungguhan)."""
+    looks_like_key = (
+        len(value) > 40
+        or (len(value) >= 12 and value.upper().startswith(KEY_PREFIXES))
+        or re.fullmatch(r"(AKIA|ASIA)[A-Z0-9]{16}", value) is not None
+        or (len(value) >= 32 and sum(c.isdigit() for c in value) / len(value) >= 0.2)
+        or (len(value) >= 20 and "_" not in value and any(c.isdigit() for c in value) and any(c.isalpha() for c in value)))
+    if looks_like_key:
+        return ("itu terlihat seperti API key, bukan nama variabel. Isi NAMA variabel, bukan key-nya "
+                "(mis. TD_API_KEY); key diketik nanti di prompt tersembunyi atau lewat env " + ENV_LLM_KEY)
     if not re.match(r"^[A-Z][A-Z0-9_]{1,63}$", value):
         return "nama variabel env: HURUF_BESAR, angka, garis bawah (ini NAMA variabel, bukan key-nya)"
-    if value == "DISCORD_BOT_TOKEN":
-        return "DISCORD_BOT_TOKEN tidak boleh dipakai di sini"
+    if value in BLOCKED_ENV_NAMES or value.startswith(BLOCKED_ENV_PREFIXES):
+        return (f"{value} adalah variabel sistem/Hermes yang tidak boleh dipakai untuk menyimpan key; "
+                "pilih nama khusus, mis. TD_API_KEY")
     return None
 
 
@@ -1327,7 +1796,36 @@ LLM_STATUS_HINTS = {
     401: "API key salah atau kedaluwarsa", 403: "API key tidak berhak atas model/endpoint ini",
     404: "URL dasar salah (biasanya harus berakhir /v1) atau nama model tidak dikenal",
     429: "kuota/rate limit endpoint habis",
+    **{code: "URL dasar dialihkan (redirect) ke host lain; wizard tidak mengikutinya supaya API key tidak ikut terkirim — "
+             "pakai URL akhirnya sebagai URL dasar" for code in (301, 302, 303, 307, 308)},
 }
+
+PRIVATE_NETS = [ipaddress.ip_network(n) for n in ("127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
+                                                  "169.254.0.0/16", "::1/128", "fc00::/7", "fe80::/10")]
+
+
+def host_is_local(host: Optional[str]) -> bool:
+    """localhost, loopback, atau alamat jaringan pribadi (RFC 1918 / ULA / link-local). Nama DNS lain → False."""
+    host = (host or "").strip("[]").lower()
+    if host == "localhost" or host.endswith(".localhost"):
+        return True
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return any(ip in net for net in PRIVATE_NETS if net.version == ip.version)
+
+
+def check_transport(ctx: "Context", base: str) -> None:
+    """http:// ke host non-lokal mengirim API key dan isi percakapan tanpa enkripsi: butuh persetujuan eksplisit."""
+    parts = urllib.parse.urlsplit(base)
+    if parts.scheme != "http" or host_is_local(parts.hostname):
+        return
+    ctx.warn(f"URL LLM memakai http:// ke host {parts.hostname}: API key dan isi percakapan terkirim TANPA enkripsi lewat jaringan. "
+             "Pakai https:// bila endpoint mendukung.")
+    if not ctx.prompt.confirm("allow_http_llm", f"Tetap kirim API key lewat http:// ke {parts.hostname}?", None):
+        raise StepError(f"URL LLM http:// ke {parts.hostname} tidak disetujui",
+                        fix="pakai URL https://, atau (jaringan tepercaya saja) setujui dengan `allow_http_llm: true` di --answers")
 
 
 class LLMEndpoint(Step):
@@ -1356,6 +1854,7 @@ class LLMEndpoint(Step):
                                     "td-normal", valid_model, reask)
             simple = ctx.prompt.ask("llm_model_simple", "Nama model di endpoint untuk alias td-simple (model ringan)",
                                     "td-simple", valid_model, reask)
+            check_transport(ctx, base)
             key = ctx.llm_key(key_env, fresh=reask)
             ok = True
             for model in dict.fromkeys((simple, normal)):
@@ -1465,7 +1964,8 @@ class HermesInstall(Step):
                "dijalankan: konfigurasi tim harus diterapkan dulu. Jangan jalankan `hermes gateway setup` sendiri.")
 
     def command(self):
-        return f"set -o pipefail; curl -fsSL {HERMES_INSTALL_URL} | bash -s -- --non-interactive --skip-setup"
+        return (f"set -o pipefail; curl --proto '=https' --tlsv1.2 -fsSL {HERMES_INSTALL_URL} | "
+                "bash -s -- --non-interactive --skip-setup")
 
     def check(self, ctx):
         return (ctx.home() is not None and ctx.hermes_bin().exists()
@@ -1483,7 +1983,7 @@ class HermesInstall(Step):
         if not ctx.hermes_bin().exists():
             ctx.say(f"  Hermes belum terpasang untuk user {info.name}. Perintah installer resmi (dijalankan sebagai {info.name}):")
             ctx.say(f"    {self.command()}")
-            fix = (f"pasang manual: sudo -iu {info.name}, lalu `curl -fsSL {HERMES_INSTALL_URL} | bash`; "
+            fix = (f"pasang manual: sudo -iu {info.name}, lalu `curl --proto '=https' --tlsv1.2 -fsSL {HERMES_INSTALL_URL} | bash`; "
                    f"setelah `hermes --version` jalan, ulangi: {RESUME_HINT}")
             if not ctx.prompt.confirm("install_hermes", "Unduh dan jalankan installer itu sekarang? (beberapa menit)", None):
                 raise StepError("Hermes belum terpasang", fix=fix)
@@ -1505,7 +2005,84 @@ class HermesInstall(Step):
             ctx.warn(f"`hermes doctor` keluar dengan kode {doctor.rc}; baca keluarannya di atas (belum tentu fatal sebelum provisioning)")
 
 
-KIT_EXCLUDE = (".git", ".github", "__pycache__", ".pytest_cache", ".venv", "arsip-versi-lama", "*.pyc", "*.bak", "*.bak-*")
+# Daftar IZIN untuk salinan kit (bukan copytree + daftar tolak): berkas lain di folder sumber — `.env` lokal, berkas
+# jawaban, team.yaml, kunci SSH — tidak ikut tersalin, apalagi dibuat terbaca semua orang oleh `chmod a+rX`.
+KIT_DIRS = ("kit", "teamctl", "plugins", "skills", "systemd", "tools", "docker", "docs", "tests")
+KIT_TOP_FILES = ("VERSION", "requirements-dev.txt", "pyproject.toml", "CHANGELOG.md", "README.md", "setup.sh",
+                 "team.example.yaml", "members.example.yaml")
+KIT_TOP_GLOBS = ("*.py", "*.example.yaml", "LICENSE*")
+# Dilapisi lagi di dalam direktori yang diizinkan: dotfile apa pun, cache, cadangan, kunci/kredensial, berkas jawaban.
+KIT_DENY = ("__pycache__", "*.pyc", "*.pyo", "*.bak", "*.bak-*", "*.orig", "*.swp", "*~", "*.pem", "*.key", "*.p12", "*.pfx",
+            "id_rsa*", "id_dsa*", "id_ecdsa*", "id_ed25519*", "jawaban*", "answers*", "team.yaml", "members.yaml",
+            "*.secret*", "*.token", "venv", "node_modules")
+KIT_QUIET_SKIP = {".git", ".github", ".gitignore", "__pycache__", ".pytest_cache", ".venv", "venv", "arsip-versi-lama"}
+SYSTEM_DIRS = frozenset((
+    "/", "/etc", "/usr", "/usr/local", "/opt", "/home", "/var", "/root", "/bin", "/sbin", "/lib", "/lib32", "/lib64",
+    "/libx32", "/boot", "/dev", "/proc", "/sys", "/run", "/srv", "/tmp", "/mnt", "/media", "/snap", "/usr/bin",
+    "/usr/sbin", "/usr/lib", "/usr/lib64", "/usr/share", "/usr/local/bin", "/usr/local/lib", "/usr/local/sbin", "/var/lib",
+    "/var/log", "/var/tmp", "/etc/hermes"))
+
+
+def validate_kit_dir(path: Any, source: Path, home: Optional[str] = None) -> Optional[str]:
+    """Alasan --kit-dir ditolak, atau None. Direktori ini diganti seluruhnya oleh wizard dan jadi milik root."""
+    raw = str(path)
+    if not raw or not os.path.isabs(raw):
+        return "harus jalur absolut (mis. /opt/hermes-team)"
+    norm, real = os.path.normpath(raw), os.path.realpath(raw)
+    for candidate in (norm, real):
+        if candidate in SYSTEM_DIRS:
+            return f"{candidate} adalah direktori sistem; wizard akan menggantinya seluruhnya"
+    src = os.path.realpath(str(source))
+    if real != src and (src == real or src.startswith(real.rstrip("/") + "/")):
+        return "direktori itu memuat repo sumber wizard (induknya); menggantinya menghapus repo ini"
+    if home:
+        hr = os.path.realpath(str(home))
+        if real == hr or real.startswith(hr + "/"):
+            return f"berada di dalam home user Hermes ({hr}); user itu bisa mengubah kode yang dijalankan sebagai root"
+        if hr.startswith(real.rstrip("/") + "/"):
+            return f"memuat home user Hermes ({hr})"
+    return None
+
+
+def _kit_denied(name: str) -> bool:
+    import fnmatch
+    return name.startswith(".") or any(fnmatch.fnmatch(name, pat) for pat in KIT_DENY)
+
+
+def _copy_kit_tree(src: Path, dst: Path, skipped: List[str], rel: str) -> None:
+    for entry in sorted(os.scandir(src), key=lambda e: e.name):
+        label = f"{rel}/{entry.name}"
+        if entry.is_symlink():
+            skipped.append(label + " (symlink)")
+        elif _kit_denied(entry.name):
+            if entry.name not in KIT_QUIET_SKIP and not entry.name.endswith((".pyc", ".pyo")):
+                skipped.append(label)
+        elif entry.is_dir(follow_symlinks=False):
+            _copy_kit_tree(Path(entry.path), dst / entry.name, skipped, label)
+        elif entry.is_file(follow_symlinks=False):
+            dst.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(entry.path, dst / entry.name, follow_symlinks=False)
+        else:
+            skipped.append(label + " (bukan berkas biasa)")
+
+
+def copy_kit(src: Path, stage: Path) -> List[str]:
+    """Salin hanya yang diizinkan (KIT_DIRS, KIT_TOP_FILES/KIT_TOP_GLOBS) dari `src` ke `stage`; symlink tidak diikuti dan
+    tidak disalin. Mengembalikan daftar yang dilewati di tingkat atas (selain sampah yang memang diabaikan)."""
+    import fnmatch
+    skipped: List[str] = []
+    for entry in sorted(os.scandir(src), key=lambda e: e.name):
+        name = entry.name
+        if entry.is_symlink():
+            skipped.append(name + " (symlink)")
+        elif entry.is_dir(follow_symlinks=False) and name in KIT_DIRS:
+            _copy_kit_tree(Path(entry.path), stage / name, skipped, name)
+        elif (entry.is_file(follow_symlinks=False) and not _kit_denied(name)
+              and (name in KIT_TOP_FILES or any(fnmatch.fnmatch(name, g) for g in KIT_TOP_GLOBS))):
+            shutil.copy2(entry.path, stage / name, follow_symlinks=False)
+        elif name not in KIT_QUIET_SKIP:
+            skipped.append(name)
+    return skipped
 
 
 class KitInstall(Step):
@@ -1517,33 +2094,86 @@ class KitInstall(Step):
 
     def plan(self, ctx):
         same = ctx.kit_dir.resolve() == ctx.source_dir.resolve()
-        lines = [] if same else [f"salin {ctx.source_dir} → {ctx.kit_dir} (tanpa .git, cache uji, arsip-versi-lama)"]
+        lines = [] if same else [f"salin yang diizinkan dari {ctx.source_dir} → {ctx.kit_dir} (daftar izin: modul Python, kit/, "
+                                 "teamctl/, plugins/, skills/, systemd/, tools/, docker/, docs/, tests/, VERSION, *.example.yaml, "
+                                 "dst.; bukan .env/jawaban/kunci) — hanya bila direktori tujuan kosong/belum ada atau instalasi "
+                                 "kit sebelumnya"]
         return lines + [f"chown -R root:root {ctx.kit_dir}", f"chmod -R a+rX,go-w {ctx.kit_dir}"]
 
+    @staticmethod
+    def _wizard_dir(path: Path) -> bool:
+        return (path.is_dir() and not path.is_symlink()
+                and any((path / m).is_file() and not (path / m).is_symlink() for m in (KIT_MARKER, KIT_STAGING_MARKER)))
+
+    def _discard(self, path: Path) -> None:
+        if not self._wizard_dir(path):
+            raise StepError(f"{path} sudah ada tetapi bukan direktori kerja buatan wizard; tidak dihapus",
+                            fix=f"periksa isinya, pindahkan atau hapus sendiri, lalu ulangi: {RESUME_HINT} --from kit_install")
+        shutil.rmtree(path)
+
     def run(self, ctx):
-        src, dst = ctx.source_dir.resolve(), ctx.kit_dir
+        src, dst = ctx.source_dir.resolve(), Path(ctx.kit_dir)
         if not (src / "hermes_team.py").is_file():
             raise StepError(f"{src} bukan direktori kit (hermes_team.py tidak ada)")
-        if dst.resolve() == src:
+        home = ctx.home()
+        problem = validate_kit_dir(dst, src, str(home) if home else None)
+        if problem:
+            raise StepError(f"--kit-dir {dst} ditolak: {problem}", fix="pakai direktori khusus, mis. --kit-dir /opt/hermes-team")
+        target = dst
+        if os.path.realpath(str(dst)) == str(src):
             ctx.say(f"  · wizard dijalankan dari {dst}; tidak perlu menyalin, hanya merapikan kepemilikan")
         elif (dst / ".git").exists():
             ctx.say(f"  · {dst} adalah clone git; isinya tidak ditimpa (perbarui dengan `git -C {dst} pull`)")
         else:
-            stage = dst.with_name(dst.name + ".baru")
-            old = dst.with_name(dst.name + ".lama")
-            for leftover in (stage, old):
-                if leftover.exists():
-                    shutil.rmtree(leftover)
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copytree(src, stage, ignore=shutil.ignore_patterns(*KIT_EXCLUDE), symlinks=True)
-            if dst.exists():
-                os.replace(dst, old)
+            target = self.install_copy(ctx, src, dst)
+        ctx.run(["chown", "-R", "root:root", str(target)], what="chown kit")
+        ctx.run(["chmod", "-R", "a+rX,go-w", str(target)], what="chmod kit")
+        if target != dst:
+            self.swap(ctx, target, dst)
+
+    def install_copy(self, ctx, src: Path, dst: Path) -> Path:
+        stage, old = dst.with_name(dst.name + ".baru"), dst.with_name(dst.name + ".lama")
+        exists = os.path.lexists(dst)
+        if exists and not (self._wizard_dir(dst) and (dst / KIT_MARKER).is_file() and (dst / "hermes_team.py").is_file()):
+            raise StepError(f"{dst} sudah ada dan bukan instalasi kit buatan wizard; tidak diganti",
+                            cause=f"penggantian menghapus seluruh isinya; yang dikenali hanya direktori berpenanda {KIT_MARKER} "
+                                  "yang memuat hermes_team.py",
+                            fix="pakai --kit-dir yang kosong/belum ada (mis. /opt/hermes-team); bila ini memang instalasi lama dari "
+                                f"wizard, buat penandanya dulu: touch {dst}/{KIT_MARKER}")
+        for leftover in (stage, old):
+            if os.path.lexists(leftover):
+                self._discard(leftover)
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        stage.mkdir(mode=0o755)
+        (stage / KIT_STAGING_MARKER).write_text(f"dibuat wizard kit v{KIT_VERSION}\n", encoding="utf-8")
+        skipped = copy_kit(src, stage)
+        os.replace(stage / KIT_STAGING_MARKER, stage / KIT_MARKER)
+        if skipped:
+            ctx.say("  · tidak disalin (di luar daftar izin kit): " + ", ".join(skipped[:15]) + (" …" if len(skipped) > 15 else ""))
+        return stage
+
+    def swap(self, ctx, stage: Path, dst: Path) -> None:
+        """Tukar instalasi lama dengan yang baru; yang lama (.lama) dihapus hanya setelah yang baru terbukti ada."""
+        old = dst.with_name(dst.name + ".lama")
+        had_old = os.path.lexists(dst)
+        if had_old:
+            os.replace(dst, old)
+        try:
             os.replace(stage, dst)
-            if old.exists():
-                shutil.rmtree(old)
-            ctx.say(f"  ✓ kit v{KIT_VERSION} disalin ke {dst}")
-        ctx.run(["chown", "-R", "root:root", str(dst)], what="chown kit")
-        ctx.run(["chmod", "-R", "a+rX,go-w", str(dst)], what="chmod kit")
+            if not ((dst / "hermes_team.py").is_file() and (dst / KIT_MARKER).is_file()):
+                raise OSError("salinan baru tidak lengkap")
+        except OSError:
+            if had_old:
+                if os.path.lexists(dst):
+                    shutil.rmtree(dst, ignore_errors=True)
+                os.replace(old, dst)
+            raise
+        if had_old:
+            try:
+                self._discard(old)
+            except (OSError, StepError) as exc:
+                ctx.warn(f"cadangan lama {old} tidak terhapus ({exc}); hapus sendiri bila sudah tidak perlu")
+        ctx.say(f"  ✓ kit v{KIT_VERSION} disalin ke {dst}")
 
 
 def build_team_config(example: dict, data: Dict[str, Any], answers: Dict[str, Any]) -> dict:
@@ -1641,9 +2271,13 @@ class WriteConfig(Step):
         ctx.make_dir(ctx.team_dir, 0o700, info.name, info.name)
         target = ctx.team_file
         write = True
-        if target.exists():
+        try:
+            old_text: Optional[str] = ctx.read_text(target)      # menolak symlink; root tidak membaca berkas orang lain
+        except FileNotFoundError:
+            old_text = None
+        if old_text is not None:
             try:
-                current = yaml.safe_load(target.read_text(encoding="utf-8")) or {}
+                current = yaml.safe_load(old_text) or {}
             except yaml.YAMLError:
                 current = {"(berkas lama)": "bukan YAML yang valid"}
             changes = diff_summary(current, team)
@@ -1658,9 +2292,8 @@ class WriteConfig(Step):
                     ctx.say(f"    … dan {len(changes) - 30} lainnya")
                 ctx.say("  (komentar di berkas lama juga tidak ikut ke berkas baru)")
                 if ctx.prompt.confirm("overwrite_team_yaml", "Timpa dengan hasil wizard? Berkas lama dicadangkan", None):
-                    backup = target.with_name(f"{target.name}.bak-{ctx.sys.timestamp()}")
-                    shutil.copy2(target, backup)
-                    ctx.sys.chown(backup, info.name, info.name)
+                    backup = ctx.backup_file(target, target.with_name(f"{target.name}.bak-{ctx.sys.timestamp()}"),
+                                             info.name, info.name)
                     ctx.say(f"  ✓ cadangan: {backup}")
                 else:
                     ctx.say("  · team.yaml lama dipertahankan; langkah berikutnya memakai berkas itu")
@@ -1760,7 +2393,7 @@ class Extras(Step):
                     fix="periksa koneksi dan ruang disk (`docker system df`); langkah ini boleh dilewati (build_sandbox: false)")
             ctx.data["sandbox_image"] = tag
             ctx.save()
-            current = ctx.team_file.read_text(encoding="utf-8")
+            current = ctx.read_text(ctx.team_file)
             updated = set_sandbox_image(current, tag)
             if updated is None or ((yaml.safe_load(updated) or {}).get("sandbox") or {}).get("image") != tag:
                 ctx.warn(f"baris sandbox.image tidak ditemukan di {ctx.team_file}; isi manual `sandbox: {{image: \"{tag}\"}}` "
@@ -1769,11 +2402,18 @@ class Extras(Step):
                 ctx.write_file(ctx.team_file, updated, 0o600, info.name, info.name)
                 ctx.say(f"  ✓ sandbox.image = {tag}; provisioning ulang supaya berlaku")
                 run_provision(ctx)
-        if ctx.prompt.confirm("usage_timer", "Pasang pemotret pemakaian token (timer tiap 15 menit)?", True):
-            self.install_timer(ctx, info, "collect")
-        if ctx.data.get("usage_channel_id") and ctx.state.answers.get("usage_reports"):
-            if ctx.prompt.confirm("report_timer", "Pasang timer laporan pemakaian terjadwal?", True):
-                self.install_timer(ctx, info, "report")
+        if ctx.no_systemd:
+            kit = ctx.kit_dir
+            ctx.say("  · --no-systemd: timer pemakaian TIDAK dipasang. Jalankan sendiri secara berkala (cron/supervisor) sebagai "
+                    f"{info.name}:\n      python3 {kit}/usage_ledger.py collect        # tiap 15 menit"
+                    + (f"\n      python3 {kit}/tools/usage_post.py            # laporan terjadwal (jam di team.yaml)"
+                       if ctx.data.get("usage_channel_id") and ctx.state.answers.get("usage_reports") else ""))
+        else:
+            if ctx.prompt.confirm("usage_timer", "Pasang pemotret pemakaian token (timer tiap 15 menit)?", True):
+                self.install_timer(ctx, info, "collect")
+            if ctx.data.get("usage_channel_id") and ctx.state.answers.get("usage_reports"):
+                if ctx.prompt.confirm("report_timer", "Pasang timer laporan pemakaian terjadwal?", True):
+                    self.install_timer(ctx, info, "report")
         ctx.say("  · Pembatasan internet sandbox (proxy egress Hermes) TIDAK dipasang wizard. Bila perlu, sebagai "
                 f"{info.name}:\n      hermes egress install && hermes egress setup && hermes egress start")
 
@@ -1786,7 +2426,7 @@ class Extras(Step):
             ctx.write_file(unit_dir / unit, text.replace("/opt/hermes-team", str(ctx.kit_dir)), 0o644, info.name, info.name)
         fix = (f"`systemctl --user` butuh linger dan manajer user yang hidup: loginctl enable-linger {info.name}; "
                f"systemctl start user@{info.uid}.service; lalu {RESUME_HINT} --only extras")
-        ctx.run(["systemctl", "start", f"user@{info.uid}.service"], check=False)
+        wait_user_manager(ctx, info)
         ctx.run(["systemctl", "--user", "daemon-reload"], as_user=True, what="systemctl --user daemon-reload", fix=fix)
         ctx.run(["systemctl", "--user", "enable", "--now", timer], as_user=True, what=f"mengaktifkan {timer}", fix=fix)
         ctx.say(f"  ✓ {timer} aktif")
@@ -1798,44 +2438,175 @@ GATEWAY_LOG_HINTS = (
     ("LoginFailure", "token bot ditolak Discord", f"reset token di Developer Portal, lalu: {RESUME_HINT} --from discord_bot"),
     ("Improper token", "token bot ditolak Discord", f"reset token di Developer Portal, lalu: {RESUME_HINT} --from discord_bot"),
 )
+GATEWAY_LIKELY_CAUSES = (
+    "intent belum dihidupkan: Server Members Intent / Message Content Intent (Developer Portal → Bot) → log: PrivilegedIntentsRequired",
+    "token bot salah, terpotong, atau sudah di-reset → log: LoginFailure / Improper token",
+    "bot belum ada di server (undangan belum di-Authorize) atau dikeluarkan dari server",
+    "konfigurasi tim salah (team.yaml/managed) → jalankan `hermes doctor` dan baca log di atas",
+)
+GATEWAY_POLL_STEP = 3          # detik antar pemeriksaan
+GATEWAY_WAIT = 60              # batas menunggu gateway aktif
+GATEWAY_STABLE_WAIT = 10       # jeda sebelum pemeriksaan kedua (menangkap crash loop)
+USER_BUS_WAIT = 15             # batas menunggu /run/user/<uid>/bus
+ACTIVE_WORDS = {"active", "inactive", "failed", "activating", "deactivating", "reloading", "maintenance"}
+
+
+def parse_gateway_status(text: str) -> str:
+    """Tafsir keluaran `hermes gateway status` (hulu: hermes_cli/gateway.py `systemd_status` dan `_cmd_status`):
+    "running" · "stopped" · "not_installed" · "unknown". Hulu TIDAK memakai kode keluar != 0 untuk gateway yang mati,
+    jadi teks inilah satu-satunya isyarat dari perintah itu. Penanda hulu:
+      ✓ {User|System} gateway service is running      ✗ {User|System} gateway service is stopped
+      ✓ Gateway is running (PID: …) / (supervised by …) ✗ Gateway is not running
+      ✗ Gateway service is not installed              ⏳ Restart pending: …"""
+    lines = [line.strip() for line in str(text or "").splitlines()]
+    if any("✗" in line and "not installed" in line for line in lines):
+        return "not_installed"
+    if any(("✗" in line and ("is stopped" in line or "is not running" in line)) or "Restart pending" in line for line in lines):
+        return "stopped"
+    if any("✓" in line and re.search(r"[Gg]ateway(?: service)? is running", line) for line in lines):
+        return "running"
+    return "unknown"
+
+
+def gateway_verdict(active_state: str, status_text: str = "") -> str:
+    """"running" / "stopped" / "not_installed" / "unknown". `systemctl --user is-active` (kata pertama keluarannya)
+    menang; teks status hanya dipakai bila systemctl tidak memberi jawaban yang dikenal."""
+    state = (active_state or "").strip().lower()
+    if state == "active":
+        return "running"
+    if state in ACTIVE_WORDS:
+        return "stopped"
+    return parse_gateway_status(status_text)
+
+
+def wait_user_manager(ctx: "Context", info: UserInfo) -> None:
+    """Nyalakan user@UID.service lalu TUNGGU bus-nya (/run/user/UID/bus) sebelum `systemctl --user` pertama."""
+    ctx.run(["systemctl", "start", f"user@{info.uid}.service"], check=False)
+    waited = 0
+    while not ctx.sys.user_bus_ready(info.uid):
+        if waited >= USER_BUS_WAIT:
+            ctx.warn(f"bus systemd user (/run/user/{info.uid}/bus) belum muncul setelah {USER_BUS_WAIT} detik; "
+                     "perintah `systemctl --user` berikutnya mungkin gagal (butuh linger: loginctl enable-linger)")
+            return
+        ctx.sys.sleep(1)
+        waited += 1
 
 
 class Gateway(Step):
     name, title = "gateway", "Menjalankan gateway sebagai layanan"
-    explain = "Memasang unit systemd user untuk gateway Hermes, menyalakannya, dan memeriksa statusnya."
+    explain = "Memasang unit systemd user untuk gateway Hermes, menyalakannya, dan memastikan ia benar-benar aktif dan stabil."
+    DEFAULT_UNIT = "hermes-gateway.service"      # hulu: _SERVICE_BASE (hermes_cli/gateway.py:2191), get_service_name()
 
     def plan(self, ctx):
         u = ctx.user_name
-        return [f"systemctl start user@<uid {u}>.service",
+        if ctx.no_systemd:
+            return ["(--no-systemd) tidak memasang layanan; mencetak perintah untuk menjalankan gateway secara manual"]
+        return [f"systemctl start user@<uid {u}>.service; tunggu /run/user/<uid>/bus (maks {USER_BUS_WAIT} dtk)",
                 f"sebagai {u}: hermes gateway install",
                 f"sebagai {u}: hermes gateway start",
-                f"tunggu, lalu sebagai {u}: hermes gateway status (gagal → hermes logs gateway -n 40)"]
+                f"sebagai {u}: systemctl --user is-active {self.DEFAULT_UNIT} sampai active (maks {GATEWAY_WAIT} dtk), "
+                f"lalu periksa lagi setelah {GATEWAY_STABLE_WAIT} dtk (gagal → hermes logs gateway -n 40)"]
+
+    def unit_name(self, ctx, info) -> str:
+        """Nama unit yang benar-benar dipasang `hermes gateway install` (bare `hermes-gateway`, atau berakhiran profil/hash)."""
+        unit_dir = Path(info.home) / ".config" / "systemd" / "user"
+        try:
+            dfd = ctx._open_parent(unit_dir / "x")
+            try:
+                names = sorted(os.listdir(dfd))
+            finally:
+                os.close(dfd)
+        except (OSError, StepError):
+            names = []
+        found = [n for n in names if re.match(r"^hermes-gateway(-[a-z0-9_-]{1,64})?\.service$", n)]
+        if self.DEFAULT_UNIT in found or len(found) != 1:
+            return self.DEFAULT_UNIT
+        return found[0]
+
+    def probe(self, ctx, unit: str) -> Tuple[str, str, str]:
+        res = ctx.run(["systemctl", "--user", "is-active", unit], as_user=True, check=False)
+        words = (res.out.strip().splitlines() or [""])[0].strip().lower()
+        state = words if words in ACTIVE_WORDS else ""
+        text = ""
+        if not state:                     # systemctl tidak menjawab: pakai teks `hermes gateway status`
+            status = ctx.run(["hermes", "gateway", "status"], as_user=True, check=False)
+            text = status.out + status.err
+        return state, text, gateway_verdict(state, text)
+
+    @staticmethod
+    def restarts(ctx, unit: str) -> Optional[int]:
+        res = ctx.run(["systemctl", "--user", "show", "-p", "NRestarts", "--value", unit], as_user=True, check=False)
+        try:
+            return int(res.out.strip())
+        except ValueError:
+            return None
 
     def run(self, ctx):
         info = ctx.user()
-        ctx.run(["systemctl", "start", f"user@{info.uid}.service"], check=False)
+        if ctx.no_systemd:
+            return self.manual(ctx, info)
+        if not ctx.sys.has_systemd():
+            raise StepError("systemd tidak berjalan di server ini; gateway tidak bisa dipasang sebagai layanan",
+                            fix=f"jalankan di server dengan systemd, atau {RESUME_HINT} --no-systemd (gateway dijalankan manual)")
+        wait_user_manager(ctx, info)
         fix = (f"periksa: sudo -iu {info.name} lalu `hermes doctor` dan `hermes logs gateway -n 80`. "
                f"Setelah diperbaiki: {RESUME_HINT} --from gateway")
         ctx.run(["hermes", "gateway", "install"], as_user=True, what="hermes gateway install", fix=fix)
         ctx.run(["hermes", "gateway", "start"], as_user=True, what="hermes gateway start", fix=fix)
-        ctx.sys.sleep(8)
+        unit = self.unit_name(ctx, info)
+        ctx.say(f"  Menunggu {unit} aktif (maks {GATEWAY_WAIT} detik) ...")
+        waited, idle = 0, 0
+        while True:
+            state, _text, verdict = self.probe(ctx, unit)
+            if verdict == "running":
+                break
+            idle = idle + 1 if state == "inactive" else 0
+            if state == "failed" or idle >= 3 or waited >= GATEWAY_WAIT:
+                return self.fail(ctx, info, unit, fix, f"unit {unit} berstatus '{state or verdict}' setelah {waited} detik")
+            ctx.sys.sleep(GATEWAY_POLL_STEP)
+            waited += GATEWAY_POLL_STEP
+        first = self.restarts(ctx, unit)
+        ctx.say(f"  · aktif; memeriksa lagi setelah {GATEWAY_STABLE_WAIT} detik (menangkap crash loop) ...")
+        ctx.sys.sleep(GATEWAY_STABLE_WAIT)
+        state, _text, verdict = self.probe(ctx, unit)
+        again = self.restarts(ctx, unit)
+        if verdict != "running" or (first is not None and again is not None and again > first):
+            return self.fail(ctx, info, unit, fix, f"gateway tidak stabil: sempat aktif lalu mati/restart berulang "
+                             f"(status sekarang '{state or verdict}', restart {first}→{again})", unstable=True)
         status = ctx.run(["hermes", "gateway", "status"], as_user=True, check=False)
         for line in (status.out + status.err).strip().splitlines()[-20:]:
             ctx.say(f"    {line}")
-        if not status.ok:
-            logs = ctx.run(["hermes", "logs", "gateway", "-n", "40"], as_user=True, check=False)
-            text = (logs.out + logs.err).strip()
-            ctx.say("  --- baris terakhir log gateway ---")
-            for line in text.splitlines()[-40:]:
-                ctx.say(f"    {line}")
-            cause, hint = f"`hermes gateway status` keluar dengan kode {status.rc}", fix
-            for needle, why, how in GATEWAY_LOG_HINTS:
-                if needle in text:
-                    cause, hint = why, how
-                    break
-            raise StepError("gateway tidak berjalan", cause=cause, fix=hint)
-        ctx.say("  ✓ `hermes gateway status` melaporkan sukses. Pastikan sendiri: bot tampil ONLINE di Discord, dan")
+        ctx.say(f"  ✓ {unit} aktif dan stabil (`systemctl --user is-active` = active, dua kali berselang {GATEWAY_STABLE_WAIT} detik). "
+                "Pastikan sendiri: bot tampil ONLINE di Discord, dan")
         ctx.say(f"    `sudo -iu {info.name} hermes logs -f` memuat baris plugin team-guard tanpa galat.")
+
+    def fail(self, ctx, info, unit: str, fix: str, detail: str, unstable: bool = False):
+        status = ctx.run(["hermes", "gateway", "status"], as_user=True, check=False)
+        for line in (status.out + status.err).strip().splitlines()[-20:]:
+            ctx.say(f"    {line}")
+        logs = ctx.run(["hermes", "logs", "gateway", "-n", "40"], as_user=True, check=False)
+        text = (logs.out + logs.err).strip()
+        if not text:
+            journal = ctx.run(["journalctl", "--user", "-u", unit, "-n", "40", "--no-pager"], as_user=True, check=False)
+            text = (journal.out + journal.err).strip()
+        ctx.say("  --- baris terakhir log gateway ---")
+        for line in text.splitlines()[-40:]:
+            ctx.say(f"    {line}")
+        ctx.say("  Penyebab yang paling sering:")
+        for line in GATEWAY_LIKELY_CAUSES:
+            ctx.say(f"    • {line}")
+        cause, hint = detail, fix
+        for needle, why, how in GATEWAY_LOG_HINTS:
+            if needle in text:
+                cause, hint = why, how
+                break
+        raise StepError("gateway tidak stabil" if unstable else "gateway tidak berjalan", cause=cause, fix=hint)
+
+    def manual(self, ctx, info) -> None:
+        ctx.say("  · --no-systemd: gateway TIDAK dipasang sebagai layanan (tanpa systemd tidak ada autostart dan restart otomatis).")
+        ctx.say(f"    Jalankan manual sebagai {info.name}, di tmux/screen/supervisor pilihanmu:")
+        ctx.say(f"      sudo -iu {info.name} hermes gateway run")
+        ctx.say(f"    Periksa: sudo -iu {info.name} hermes gateway status   (perhatikan teks 'running' / 'not running')")
 
 
 def find_hermes_python(launcher: Path, home: Path) -> Tuple[str, str]:
@@ -2017,12 +2788,23 @@ def run_wizard(ctx: Context, steps: Optional[List[Step]] = None, start: Optional
             ctx.say(f"Langkah '{wanted}' tidak dikenal. Pilihan: {', '.join(names)}")
             return 2
     first = names.index(start) if start else 0
+    # --from X: X dan SEMUA langkah sesudahnya diulang (jawaban dipertahankan). Tanpa ini langkah hilir yang check()-nya
+    # masih lulus (team.yaml, provisioning, gateway) tetap memakai hasil lama setelah jawaban/langkah hulu berubah.
+    redo = set(names[first:]) if start else set()
+    if start:
+        marked = [n for n in names[first:] if ctx.state.done(n)]
+        ctx.say(f"--from {start}: {len(redo)} langkah diulang ({', '.join(names[first:])}); jawaban tersimpan dipertahankan"
+                + (f"; ditandai ulang (belum selesai): {', '.join(marked)}" if marked else ""))
+        if not ctx.dry_run:
+            for name in redo:
+                ctx.state.unmark(name)
+            ctx.save()
     for i, step in enumerate(steps):
         if (only and step.name != only) or i < first:
             continue
         ctx.say("")
         ctx.say(f"[{i + 1}/{total}] {step.title}")
-        forced = step.name in (start, only)
+        forced = step.name == only or step.name in redo
         try:
             if not forced and step.check(ctx):
                 ctx.say("  ✓ sudah selesai — dilewati")
@@ -2043,7 +2825,7 @@ def run_wizard(ctx: Context, steps: Optional[List[Step]] = None, start: Optional
             _save_quietly(ctx)
             ctx.say(f"\nDihentikan. Lanjutkan kapan saja dengan:  {RESUME_HINT}")
             return 130
-        except (StepError, TeamError, OSError, RuntimeError, ValueError, KeyError) as exc:
+        except (StepError, TeamError, OSError, RuntimeError, ValueError, KeyError, TypeError, AttributeError, IndexError) as exc:
             if isinstance(exc, TeamError) and not isinstance(exc, StepError):
                 exc = StepError(str(exc), cause="permintaan ke Discord gagal",
                                 fix="periksa koneksi dan izin bot; lihat docs/INSTALL.md, bagian \"Bila ada yang tidak jalan\"")
@@ -2066,25 +2848,41 @@ def _save_quietly(ctx: Context) -> None:
 # --------------------------------------------------------------------------- CLI
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     ap = argparse.ArgumentParser(prog="setup.sh", description="Wizard pemasangan kit tim Hermes (bisa dilanjutkan).",
-                                 epilog="Langkah: " + ", ".join(STEP_NAMES))
+                                 epilog="Langkah: " + ", ".join(STEP_NAMES)
+                                 + "\nKode keluar: 0 sukses · 1 langkah gagal / bukan root · 2 salah pakai (argumen, jawaban, state rusak, "
+                                   "--kit-dir) · 3 wizard lain sedang berjalan · 130 dihentikan",
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--list", action="store_true", help="tampilkan langkah dan statusnya, lalu keluar")
     ap.add_argument("--dry-run", action="store_true", help="tampilkan rencana tiap langkah tanpa mengubah apa pun")
-    ap.add_argument("--from", dest="start", metavar="LANGKAH", help="mulai (ulang) dari langkah ini")
-    ap.add_argument("--only", metavar="LANGKAH", help="jalankan satu langkah saja")
+    ap.add_argument("--from", dest="start", metavar="LANGKAH",
+                    help="ulangi LANGKAH ini dan semua langkah sesudahnya (jawaban tersimpan dipertahankan); "
+                         "untuk satu langkah saja pakai --only")
+    ap.add_argument("--only", metavar="LANGKAH", help="jalankan satu langkah saja (langkah sesudahnya tidak disentuh)")
     ap.add_argument("--answers", metavar="YAML", help="berkas jawaban (tanpa rahasia)")
     ap.add_argument("--non-interactive", action="store_true",
                     help=f"tanpa pertanyaan; rahasia dari env {ENV_BOT_TOKEN} dan {ENV_LLM_KEY}")
     ap.add_argument("--yes", action="store_true", help="terima semua nilai bawaan (persetujuan eksplisit tetap ditanyakan)")
     ap.add_argument("--user", default=None, help="user Linux untuk Hermes (bawaan: hermes)")
-    ap.add_argument("--kit-dir", default=None, help="tujuan pemasangan kit (bawaan: /opt/hermes-team)")
+    ap.add_argument("--kit-dir", default=None,
+                    help="tujuan pemasangan kit, jalur absolut (bawaan: /opt/hermes-team); hanya direktori kosong/baru atau "
+                         "instalasi kit sebelumnya yang diganti")
+    ap.add_argument("--no-systemd", action="store_true",
+                    help="server tanpa systemd (kontainer/WSL): lewati pemasangan gateway dan timer, cetak perintah manualnya")
     ap.add_argument("--reset", action="store_true", help="hapus state wizard dan mulai dari awal (tidak menghapus yang sudah terpasang)")
     return ap.parse_args(argv)
+
+
+def _say_error(out: Callable[[str], None], exc: StepError) -> None:
+    out(f"✗ {exc.message}")
+    for extra in (exc.cause, exc.fix):
+        if extra:
+            out(f"  {extra}")
 
 
 def main(argv: Optional[List[str]] = None, system: Optional[HostSystem] = None, *, state_file: Optional[Path] = None,
          out: Callable[[str], None] = print, input_fn: Callable[[str], str] = input,
          getpass_fn: Callable[[str], str] = getpass.getpass, environ: Optional[Dict[str, str]] = None,
-         context_overrides: Optional[Dict[str, Any]] = None) -> int:
+         context_overrides: Optional[Dict[str, Any]] = None, lock_file: Optional[Path] = None) -> int:
     args = parse_args(argv)
     system = system or HostSystem()
     read_only = args.list or args.dry_run
@@ -2095,24 +2893,41 @@ def main(argv: Optional[List[str]] = None, system: Optional[HostSystem] = None, 
         out("Pakai salah satu: --from atau --only.")
         return 2
     state = State(state_file or STATE_FILE)
+    lock = None
     try:
+        if not read_only:
+            lock = acquire_lock(lock_file or state.path.parent / ".lock")
         if args.reset and not read_only:
             state.reset()
             out(f"State wizard dihapus ({state.path}).")
-        state.load()
+        state.load(keep_copy=not read_only)
         answers = load_answers(Path(args.answers)) if args.answers else {}
     except StepError as exc:
-        out(f"✗ {exc.message}")
-        for extra in (exc.cause, exc.fix):
-            if extra:
-                out(f"  {extra}")
-        return 2
+        _say_error(out, exc)
+        if lock is not None:
+            lock.close()
+        return EXIT_BUSY if isinstance(exc, WizardBusy) else 2
+    try:
+        return _run(args, system, state, answers, out, input_fn, getpass_fn, environ, context_overrides or {}, read_only)
+    finally:
+        if lock is not None:
+            lock.close()
+
+
+def _run(args, system, state, answers, out, input_fn, getpass_fn, environ, overrides, read_only) -> int:
     user = args.user or state.data.get("linux_user") or "hermes"
     kit_dir = args.kit_dir or state.data.get("kit_dir") or "/opt/hermes-team"
+    source = overrides.get("source_dir") or Path(__file__).resolve().parent
+    problem = validate_kit_dir(kit_dir, Path(source))
+    if problem:
+        _say_error(out, StepError(f"--kit-dir {kit_dir} ditolak: {problem}", fix="pakai direktori khusus, mis. --kit-dir /opt/hermes-team"))
+        return 2
     state.data["linux_user"], state.data["kit_dir"] = user, str(kit_dir)
+    if args.no_systemd:
+        state.data["no_systemd"] = True
     prompter = Prompter(answers, state.answers, args.non_interactive, args.yes, out, input_fn, getpass_fn, environ)
     ctx = Context(system, state, prompter, user=user, kit_dir=Path(kit_dir), dry_run=args.dry_run, out=out,
-                  **(context_overrides or {}))
+                  no_systemd=bool(state.data.get("no_systemd")), **overrides)
     prompter.out = ctx.say
     for name in (ENV_BOT_TOKEN, ENV_LLM_KEY):
         ctx.add_secret(str(prompter.environ.get(name) or "").strip())
@@ -2120,7 +2935,8 @@ def main(argv: Optional[List[str]] = None, system: Optional[HostSystem] = None, 
         list_steps(ctx, STEPS)
         return 0
     ctx.say(f"Wizard pemasangan kit tim Hermes v{KIT_VERSION}" + (" — DRY-RUN" if args.dry_run else ""))
-    ctx.say(f"User Linux: {user} · direktori kit: {kit_dir} · state: {state.path}")
+    ctx.say(f"User Linux: {user} · direktori kit: {kit_dir} · state: {state.path}"
+            + (" · tanpa systemd (--no-systemd)" if ctx.no_systemd else ""))
     return run_wizard(ctx, STEPS, start=args.start, only=args.only)
 
 

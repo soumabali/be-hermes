@@ -7,6 +7,7 @@ Gangguan untuk uji ketahanan klien (dipakai sekali per entri, berurutan):
     state.fault("GET", "/users/@me", status=429, body={"retry_after": 0.3}, headers={"Retry-After": "2"})
     state.fault("POST", "/guilds/", status=503, times=2)
     state.fault("GET", "/guilds/", status=200, raw=b"<html>bukan json</html>")
+    state.fault("POST", "/guilds/", status=502, after=True)    # server MELAKUKAN permintaan lalu menjawab 502
 """
 import itertools
 import json
@@ -42,12 +43,14 @@ class State:
         self.bot_guilds = [{"id": GUILD, "name": "Tim Backend"}]
         self._seed()
 
-    def fault(self, method, prefix, status=500, body=None, headers=None, raw=None, times=1):
-        """Jawab `times` request berikutnya yang cocok (method + awalan path) dengan status/body ini."""
+    def fault(self, method, prefix, status=500, body=None, headers=None, raw=None, times=1, after=False):
+        """Jawab `times` request berikutnya yang cocok (method + awalan path) dengan status/body ini.
+        after=True: permintaan DIJALANKAN dulu (mis. channel benar-benar dibuat), baru dijawab dengan gangguan —
+        meniru 502/503 yang datang setelah server selesai bekerja."""
         with self.lock:
             for _ in range(times):
                 self.faults.append({"method": method, "prefix": prefix, "status": status, "body": body,
-                                    "headers": dict(headers or {}), "raw": raw})
+                                    "headers": dict(headers or {}), "raw": raw, "after": after})
 
     def add_member(self, uid, username, roles=()):
         with self.lock:
@@ -147,10 +150,16 @@ class Handler(BaseHTTPRequestHandler):
             for fault in st.faults:
                 if fault["method"] == self.command and path.startswith(fault["prefix"]):
                     st.faults.remove(fault)
-                    body = fault["body"]
-                    if body is None and fault["raw"] is None and fault["status"] >= 400:
-                        body = {"message": f"gangguan tiruan {fault['status']}", "code": 0}
-                    return self._send(fault["status"], body, fault["headers"], fault["raw"])
+                    if fault.get("after"):
+                        self._send = lambda *a, **k: None          # efeknya terjadi, jawabannya dibuang
+                        try:
+                            self._route(self.command, path.strip("/").split("/"), body, query)
+                        finally:
+                            del self._send
+                    fault_body = fault["body"]
+                    if fault_body is None and fault["raw"] is None and fault["status"] >= 400:
+                        fault_body = {"message": f"gangguan tiruan {fault['status']}", "code": 0}
+                    return self._send(fault["status"], fault_body, fault["headers"], fault["raw"])
             return self._route(self.command, path.strip("/").split("/"), body, query)
 
     def _route(self, m, p, body, q):
