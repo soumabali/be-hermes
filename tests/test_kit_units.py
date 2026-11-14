@@ -3116,6 +3116,20 @@ class TestRegisteredKindWorksEndToEnd:
         ht.main(cli(kit, "status"))
         assert "team-ops" in capsys.readouterr().out
 
+    def test_roster_carries_role_and_cron_exempt_only_when_not_default(self, kit, register_kind):
+        """Kit → roster → plugin: kunci opsional `role` / `cron_exempt` hanya ditulis bila berbeda dari bawaan."""
+        register_kind(kit_profiles.ProfileKind(
+            "oncall", ht.SOUL_SHARED, kit_profiles._shared_settings, needs_channel=True, reserved=True,
+            model_target=True, channel_label="channel oncall", role="admin", cron_exempt=True))
+        llm = {**__import__("conftest").LLM, "oncall_model": "td-normal"}
+        kit.write_team(oncall={"profile": "team-oncall", "channel_id": OPS_CH}, llm=llm)
+        ht.cmd_apply(kit.team(), kit.hermes())
+        channels = kit.roster()["channels"]
+        assert channels[OPS_CH] == {"profile": "team-oncall", "kind": "oncall", "role": "admin", "cron_exempt": True}
+        by_kind = {c["kind"]: c for c in channels.values() if c["kind"] in ("shared", "admin")}
+        assert set(by_kind["shared"]) == {"profile", "kind"}                      # bawaan: tanpa kunci tambahan
+        assert by_kind["admin"]["role"] == "admin" and by_kind["admin"]["cron_exempt"] is True
+
     def test_members_models_override_and_set_model_target(self, ops, kit):
         kit.write_members([BE1, BUDI], models={"ops": "td-simple"})
         team = kit.team()

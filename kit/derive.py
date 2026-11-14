@@ -449,7 +449,13 @@ def roster_data(team: dict, hermes_root: Path, hermes_bin: str) -> dict:
     inactive = {m["user_id"]: {"name": m["name"], "channel_id": m["channel_id"]}
                 for m in team["members"] if not m.get("active", True)}
     for kind in SYSTEM_KINDS:
-        channels[team[kind]["channel_id"]] = {"profile": team[kind]["profile"], "kind": kind}
+        spec = PROFILE_KINDS[kind]
+        entry = {"profile": team[kind]["profile"], "kind": kind}
+        if spec.role != "member":            # kunci opsional: hanya ditulis bila berbeda dari bawaan plugin
+            entry["role"] = spec.role
+        if spec.cron_exempt:
+            entry["cron_exempt"] = True
+        channels[team[kind]["channel_id"]] = entry
     reserved = sorted({str(p["key_env"]) for p in (llm.get("providers") or {}).values()
                        if p.get("key_env")}) if llm else []
     allowed, free = gateway_channels(team)

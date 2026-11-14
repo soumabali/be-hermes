@@ -27,6 +27,8 @@ class RosterChannel(TypedDict, total=False):
     kind: str          # personal | shared | admin
     owner: str         # hanya kind personal
     name: str          # hanya kind personal
+    role: str          # opsional: "admin" = channel khusus admin (bawaan plugin: kind == admin)
+    cron_exempt: bool  # opsional: toolset cronjob tetap menyala (bawaan plugin: kind == admin)
 
 
 class RosterUser(TypedDict):
