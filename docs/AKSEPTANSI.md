@@ -45,15 +45,24 @@ Catat tanggal, versi kit (`python3 hermes_team.py --version`), versi Hermes, dan
 issue atau berkas catatan. Kegagalan yang ditemukan adalah temuan, bukan kegagalan dokumen ini: laporkan dan
 perbaiki di kit, lalu ulang dari pemeriksaan yang gagal.
 
-## C. Pekerjaan kode yang tersisa
+## C. Pekerjaan kode
 
-| Item | Alasan | Selesai bila |
-|---|---|---|
-| Pecah closure `plan()` panjang di `teamctl/tools_discord.py` (100, 71, 64 baris) dan `tools_team.py`/`tools_usage.py` (71, 83) | Tool baru lebih mudah ditulis dan ditinjau bila dasarnya kecil | Tiap fungsi < 60 baris, `tools/list` identik (uji pin SHA256 tetap hijau) |
-| Pecah `usage_ledger._run` (119 baris) dan `collect` (65) | Sama | < 60 baris, uji ledger tetap hijau |
-| Langkah manual saat menambah jenis profile (`teamctl/tools_team.py` set-model, `teamctl/discord_guard.py` team_channels, `kind` di plugin, `kit/skills.py`) | Menambah jenis profile semestinya satu entri registry | Uji `TestRegisteredKindWorksEndToEnd` mencakup teamctl dan plugin, tanpa edit manual |
-| `tests/test_contract.py` memakai `kit_config.plugin_default_problems()` | Satu sumber untuk drift setelan | Satu pemeriksaan, bukan dua |
-| Audit independen ulang atas perbaikan putaran kedua | Penulis tidak boleh jadi satu-satunya pemeriksa | Auditor yang tidak ikut menulis tidak menemukan temuan tinggi |
+Selesai dan terbukti oleh uji lokal (2078 lulus) dan CI hijau (unit 3.10/3.11/3.14, integrasi pinned dan main):
+
+- Fungsi panjang di `teamctl/` dipecah (tidak ada yang ≥ 60 baris; `tools/list` identik, hash dipin uji) dan
+  `usage_ledger.collect` / `main` dipecah.
+- Jenis profile baru di `PROFILE_KINDS` mengalir ke teamctl (target set-model, channel tim, penjaga admin), roster
+  (`role`, `cron_exempt`), plugin (cron guard, live reload, placeholder sambutan), dan `kit/skills.py`; diuji dengan
+  jenis tiruan di `TestRegisteredKindWorksEndToEnd`, `tests/test_teamctl_kinds.py`, `TestRegisteredKindInPlugin`.
+- `tests/test_contract.py` memakai `kit_config.plugin_default_problems()`.
+- Audit independen atas perbaikan putaran kedua: tidak ada bypass pada penjaga tool admin; temuan sedang/rendah
+  (izin baca direktori kit, nisan rusak, label admin, regex `$`, klaim `managed --install`) sudah diperbaiki atau
+  diluruskan di dokumen.
+
+Masih manual saat menambah jenis profile: `DISCORD_HOME_CHANNEL` / `no_thread_channels` di `kit/derive.py::host_settings`,
+blok contoh di `team.example.yaml`, dan teks README/FITUR (lihat `docs/PENGEMBANGAN.md`).
+
+Belum ada pihak lain yang mengaudit perbaikan terbaru ini (audit di atas dilakukan sebelum perbaikan terakhir).
 
 ## D. Cara menilai
 
