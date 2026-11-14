@@ -7,6 +7,7 @@ import base64
 import io
 import json
 import os
+import re
 import socket
 import stat
 import subprocess
@@ -3056,3 +3057,210 @@ class TestRosterContract:
     def test_written_roster_json_has_the_schema_key(self, kit):
         ht.cmd_apply(kit.team(), kit.hermes())
         assert kit.roster()["schema"] == kit_contracts.ROSTER_SCHEMA
+
+
+# =========================================================================== audit 3: jenis profile dari registri
+OPS_CH = "700000000000000099"
+
+
+class TestRegisteredKindWorksEndToEnd:
+    """Jenis baru (needs_channel + model_target) cukup didaftarkan di registri: skema, rute, alias model,
+    models: di members.yaml, roster, host-yaml, check/describe, provisioning, dan nama dicadangkan mengikutinya."""
+
+    @pytest.fixture
+    def ops(self, kit, register_kind):
+        kind = register_kind(kit_profiles.ProfileKind(
+            "ops", ht.SOUL_SHARED, kit_profiles._shared_settings, needs_channel=True, reserved=True,
+            model_target=True, note="ops, @mention", channel_label="channel ops", model_label="ops"))
+        llm = {**__import__("conftest").LLM, "ops_model": "td-normal"}
+        kit.write_team(ops={"profile": "team-ops", "channel_id": OPS_CH}, llm=llm)
+        return kind
+
+    def test_registry_views_follow_the_new_kind(self, ops):
+        assert kit_profiles.SYSTEM_KINDS == ("shared", "admin", "ops")
+        assert kit_profiles.MODEL_TARGETS == ("shared", "admin", "lobby", "ops")
+        assert "ops" in ht.RESERVED_NAMES and "ops" in kit_config.section_keys("")
+        assert "llm.ops_model" in kit_config.FIELD_BY_PATH and "ops.channel_id" in kit_config.FIELD_BY_PATH
+
+    def test_check_apply_roster_host_yaml_and_models(self, ops, kit, capsys):
+        ht.main(cli(kit, "check"))
+        out = capsys.readouterr().out
+        assert OPS_CH in out and "team-ops" in out and "Konfigurasi valid." in out
+        assert not [w for w in kit.team()["warnings"] if "ops" in w]
+        ht.cmd_apply(kit.team(), kit.hermes())
+        # provisioning: profile ada, SOUL tertulis, model dari llm.ops_model
+        assert kit.home("team-ops").is_dir() and (kit.home("team-ops") / "SOUL.md").is_file()
+        assert kit.config("team-ops")["model"]["default"] == "td-normal"
+        # rute gateway + channel diizinkan
+        routes = routes_for(kit, "team-ops")
+        assert routes and routes[0]["chat_id"] == OPS_CH and routes[0]["name"] == "team-ops"
+        assert OPS_CH in kit.config("default")["discord"]["allowed_channels"].split(",")
+        roster = kit.roster()
+        assert roster["channels"][OPS_CH] == {"profile": "team-ops", "kind": "ops"}
+        assert OPS_CH in roster["gateway"]["allowed_channels"]
+        assert OPS_CH not in roster["gateway"]["free_response_channels"]            # free_response=False
+        assert any(r["chat_id"] == OPS_CH for r in roster["gateway"]["profile_routes"])
+        ht.main(cli(kit, "host-yaml"))
+        host = capsys.readouterr().out
+        assert "team-ops" in host and OPS_CH in host
+        ht.main(cli(kit, "status"))
+        assert "team-ops" in capsys.readouterr().out
+
+    def test_members_models_override_and_set_model_target(self, ops, kit):
+        kit.write_members([BE1, BUDI], models={"ops": "td-simple"})
+        team = kit.team()
+        assert team["model_overrides"] == {"ops": "td-simple"}
+        assert ht.model_alias(team, "ops") == "td-simple"
+        ht.cmd_apply(team, kit.hermes())
+        assert kit.config("team-ops")["model"]["default"] == "td-simple"
+        result = ht.set_model(kit.team(), kit.hermes(), "ops", "td-normal")
+        assert result["profiles"] == ["team-ops"]
+        assert kit.config("team-ops")["model"]["default"] == "td-normal"
+        assert kit.team()["model_overrides"]["ops"] == "td-normal"
+
+    def test_channel_collision_reserved_name_and_placeholders(self, ops, kit):
+        kit.write_team(ops={"profile": "team-ops", "channel_id": BE1_CH})
+        with pytest.raises(ht.TeamError, match="dipakai dua kali"):
+            kit.team()
+        kit.write_team(ops={"profile": "team-ops", "channel_id": OPS_CH})
+        with pytest.raises(ht.TeamError, match="dipakai sistem"):
+            ht.check_new_name(kit.team(), "ops")
+        assert any(item.startswith("ops.channel_id") for item in ht.placeholder_ids(kit.team()))
+
+    def test_admin_routed_kind_gets_per_admin_routes(self, kit, register_kind):
+        register_kind(kit_profiles.ProfileKind(
+            "audit", ht.SOUL_ADMIN, kit_profiles._shared_settings, needs_channel=True, reserved=True,
+            admin_routes=True, free_response=True, role="admin"))
+        kit.write_team(audit={"profile": "team-audit", "channel_id": OPS_CH})
+        team = kit.team()
+        names = [r["name"] for r in ht.build_routes(team) if r["profile"] == "team-audit"]
+        assert names == ["team-audit-1"]
+        assert OPS_CH in ht.gateway_channels(team)[1]
+
+    def test_without_the_kind_unknown_block_is_only_a_warning(self, kit):
+        kit.write_team(ops={"profile": "team-ops", "channel_id": OPS_CH})
+        assert any("'ops' tidak dikenal" in w for w in kit.team()["warnings"])
+        assert "ops" not in kit_profiles.SYSTEM_KINDS
+
+    def test_registry_is_restored_after_the_test(self):
+        assert kit_profiles.SYSTEM_KINDS == ("shared", "admin") and "ops" not in kit_config.top_level_keys()
+        assert "llm.ops_model" not in kit_config.FIELD_BY_PATH
+
+
+# =========================================================================== audit 3: nilai kosong tetap lunak
+FALSY = [None, "", 0, False, [], {}]
+FALSY_IDS = ["null", "string-kosong", "nol", "false", "daftar-kosong", "mapping-kosong"]
+
+
+class TestFalsyValuesKeepOldLeniency:
+    def effective(self, kit):
+        team = kit.team()
+        return {"template": team["template"], "shared": team["shared"], "admin": team["admin"]}
+
+    @pytest.mark.parametrize("value", FALSY, ids=FALSY_IDS)
+    @pytest.mark.parametrize("path", ["template_profile", "shared.profile", "admin.profile"])
+    def test_blank_profile_names_mean_default(self, kit, capsys, path, value):
+        top, _, sub = path.partition(".")
+        data = kit.write_team()
+        if sub:
+            data[top].pop(sub)
+        else:
+            data.pop(top)
+        kit.team_file.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+        want = self.effective(kit)                                    # kunci tidak ada
+        if sub:
+            data[top][sub] = value
+        else:
+            data[top] = value
+        kit.team_file.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+        assert self.effective(kit) == want                            # kunci ada tapi kosong
+        for command in ("check", "host-yaml", "status", "managed"):
+            ht.main(cli(kit, command))                                # exit 0 (tanpa SystemExit)
+        capsys.readouterr()
+
+    @pytest.mark.parametrize("value", FALSY, ids=FALSY_IDS)
+    @pytest.mark.parametrize("kind", ["shared", "admin"])
+    def test_blank_auto_skills_mean_empty_list(self, kit, kind, value):
+        kit.write_team(**{kind: {"auto_skills": value}})
+        assert kit.team()[kind]["auto_skills"] == []
+
+    @pytest.mark.parametrize("value", ["abc", 3, 1.5, True, {"a": 1}])
+    def test_non_empty_wrong_types_still_error_clearly(self, kit, value):
+        kit.write_team(shared={"auto_skills": value})
+        with pytest.raises(ht.TeamError, match=r"shared\.auto_skills: harus daftar"):
+            kit.team()
+
+    def test_non_empty_invalid_profile_name_still_errors(self, kit):
+        kit.write_team(template_profile="Nama Salah!")
+        with pytest.raises(ht.TeamError, match=r"template_profile: nama profile 'Nama Salah!' tidak valid"):
+            kit.team()
+
+    def test_blank_template_follows_profile_prefix(self, kit):
+        kit.write_team(profile_prefix="tim-", template_profile="")
+        assert kit.team()["template"] == "tim-template"
+
+    def test_null_prefix_and_secret_lists_stay_accepted(self, kit):
+        kit.write_team(profile_prefix=None, secrets={"allow_names": None, "deny_names": None})
+        team = kit.team()
+        assert team["prefix"] == "be-" and team["secrets"]["allow_names"] == [] == team["secrets"]["deny_names"]
+
+
+# =========================================================================== audit 4: nisan channel anggota yang dihapus
+class TestRemovedChannelTombstone:
+    @pytest.fixture
+    def applied(self, kit):
+        ht.cmd_apply(kit.team(), kit.hermes())
+        kit.write_members([BE1, {**BUDI, "active": False}])
+        ht.cmd_apply(kit.team(), kit.hermes(), only=[], host_only=True)
+        return kit
+
+    def tombstone(self, kit):
+        return json.loads((kit.state / "removed_channels.json").read_text(encoding="utf-8"))
+
+    def test_recorded_with_contract_shape_and_0600(self, applied):
+        ht.remove_member(applied.team(), applied.hermes(), "budi")
+        data = self.tombstone(applied)
+        assert set(data) == kit_contracts.keys_of(kit_contracts.RemovedChannels)
+        assert data["schema"] == kit_contracts.REMOVED_CHANNELS_SCHEMA == 1
+        entry = data["channels"][BUDI_CH]
+        assert set(entry) == kit_contracts.keys_of(kit_contracts.RemovedChannel)
+        assert entry["member"] == "budi" and entry["name"] == ""
+        assert re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", entry["removed_at"])
+        assert stat.S_IMODE((applied.state / "removed_channels.json").stat().st_mode) == 0o600
+        assert [p.name for p in applied.state.iterdir() if p.name.startswith(".removed")] == []   # tanpa sisa temp
+
+    def test_recorded_when_channel_deletion_fails(self, applied, discord, api):
+        discord.fault("DELETE", f"/channels/{BUDI_CH}", status=403, body={"message": "Missing Permissions", "code": 50013})
+        ht.remove_member(applied.team(), applied.hermes(), "budi", delete_channel=True, api=api)
+        assert BUDI_CH in discord.channels and BUDI_CH in self.tombstone(applied)["channels"]
+
+    def test_not_kept_when_channel_really_deleted(self, applied, discord, api):
+        ht.remove_member(applied.team(), applied.hermes(), "budi", delete_channel=True, api=api)
+        assert BUDI_CH not in discord.channels
+        assert BUDI_CH not in self.tombstone(applied)["channels"]
+
+    def test_merges_with_existing_entries_and_replaces_corrupt_file(self, applied):
+        path = applied.state / "removed_channels.json"
+        old = {"schema": 1, "channels": {"111": {"name": "x", "member": "lama", "removed_at": "2024-01-01T00:00:00Z"}}}
+        path.write_text(json.dumps(old), encoding="utf-8")
+        ht.remove_member(applied.team(), applied.hermes(), "budi")
+        channels = self.tombstone(applied)["channels"]
+        assert channels["111"] == old["channels"]["111"] and BUDI_CH in channels
+        # berkas rusak → diganti yang baru, bukan error
+        applied.write_members([BE1, {**BUDI, "active": False}])
+        path.write_text("{bukan json", encoding="utf-8")
+        ht.remove_member(applied.team(), applied.hermes(), "budi")
+        assert list(self.tombstone(applied)["channels"]) == [BUDI_CH]
+
+    def test_dry_run_writes_nothing(self, applied):
+        ht.remove_member(applied.team(), applied.hermes(dry_run=True), "budi", delete_channel=True)
+        assert not (applied.state / "removed_channels.json").exists()
+
+    def test_crash_between_tombstone_and_members_yaml_leaves_channel_protected(self, applied, patch_kit):
+        def boom(team):
+            raise RuntimeError("listrik mati")
+        patch_kit("save_members", boom)
+        with pytest.raises(RuntimeError, match="listrik mati"):
+            ht.remove_member(applied.team(), applied.hermes(), "budi")
+        assert BUDI_CH in self.tombstone(applied)["channels"]                         # nisan sudah ada
+        assert [m["name"] for m in applied.members_yaml()] == ["be1", "budi"]         # entri belum hilang

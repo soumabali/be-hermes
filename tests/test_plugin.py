@@ -508,7 +508,7 @@ class TestEnvFile:
         assert text.count("GH_PAT=") == 1 and "# komentar" in text and "FOO=bar" in text
         assert store.read_env() == {"FOO": "bar", "GH_PAT": "nilai-baru-123", "BAZ": "q u x"}
 
-    @pytest.mark.parametrize("value", ['p@ss "quoted" \\ back', "with # hash and spaces", "$HOME/${X} `cmd`",
+    @pytest.mark.parametrize("value", ['p@ss "quoted" \\ back', "with # hash and spaces", "$HOME/$X $(id) `cmd`",
                                        "'single' quotes", "tab\there", "=equals=at=start"])
     def test_value_roundtrip_through_env_tokenizer(self, tmp_path, value):
         store = secrets.SecretStore(tmp_path, extra_env=())
@@ -4058,3 +4058,205 @@ class TestEnvSetRaces:
         t1.join()
         kinds = [k for k, _ in order]
         assert kinds == ["start", "end", "start", "end"], order          # tidak tumpang tindih
+
+
+class TestCronRate(ScaleBase):
+    """Bentuk sekali jalan (`in 1m`, ISO) lolos pemeriksaan interval; job sekali-jalan yang membuat job berikutnya
+    (rantai) tetap = satu giliran LLM per menit. Dibatasi lewat LAJU pembuatan/perubahan per profile."""
+
+    @staticmethod
+    def call(ctx, action="create", schedule="in 1m", **extra):
+        args = {"action": action, "prompt": "cek", **extra}
+        if schedule is not None:
+            args["schedule"] = schedule
+        return ctx.fire("pre_tool_call", tool_name="cronjob_manage", args=args, task_id="t")
+
+    @pytest.mark.parametrize("minutes,per_hour", [(15, 4), (5, 12), (60, 3), (30, 3), (120, 3), (1, 60), (0, 60)])
+    def test_limit_formula(self, minutes, per_hour):
+        assert cronguard.rate_limit_per_hour(minutes) == per_hour
+
+    def test_self_chaining_one_shots_are_throttled(self, d):
+        self.env.set("settings", cron_min_interval_minutes=15)
+        ctx = self.env.register("be-budi")
+        for i in range(4):                                          # max(3, 60 // 15) = 4 per jam
+            assert self.call(ctx) == [], i
+            self.clock.advance(60)
+        got = self.call(ctx)
+        assert got and got[0]["action"] == "block"
+        assert "4" in got[0]["message"] and "per jam" in got[0]["message"] and "menit" in got[0]["message"]
+        self.clock.advance(3600)
+        assert self.call(ctx) == []                                 # jendela bergulir: slot kembali
+
+    def test_window_is_sliding_not_fixed(self, d):
+        self.env.set("settings", cron_min_interval_minutes=20)      # 3 per jam
+        ctx = self.env.register("be-budi")
+        assert self.call(ctx) == []                                 # t=0
+        self.clock.advance(1800)
+        assert self.call(ctx) == [] and self.call(ctx) == []        # t=1800 (2 sekaligus)
+        assert self.call(ctx)[0]["action"] == "block"
+        self.clock.advance(1799)                                    # t=3599: yang t=0 belum keluar
+        assert self.call(ctx)[0]["action"] == "block"
+        self.clock.advance(2)                                       # t=3601: slot t=0 bebas
+        assert self.call(ctx) == []
+
+    def test_run_update_and_create_share_the_budget(self, d):
+        self.env.set("settings", cron_min_interval_minutes=20)
+        ctx = self.env.register("be-budi")
+        assert self.call(ctx, "run", schedule=None, job_id="j1") == []
+        assert self.call(ctx, "update", schedule=None, job_id="j1") == []      # ubah prompt saja = perubahan
+        assert self.call(ctx, "create", schedule="2030-01-01T00:00:00") == []
+        got = self.call(ctx, "run", schedule=None, job_id="j1")
+        assert got and got[0]["action"] == "block"
+
+    @pytest.mark.parametrize("action", ["list", "pause", "resume", "remove", "status"])
+    def test_other_actions_are_not_counted(self, d, action):
+        self.env.set("settings", cron_min_interval_minutes=20)
+        ctx = self.env.register("be-budi")
+        for _ in range(10):
+            assert self.call(ctx, action, schedule=None, job_id="j1") == []
+
+    def test_too_frequent_recurring_is_refused_by_interval_and_does_not_consume_budget(self, d):
+        self.env.set("settings", cron_min_interval_minutes=20)
+        ctx = self.env.register("be-budi")
+        for _ in range(6):
+            got = self.call(ctx, schedule="every 1m")
+            assert "20 menit" in got[0]["message"] and "per jam" not in got[0]["message"]
+        assert self.call(ctx, schedule="every 30m") == []
+
+    def test_counted_per_profile_and_admin_is_exempt(self, d):
+        self.env.set("settings", cron_min_interval_minutes=20)
+        budi, be1, admin = (self.env.register(p) for p in ("be-budi", "be-be1", "team-admin"))
+        for _ in range(3):
+            assert self.call(budi) == []
+        assert self.call(budi)[0]["action"] == "block"
+        assert self.call(be1) == []                                 # profile lain punya jatah sendiri
+        for _ in range(10):
+            assert self.call(admin) == []
+
+    def test_disabled_without_the_setting(self, d):
+        ctx = self.env.register("be-budi")
+        for _ in range(10):
+            assert self.call(ctx) == []
+
+    def test_rate_helper_is_injectable_and_thread_safe(self):
+        rate = cronguard.CronRate()
+        results = []
+        threads = [threading.Thread(target=lambda: results.append(rate.acquire("p", 5, 100.0))) for _ in range(20)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert sum(1 for r in results if r == 0.0) == 5
+        assert all(r > 0 for r in results if r != 0.0)
+        assert rate.acquire("p", 5, 100.0 + 3600.1) == 0.0
+
+
+class TestUpstreamSourceText:
+    """`_source_text` membaca sumber hulu TANPA mengimpor: batas baca, tanpa cwd, tanpa symlink keluar."""
+
+    @staticmethod
+    def _mod(root, text="def register_env_passthrough(): pass\n"):
+        pkg = root / "toolsx"
+        pkg.mkdir(parents=True, exist_ok=True)
+        (pkg / "__init__.py").write_text("")
+        (pkg / "env_passthrough.py").write_text(text)
+        return "toolsx.env_passthrough"
+
+    def test_finds_normal_source_on_absolute_sys_path(self, tmp_path, monkeypatch):
+        module = self._mod(tmp_path)
+        monkeypatch.syspath_prepend(str(tmp_path))
+        assert "register_env_passthrough" in upstreammod._source_text(module)
+
+    @pytest.mark.parametrize("entry", ["", ".", "relatif/dir"])
+    def test_empty_and_relative_sys_path_entries_are_skipped(self, tmp_path, monkeypatch, entry):
+        """Regresi: "" / "." berarti cwd → berkas penyerang di direktori kerja dibaca sebagai 'sumber Hermes'."""
+        module = self._mod(tmp_path / "cwd")
+        monkeypatch.chdir(tmp_path / "cwd")
+        monkeypatch.setattr(sys, "path", [entry] + [p for p in sys.path if p not in ("", ".")])
+        assert upstreammod._source_text(module) is None
+
+    def test_reads_at_most_the_limit_and_never_the_whole_file(self, tmp_path, monkeypatch):
+        module = self._mod(tmp_path, "x = 1\n" * 100)
+        monkeypatch.syspath_prepend(str(tmp_path))
+        monkeypatch.setattr(upstreammod, "_SOURCE_LIMIT", 40)
+        monkeypatch.setattr(upstreammod.Path, "read_text",
+                            lambda *a, **k: (_ for _ in ()).throw(AssertionError("seluruh berkas dibaca")))
+        got = upstreammod._source_text(module)
+        assert got is not None and len(got.encode()) <= 40
+
+    def test_files_over_the_hard_cap_are_refused_not_read(self, tmp_path, monkeypatch):
+        module = self._mod(tmp_path, "x = 1\n" * 100)
+        monkeypatch.syspath_prepend(str(tmp_path))
+        monkeypatch.setattr(upstreammod, "_SOURCE_HARD_CAP", 100)
+        assert upstreammod._source_text(module) is None
+
+    def test_symlink_pointing_outside_the_sys_path_entry_is_not_followed(self, tmp_path, monkeypatch):
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (outside / "secret.py").write_text("register_env_passthrough = 1\n")
+        entry = tmp_path / "entry"
+        pkg = entry / "toolsx"
+        pkg.mkdir(parents=True)
+        (pkg / "__init__.py").write_text("")
+        (pkg / "env_passthrough.py").symlink_to(outside / "secret.py")
+        monkeypatch.syspath_prepend(str(entry))
+        assert upstreammod._source_text("toolsx.env_passthrough") is None
+
+    def test_symlinked_package_directory_leading_outside_is_not_followed(self, tmp_path, monkeypatch):
+        outside = tmp_path / "outside" / "toolsx"
+        outside.mkdir(parents=True)
+        (outside / "__init__.py").write_text("")
+        (outside / "env_passthrough.py").write_text("register_env_passthrough = 1\n")
+        entry = tmp_path / "entry"
+        entry.mkdir()
+        (entry / "toolsx").symlink_to(outside, target_is_directory=True)
+        monkeypatch.syspath_prepend(str(entry))
+        assert upstreammod._source_text("toolsx.env_passthrough") is None
+
+    def test_symlink_staying_inside_the_entry_is_fine(self, tmp_path, monkeypatch):
+        module = self._mod(tmp_path)
+        (tmp_path / "toolsx" / "alias.py").symlink_to(tmp_path / "toolsx" / "env_passthrough.py")
+        monkeypatch.syspath_prepend(str(tmp_path))
+        assert "register_env_passthrough" in upstreammod._source_text("toolsx.alias")
+        assert module
+
+
+class TestApproveDenyExemption(ScaleBase):
+    """/approve dan /deny tetap bebas anggaran/rate/antrean: mereka tidak memulai giliran LLM, hanya membuka
+    thread agen yang SUDAH berjalan (giliran yang sama, sudah diperiksa saat diterima). Menahannya karena anggaran
+    habis hanya membuat giliran itu menunggu sampai auto-deny."""
+
+    source = TestIntegrationEnvNames.source
+
+    def test_exempt_even_when_budget_rate_and_queue_would_refuse(self, d):
+        path = self.env.state_dir / "usage.db"
+        self.env.roster["usage"] = {"timezone": "UTC", "ledger": str(path)}
+        self.env.set("settings", daily_token_budget=1000, rate_per_minute=1, burst=1, user_max_concurrent=1)
+        S.ledger_add(path, TODAY, S.U_BUDI, 5000, 5000)
+        assert self.go(d, event(S.U_BUDI, S.CH_BUDI, "kerjakan sesuatu"))["reason"] == "team-guard: anggaran token habis"
+        for text in ("/approve", "/approve all always", "/deny", "/deny all alasan panjang"):
+            assert self.go(d, event(S.U_BUDI, S.CH_BUDI, text)) is None, text
+        assert {"approve", "deny"} <= dispatch.EXEMPT_COMMANDS
+
+    def test_reasoning_is_documented_next_to_the_allowlist(self):
+        text = (S.PLUGIN_DIR / "dispatch.py").read_text(encoding="utf-8")
+        assert "TIDAK memulai giliran" in text and "resolve_gateway_approval" in text and "auto-deny" in text
+
+    def test_upstream_handlers_only_resolve_a_blocked_agent_thread(self, source):
+        """Sumber Hermes: handler /approve & /deny hanya memanggil resolve_gateway_approval (membuka thread yang
+        menunggu) dan tidak pernah menjadwalkan / menjalankan agen."""
+        import ast
+        with open(os.path.join(source, "gateway", "slash_commands.py"), encoding="utf-8") as fh:
+            tree = ast.parse(fh.read())
+        found = {}
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef)) and node.name in (
+                    "_handle_approve_command", "_handle_deny_command"):
+                called = {getattr(n.func, "attr", getattr(n.func, "id", "")) for n in ast.walk(node)
+                          if isinstance(n, ast.Call)}
+                found[node.name] = called
+        assert set(found) == {"_handle_approve_command", "_handle_deny_command"}
+        for name, called in found.items():
+            assert "resolve_gateway_approval" in called and "_blocking_approval_or_stale" in called, name
+            assert not called & {"_run_agent", "handle_message", "create_task", "ensure_future", "run_agent",
+                                 "_handle_message", "start_turn"}, (name, called)

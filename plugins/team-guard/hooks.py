@@ -8,7 +8,8 @@ from __future__ import annotations
 
 from typing import Any, Mapping, Optional
 
-from .cronguard import check_cron_call
+from . import shared
+from .cronguard import CronRate, check_cron_call, check_cron_rate
 from .guard import check_tool_call
 from .redact import scrub_user_messages
 from .scale import is_rate_limit_error
@@ -110,6 +111,9 @@ class ProfileHooks:
         if self.kind != "admin":
             try:
                 found = check_cron_call(tool_name, args, roster.settings.get("cron_min_interval_minutes"))
+                if not found:         # laju: rantai job sekali-jalan & `run` (hanya yang lolos interval dihitung)
+                    found = check_cron_rate(tool_name, args, roster.settings.get("cron_min_interval_minutes"),
+                                            shared.slot("cron-rate", CronRate), self.profile, self.rt.clock)
             except Exception as exc:
                 log_once("cron-guard", "penjaga jadwal cron gagal (%s: %s); panggilan diloloskan",
                          type(exc).__name__, exc)

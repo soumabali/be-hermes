@@ -7,7 +7,7 @@ import re
 import shlex
 import sys
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 import yaml
 
 import kit_config
@@ -362,14 +362,73 @@ def managed_diff_lines(diff: dict) -> list[str]:
     return lines
 
 
+def _kit_stat(path: str) -> os.stat_result:
+    """Pembungkus os.stat untuk pemeriksaan kepemilikan kit (titik suntik uji: tanpa mengikuti symlink lagi,
+    path sudah di-realpath)."""
+    return os.stat(path)
+
+
+def untrusted_kit_paths(kit_dir: Optional[Path] = None, *, stat_fn: Optional[Callable[[str], Any]] = None,
+                        limit: int = 5) -> list[str]:
+    """Path kode kit yang BUKAN milik root atau bisa ditulis grup/lain → ["<path>: <alasan>", ...] (maks `limit`).
+
+    `managed --install` dijalankan sebagai root dan mengeksekusi skrip + paket `kit/` dari tempatnya berada; bila
+    folder itu bisa diubah user `hermes` yang tak berhak, akun itu naik jadi root. Yang diperiksa (setelah
+    realpath, symlink diikuti): folder kit dan semua leluhurnya, hermes_team.py, `kit_*.py`, serta seluruh isi
+    `kit/` (termasuk __pycache__). Leluhur dengan sticky bit (mis. /tmp) boleh dapat ditulis-semua."""
+    stat_fn = stat_fn or _kit_stat
+    root = Path(os.path.realpath(kit_dir or KIT_DIR))
+    problems: list[str] = []
+
+    def check(path: Path, *, ancestor: bool = False) -> None:
+        if len(problems) >= limit:
+            return
+        real = os.path.realpath(path)
+        try:
+            info = stat_fn(real)
+        except OSError as exc:
+            problems.append(f"{real}: tidak bisa diperiksa ({exc})")
+            return
+        if info.st_uid != 0:
+            problems.append(f"{real}: dimiliki uid {info.st_uid}, bukan root")
+        elif info.st_mode & 0o022 and not (ancestor and info.st_mode & 0o1000):
+            problems.append(f"{real}: bisa ditulis grup/lain (mode {info.st_mode & 0o7777:04o})")
+
+    for parent in (root, *root.parents):
+        check(parent, ancestor=True)
+    check(root / "hermes_team.py")
+    for extra in sorted(root.glob("kit_*.py")):
+        check(extra)
+    kit_pkg = root / "kit"
+    if kit_pkg.is_dir():
+        for current, dirs, files in os.walk(kit_pkg):
+            for name in (*sorted(dirs), *sorted(files)):
+                check(Path(current) / name)
+            check(Path(current))
+    return problems
+
+
 def install_managed(team: dict, *, target_dir: Optional[Path] = None, euid: Optional[int] = None,
-                    dry_run: bool = False) -> Path:
-    """Tulis managed config secara atomik (0644). Harus root; kalau bukan → TeamError berisi perintah sudo."""
+                    dry_run: bool = False, allow_user_owned_kit: bool = False,
+                    stat_fn: Optional[Callable[[str], Any]] = None) -> Path:
+    """Tulis managed config secara atomik (0644). Harus root; kalau bukan → TeamError berisi perintah sudo.
+
+    Sebagai root, kode kit yang dijalankan harus milik root dan tidak bisa ditulis user lain
+    (`untrusted_kit_paths`); `allow_user_owned_kit=True` melewati pemeriksaan itu (uji / instalasi tak lazim)."""
     euid = os.geteuid() if euid is None else euid
     target = Path(target_dir) if target_dir else managed_dir()
     path = target / "config.yaml"
     if euid != 0:
         raise TeamError(f"memasang {path} harus sebagai root. Jalankan persis:\n  {managed_install_command(team)}")
+    if not allow_user_owned_kit:
+        bad = untrusted_kit_paths(stat_fn=stat_fn)
+        if bad:
+            raise TeamError(
+                "ditolak: kit ini dijalankan sebagai root, tetapi kodenya berada di tempat yang bisa diubah "
+                f"bukan-root ({KIT_DIR}):\n  " + "\n  ".join(bad)
+                + "\nPasang kit ke path milik root (mis. /opt/hermes-team — wizard setup melakukannya; "
+                "pastikan root pemiliknya dan tidak bisa ditulis grup/lain), lalu jalankan perintah sudo dari "
+                "salinan itu. Bila sadar risikonya (uji / instalasi tak lazim): tambah --allow-user-owned-kit.")
     if dry_run:
         return path
     target.mkdir(parents=True, exist_ok=True)

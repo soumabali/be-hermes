@@ -12,7 +12,7 @@ from kit_base import TeamError, _id
 from kit_discord import PERM, discord_token, private_overwrites, DiscordAPI
 from kit.constants import NAME_RE
 from kit.profiles import MODEL_TARGETS, PROFILE_KINDS, RESERVED_NAMES, SYSTEM_KINDS
-from kit.util import _profile, clean_display_name
+from kit.util import _profile, atomic_write, clean_display_name, now_iso
 from kit.config import _sandbox_override, _validate_unique, load_team, members_lock, reload_team, save_members, team_lock
 from kit.derive import _get_nested, compression_settings, model_settings, sandbox_limits, sandbox_settings, sandbox_worst_case_mb
 from kit.hermes_cli import Hermes
@@ -860,6 +860,49 @@ def remove_member_plan(team: dict, hermes: Hermes, name: str, *, delete_profile:
     return {"member": member, "will_delete": will, "kept": keep, "origin_skills": origin, "target_skills": targeted}
 
 
+REMOVED_CHANNELS_FILE = "removed_channels.json"
+REMOVED_CHANNELS_SCHEMA = 1
+
+
+def removed_channels_path(team: dict) -> Path:
+    return Path(team["paths"]["state_dir"]) / REMOVED_CHANNELS_FILE
+
+
+def _load_removed_channels(path: Path) -> dict:
+    """Isi `removed_channels.json` yang sah; berkas hilang / rusak / bentuk salah → daftar kosong baru."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    channels = data.get("channels") if isinstance(data, dict) else None
+    if not isinstance(channels, dict):
+        return {}
+    return {str(cid): entry for cid, entry in channels.items() if isinstance(entry, dict)}
+
+
+def _write_removed_channels(path: Path, channels: dict) -> None:
+    atomic_write(path, json.dumps({"schema": REMOVED_CHANNELS_SCHEMA, "channels": channels},
+                                  ensure_ascii=False, indent=1) + "\n", mode=0o600)
+
+
+def record_removed_channel(team: dict, member: dict, *, channel_name: str = "") -> None:
+    """Catat channel anggota yang dihapus dari members.yaml di `<state_dir>/removed_channels.json` (nisan):
+    teamctl menolak membaca / menulis / menghapus channel itu walau tak lagi tercatat sebagai channel pribadi.
+    Dipanggil di bawah kunci tim SEBELUM entri members.yaml dibuang. Tidak pernah dihapus otomatis kecuali
+    oleh `remove_member` sendiri bila channelnya benar-benar berhasil dihapus (`forget_removed_channel`)."""
+    path = removed_channels_path(team)
+    channels = _load_removed_channels(path)
+    channels[member["channel_id"]] = {"name": channel_name, "member": member["name"], "removed_at": now_iso()}
+    _write_removed_channels(path, channels)
+
+
+def forget_removed_channel(team: dict, channel_id: str) -> None:
+    path = removed_channels_path(team)
+    channels = _load_removed_channels(path)
+    if channels.pop(channel_id, None) is not None:
+        _write_removed_channels(path, channels)
+
+
 def remove_member(team: dict, hermes: Hermes, name: str, *, delete_profile: bool = False,
                   delete_channel: bool = False, api: Optional[DiscordAPI] = None) -> dict:
     """Hapus PERMANEN anggota yang sudah nonaktif: entri members.yaml + rujukan di registry skill bersama;
@@ -887,7 +930,8 @@ def remove_member(team: dict, hermes: Hermes, name: str, *, delete_profile: bool
         if touched:
             _save_registry(team, registry)
             done.append(f"'{name}' dilepas dari daftar penerima skill bersama")
-        # 2) members.yaml
+        # 2) nisan channel DULU (crash setelah ini tidak meninggalkan channel tanpa perlindungan), baru members.yaml
+        record_removed_channel(team, member)
         with members_lock(Path(team["paths"]["team_file"])):
             fresh = load_team(Path(team["paths"]["team_file"]), Path(team["paths"]["members_file"]))
             fresh["members"] = [m for m in fresh["members"] if m["name"] != name]
@@ -913,6 +957,7 @@ def remove_member(team: dict, hermes: Hermes, name: str, *, delete_profile: bool
                 else:
                     client.delete_channel(member["channel_id"], reason=f"Hermes: anggota {name} dihapus permanen")
                     done.append(f"channel Discord {member['channel_id']} dihapus")
+                    forget_removed_channel(team, member["channel_id"])      # channelnya sudah tidak ada
             except TeamError as exc:
                 notes.append(f"channel {member['channel_id']} TIDAK terhapus ({exc}); hapus manual di Discord")
         return {**plan, "done": done, "notes": notes, "dry_run": False, **result}

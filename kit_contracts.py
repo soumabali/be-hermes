@@ -17,6 +17,7 @@ from typing import Any, Optional, TypedDict, Union
 ROSTER_SCHEMA = 1            # state/roster.json (kit → plugin, teamctl, tools); "version": 3 lama tetap ada
 METRICS_SCHEMA = 1           # state/metrics.json (plugin → teamctl, tools/metrics_export)
 BUDGET_OVERRIDES_SCHEMA = 1  # state/budget_overrides.json: dipetakan per user_id, tanpa kunci "schema" (lihat KONTRAK.md)
+REMOVED_CHANNELS_SCHEMA = 1  # state/removed_channels.json (kit remove-member → teamctl Server.personal)
 EVENTS_SCHEMA = 1            # baris JSON `--events` (kit → plugin onboarding); tanpa kunci "schema" di baris
 
 
@@ -119,6 +120,18 @@ class BudgetOverride(TypedDict):
 
 
 BudgetOverrides = dict   # user_id → BudgetOverride
+
+
+# --------------------------------------------------------------------------- removed_channels.json
+class RemovedChannel(TypedDict):
+    name: str                          # nama channel bila diketahui, selain itu ""
+    member: str                        # nama anggota yang dihapus
+    removed_at: str                    # ISO UTC "…Z"
+
+
+class RemovedChannels(TypedDict):
+    schema: int                        # REMOVED_CHANNELS_SCHEMA
+    channels: dict                     # channel_id → RemovedChannel
 
 
 # --------------------------------------------------------------------------- --events (JSON lines)

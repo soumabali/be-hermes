@@ -24,6 +24,7 @@ di [`kit_contracts.py`](../kit_contracts.py) (stdlib saja), dan diuji di `tests/
 | `state/roster.json` | kit (`kit/derive.py::roster_data`, ditulis `kit/provision.py::write_roster`) | plugin (`roster.py`, `livereload.py`, `onboarding.py`, `budget.py`, ...), teamctl, `kit_doctor.py` | `schema: 1` (+ `version: 3` lama) | `test_kit_units.py::TestRosterContract`, `test_contract.py` |
 | `state/metrics.json` | plugin (`scale.py::build_metrics`, ditulis `Monitor` tiap 30 dtk) | teamctl (`team_status`), `tools/metrics_export.py` | `schema: 1` | `test_contract.py`, `test_scale_sim.py` |
 | `state/budget_overrides.json` | teamctl (`tools_usage.py`) | plugin (`budget.py::overrides`) | tanpa `schema` (dipetakan per user ID) | `test_contract.py` |
+| `state/removed_channels.json` | kit (`kit/membership.py::remove_member`, di bawah kunci tim) | teamctl (`Server.personal`: channel bekas anggota tetap dianggap pribadi) | `schema: 1` | `test_kit_units.py::TestRemoveMember` |
 | `--events` (JSON per baris, stdout) | kit CLI (`onboard`, `offboard`, `onboard-batch`) | plugin (`onboarding.py`) | tanpa `schema` (per baris; kunci `event` membedakan jenis) | `test_onboarding.py`, `test_kit_units.py` |
 | `state/usage.db` (SQLite) | `usage_ledger.py` (kolektor, dijalankan plugin/cron) | plugin (anggaran), teamctl, `usage_report.py`, `tools/usage_post.py` | `meta.schema_version = 1` (`usage_ledger.SCHEMA_VERSION`) | `test_usage_ledger.py`, `test_contract.py` |
 | `team.yaml` / `members.yaml` | manusia, `kit` (members), teamctl | kit (`kit_config` = skema), `kit_paths.load_raw` untuk alat ringan | skema = tabel `kit_config.FIELDS` | `test_kit_units.py::TestConfigSchema` |
@@ -63,6 +64,17 @@ di [`kit_contracts.py`](../kit_contracts.py) (stdlib saja), dan diuji di `tests/
   Hanya berlaku pada `day` (zona waktu `usage.timezone`); menaikkan batas ORANG itu saja, bukan plafon tim.
 * **Versi:** tanpa `schema` karena kunci tingkat atas adalah user ID; bila bentuknya perlu berubah, berkas baru
   dengan nama baru dipakai berdampingan dulu.
+
+## `state/removed_channels.json`
+
+* **Produsen:** `remove-member` (`kit/membership.py::record_removed_channel`), di bawah kunci tim, atomik, mode 0600.
+  Ditulis SEBELUM entri dibuang dari `members.yaml` (crash di antaranya tidak meninggalkan channel tanpa
+  perlindungan) dan tetap ditulis bila `--delete-channel` gagal. Hanya bila channel benar-benar berhasil dihapus
+  entrinya dibuang lagi. Selain itu TIDAK pernah dihapus otomatis. Berkas hilang / rusak diganti yang baru.
+* **Bentuk:** `kit_contracts.RemovedChannels` — `{"schema": 1, "channels": {"<channel_id>": {"name": "<nama channel
+  atau \"\">", "member": "<nama anggota>", "removed_at": "<ISO UTC Z>"}}}`.
+* **Pembaca:** teamctl `Server.personal`: channel di berkas ini diperlakukan sebagai channel pribadi (ditolak untuk
+  baca/tulis/hapus lewat tool admin) walau anggotanya sudah tidak ada. Pembaca mengabaikan kunci tak dikenal.
 
 ## `--events` (JSON per baris)
 

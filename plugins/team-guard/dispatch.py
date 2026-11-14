@@ -25,7 +25,14 @@ NOTICE_EVERY = 60.0         # jeda minimal antar pemberitahuan sejenis ke orang 
 # Perintah kendali yang TIDAK PERNAH memulai giliran LLM → bebas anggaran, rate limit, batas per orang, dan
 # antrean. Daftar izin eksplisit, diperiksa satu per satu terhadap Hermes hulu (commit 5d87ea2):
 #   stop                → gateway/slash_commands.py::_handle_stop_command (hanya menginterupsi)
-#   approve, deny       → ::_handle_approve_command/_handle_deny_command (melanjutkan giliran yang menunggu)
+#   approve, deny       → ::_handle_approve_command/_handle_deny_command. TIDAK memulai giliran: keduanya hanya
+#                         memanggil tools/approval.py::resolve_gateway_approval, yang men-set `threading.Event`
+#                         milik thread agen yang SUDAH berjalan dan sedang menunggu di dalam sebuah tool
+#                         (`has_blocking_approval(session_key)`; tanpa itu balasannya hanya "tidak ada yang menunggu").
+#                         Kelanjutannya adalah giliran yang sama, yang anggarannya sudah diperiksa saat diterima.
+#                         Memeriksa anggaran di sini justru membuat giliran itu menunggu sampai timeout approval
+#                         (auto-deny) — kebuntuan yang dihindari Hermes sendiri (run_inbound: «never a queued turn
+#                         (auto-deny deadlock)»). Dipaku oleh TestApproveDenyExemption.
 #   status, context/ctx, usage → gateway/slash_commands_status.py (hanya membaca)
 #   help, commands, whoami     → gateway/slash_commands.py (katalog / info akses)
 #   new/reset           → gateway/run_inbound.py::_hm_cmd_new → _handle_reset_command (sesi baru, tanpa giliran)

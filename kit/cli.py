@@ -193,6 +193,9 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
                       help="bandingkan dengan berkas yang terpasang; exit 1 bila ada beda")
     mode.add_argument("--install", action="store_true",
                       help="tulis berkasnya secara atomik (0644); harus root — tanpa root mencetak perintah sudo persisnya")
+    p.add_argument("--allow-user-owned-kit", action="store_true",
+                   help="--install sebagai root: lewati pemeriksaan bahwa kode kit milik root dan tak bisa ditulis "
+                        "user lain (hanya untuk uji / instalasi tak lazim)")
     sub.add_parser("host-yaml", parents=[common], help="cetak setelan gateway sebagai YAML")
     sub.add_parser("status", parents=[common], help="ringkasan kondisi")
     p = sub.add_parser("add-member", parents=[common], help="tambah anggota")
@@ -251,7 +254,9 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     p.add_argument("profile", help="nama anggota, shared, admin, atau default")
     p.add_argument("--stdin", action="store_true",
                    help="baca key dari stdin (satu baris), untuk dipakai dari skrip/pipe")
-    sub.add_parser("config-doc", help="cetak tabel setelan team.yaml (Markdown) dari skema kit_config")
+    p = sub.add_parser("config-doc", help="cetak tabel setelan team.yaml (Markdown) dari skema kit_config")
+    p.add_argument("--write", metavar="BERKAS", default=None,
+                   help="ganti tabelnya di BERKAS yang sudah ada (mis. docs/KONFIGURASI.md) alih-alih mencetak")
     return parser.parse_args(argv)
 
 
@@ -360,6 +365,14 @@ _MUTATING = {
 
 def _run(args: argparse.Namespace, events: bool) -> None:
     if args.command == "config-doc":        # tidak butuh team.yaml: tabel dari skema (kit_config.FIELDS)
+        if args.write:
+            target = Path(args.write)
+            try:
+                atomic_write(target, kit_config.replace_markdown_table(target.read_text(encoding="utf-8")), mode=0o644)
+            except (OSError, TeamError) as exc:
+                sys.exit(f"config-doc --write: {exc}")
+            print(f"✓ {target} diperbarui dari kit_config.FIELDS")
+            return
         sys.stdout.write(kit_config.markdown_table())
         return
     team, hermes, hermes_bin = _open_team(args, events)
@@ -401,7 +414,7 @@ def _cmd_managed(team: dict, args: argparse.Namespace) -> None:
         sys.exit(1)
     if args.install:
         try:
-            path = install_managed(team, dry_run=args.dry_run)
+            path = install_managed(team, dry_run=args.dry_run, allow_user_owned_kit=args.allow_user_owned_kit)
         except TeamError as exc:
             sys.exit(str(exc))
         if args.dry_run:

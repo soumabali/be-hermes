@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import os
 import re
+import stat
 import sys
 import time
 from datetime import datetime, timezone
@@ -42,7 +43,8 @@ from .state import atomic_write, now_iso
 CAPABILITIES_SCHEMA = 1
 CAPABILITIES_FILE = "capabilities.json"
 CAPABILITIES_REFRESH = 6 * 3600.0       # detik; isi yang sama tidak ditulis ulang selama ini
-_SOURCE_LIMIT = 4_000_000
+_SOURCE_LIMIT = 4_000_000          # byte yang dibaca per berkas sumber
+_SOURCE_HARD_CAP = 16_000_000      # berkas lebih besar dari ini ditolak (tidak dibaca)
 
 ENV_ALLOWED = "DISCORD_ALLOWED_CHANNELS"
 ENV_FREE = "DISCORD_FREE_RESPONSE_CHANNELS"
@@ -95,16 +97,45 @@ _PROBES: tuple[tuple[str, tuple[str, ...], str, str, str], ...] = (
 )
 
 
+def _read_limited(path: Path, root: Path) -> Optional[str]:
+    """Baca paling banyak `_SOURCE_LIMIT` byte dari berkas biasa di dalam `root` (tidak mengikuti symlink keluar),
+    atau None. Berkas lebih besar dari `_SOURCE_HARD_CAP` ditolak tanpa dibaca."""
+    real = path.resolve()
+    try:
+        real.relative_to(root)
+    except ValueError:
+        return None                                           # symlink (berkas / direktori) keluar dari entri
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    fd = os.open(str(real), flags)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_size > _SOURCE_HARD_CAP:
+            return None
+        with os.fdopen(fd, "rb", closefd=False) as fh:
+            return fh.read(_SOURCE_LIMIT).decode("utf-8", errors="replace")
+    finally:
+        os.close(fd)
+
+
 def _source_text(module: str) -> Optional[str]:
-    """Teks sumber `module` dicari di sys.path TANPA mengimpornya (tidak ada efek samping dari kode hulu)."""
+    """Teks sumber `module` dicari di sys.path TANPA mengimpornya (tidak ada efek samping dari kode hulu).
+    Entri kosong / relatif ("" dan "." = direktori kerja) dilewati; symlink yang keluar dari entri tidak diikuti;
+    berkas dibaca paling banyak `_SOURCE_LIMIT` byte dan yang melebihi `_SOURCE_HARD_CAP` ditolak."""
     parts = module.split(".")
-    for base in sys.path:
-        root = Path(base or ".")
-        for cand in (root.joinpath(*parts).with_suffix(".py"), root.joinpath(*parts, "__init__.py")):
+    for base in list(sys.path):
+        if not isinstance(base, str) or not base or not os.path.isabs(base):
+            continue
+        try:
+            root = Path(base).resolve()
+        except (OSError, RuntimeError):
+            continue
+        for cand in (Path(base).joinpath(*parts).with_suffix(".py"), Path(base).joinpath(*parts, "__init__.py")):
             try:
                 if cand.is_file():
-                    return cand.read_text(encoding="utf-8", errors="replace")[:_SOURCE_LIMIT]
-            except OSError:
+                    text = _read_limited(cand, root)
+                    if text is not None:
+                        return text
+            except (OSError, RuntimeError):
                 continue
     return None
 

@@ -343,6 +343,27 @@ def _patch_kit_fixture(monkeypatch):
     return lambda name, value: patch_kit(monkeypatch, name, value)
 
 
+@pytest.fixture
+def register_kind(monkeypatch):
+    """Daftarkan jenis profile PALSU di salinan-uji registri (`kit.profiles.PROFILE_KINDS`) dan bangun ulang
+    skema (`kit_config.rebuild_schema`); setelah uji, registri + skema dipulihkan. Mengembalikan fungsi
+    `register(kind)`."""
+    import kit_config
+    from kit import profiles
+
+    ctx = monkeypatch.context()
+    mp = ctx.__enter__()
+    try:
+        def register(kind):
+            mp.setitem(profiles.PROFILE_KINDS, kind.name, kind)
+            kit_config.rebuild_schema()
+            return kind
+        yield register
+    finally:
+        ctx.__exit__(None, None, None)
+        kit_config.rebuild_schema()
+
+
 @pytest.fixture(autouse=True)
 def _no_real_discord(monkeypatch):
     """Tanpa server tiruan, panggilan Discord apa pun harus gagal cepat, bukan keluar ke internet."""

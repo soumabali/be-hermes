@@ -25,7 +25,9 @@ from __future__ import annotations
 
 import math
 import re
-from typing import Any, Optional
+import threading
+from collections import deque
+from typing import Any, Callable, Optional
 
 from .shared import log_once
 
@@ -185,3 +187,74 @@ def check_cron_call(tool_name: Any, args: Any, min_minutes: Any) -> Optional[str
     if interval >= limit:
         return None
     return MSG_CRON.format(schedule=schedule.strip()[:80], every=_human(interval), limit=limit)
+
+
+# ----------------------------------------------------------------------------- laju pembuatan / perubahan
+# Bentuk sekali-jalan ("in 1m", timestamp ISO) lolos pemeriksaan interval, padahal job sekali-jalan yang
+# membuat job berikutnya (rantai) = satu giliran LLM per menit tanpa batas. Selain itu `action=run`
+# memicu job seketika. Karena itu SETIAP pembuatan / perubahan / pemicuan dihitung dalam jendela bergulir
+# satu jam per profile.
+RATE_WINDOW = 3600.0
+RATED_ACTIONS = frozenset({"create", "update", "run"})
+MSG_CRON_RATE = ("Terlalu banyak membuat/mengubah/menjalankan jadwal cron: batas tim {limit} kali per jam per "
+                 "profile (rantai job sekali-jalan tetap memakai satu giliran LLM tiap kali). Coba lagi dalam "
+                 "±{wait}, atau pakai satu jadwal berulang (mis. 'every {every}m'). Minta admin tim bila memang perlu.")
+
+
+def rate_limit_per_hour(min_minutes: Any) -> int:
+    """Jatah pembuatan/perubahan/pemicuan per jam per profile: `max(3, 60 // max(1, cron_min_interval_minutes))`."""
+    try:
+        minutes = int(min_minutes or 0)
+    except (TypeError, ValueError):
+        minutes = 0
+    return max(3, 60 // max(1, minutes))
+
+
+class CronRate:
+    """Jendela bergulir per profile, di memori, aman antar-thread. Satu objek per proses (slot bersama), jam
+    disuntikkan lewat argumen `now` (uji memakai jam tiruan)."""
+
+    def __init__(self, window: float = RATE_WINDOW):
+        self.window = float(window)
+        self._lock = threading.Lock()
+        self._hits: dict[str, deque] = {}
+
+    def acquire(self, profile: str, limit: int, now: float) -> float:
+        """0.0 = diizinkan (dan dicatat); selain itu detik sampai satu slot bebas (tidak dicatat)."""
+        with self._lock:
+            hits = self._hits.setdefault(str(profile), deque())
+            while hits and now - hits[0] >= self.window:
+                hits.popleft()
+            if len(hits) < limit:
+                hits.append(now)
+                return 0.0
+            return max(1.0, hits[0] + self.window - now)
+
+
+def is_rated_call(tool_name: Any, args: Any) -> bool:
+    """Panggilan tool cron yang membuat / mengubah / memicu job (bukan list/pause/resume/remove)."""
+    if str(tool_name or "") not in CRON_TOOLS or not isinstance(args, dict):
+        return False
+    action = args.get("action")
+    action = action.strip().lower() if isinstance(action, str) else ""
+    if action:
+        return action in RATED_ACTIONS
+    return isinstance(args.get("schedule"), str) and bool(args["schedule"].strip())     # bentuk lama tanpa `action`
+
+
+def check_cron_rate(tool_name: Any, args: Any, min_minutes: Any, rate: CronRate, profile: str,
+                    now: Callable[[], float]) -> Optional[str]:
+    """Pesan penolakan bila profile melewati jatah per jam; None = boleh (dan dicatat). Nonaktif bila
+    `cron_min_interval_minutes` kosong/0, sama dengan penjaga interval."""
+    try:
+        limit_minutes = int(min_minutes or 0)
+    except (TypeError, ValueError):
+        return None
+    if limit_minutes <= 0 or not is_rated_call(tool_name, args):
+        return None
+    limit = rate_limit_per_hour(limit_minutes)
+    wait = rate.acquire(profile, limit, now())
+    if wait <= 0:
+        return None
+    return MSG_CRON_RATE.format(limit=limit, wait=_human(wait) if wait < 60 else f"{int(math.ceil(wait / 60))} menit",
+                                every=limit_minutes)

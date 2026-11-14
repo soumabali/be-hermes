@@ -643,6 +643,41 @@ def markdown_table() -> str:
     return "\n".join(lines) + "\n"
 
 
+TABLE_HEADER = "| key | tipe | default | plugin | deskripsi |"
+REGENERATE_DOC = "python3 hermes_team.py config-doc --write docs/KONFIGURASI.md"
+
+
+def replace_markdown_table(text: str) -> str:
+    """Ganti tabel FIELDS di `text` (dari baris header sampai baris tabel terakhir) dengan tabel terkini."""
+    lines = text.split("\n")
+    try:
+        start = lines.index(TABLE_HEADER)
+    except ValueError:
+        raise TeamError(f"tabel konfigurasi tidak ditemukan (baris header: {TABLE_HEADER})") from None
+    end = start
+    while end < len(lines) and lines[end].startswith("|"):
+        end += 1
+    return "\n".join(lines[:start] + markdown_table().rstrip("\n").split("\n") + lines[end:])
+
+
+def plugin_default_problems(settings_defaults: dict, onboarding_defaults: dict) -> list[str]:
+    """Baris yang harus ditambahkan di plugins/team-guard/roster.py bila ada field ber-`plugin_key` yang belum
+    punya bawaan di sana (dan sebaliknya: bawaan plugin tanpa field). Kosong = sinkron."""
+    problems: list[str] = []
+    for section, table, name in (("settings", settings_defaults, "SETTINGS_DEFAULTS"),
+                                 ("onboarding", onboarding_defaults, "ONBOARDING_DEFAULTS")):
+        fields = {f.plugin_key: f for f in plugin_fields(section)}
+        for key, f in fields.items():
+            if key not in table:
+                problems.append(f'plugins/team-guard/roster.py: tambahkan ke {name}:  "{key}": {f.default!r},'
+                                f'   (dari kit_config baris `{f.path}`)')
+        for key in table:
+            if key not in fields:
+                problems.append(f"plugins/team-guard/roster.py: {name}[{key!r}] tidak punya baris ber-plugin_key "
+                                f"di kit_config.FIELDS (hapus dari plugin atau tambah barisnya)")
+    return problems
+
+
 def example_section(section: str) -> str:
     """Cuplikan YAML bawaan satu bagian (default + deskripsi sebagai komentar). Komentar tulisan tangan di
     team.example.yaml tidak diganti; ini hanya bahan untuk menyalin baris yang kurang."""
