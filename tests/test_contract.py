@@ -60,12 +60,24 @@ def test_every_plugin_flagged_field_reaches_the_plugin_and_defaults_stay_in_sync
     kit_settings = {f.plugin_key: f for f in kit_config.plugin_fields("settings")}
     kit_onboarding = {f.plugin_key: f for f in kit_config.plugin_fields("onboarding")}
     assert set(kit_settings) <= set(roster.settings) and set(kit_onboarding) <= set(roster.onboarding)
-    assert set(roster_mod.SETTINGS_DEFAULTS) == set(kit_settings)
-    assert set(roster_mod.ONBOARDING_DEFAULTS) == set(kit_onboarding)
+    problems = kit_config.plugin_default_problems(roster_mod.SETTINGS_DEFAULTS, roster_mod.ONBOARDING_DEFAULTS)
+    assert not problems, "\n".join(problems)
     for plugin_defaults, fields in ((roster_mod.SETTINGS_DEFAULTS, kit_settings),
                                     (roster_mod.ONBOARDING_DEFAULTS, kit_onboarding)):
         drift = {key for key, f in fields.items() if plugin_defaults[key] != f.default} - INTENTIONAL_PLUGIN_DEFAULTS
         assert not drift, f"bawaan plugin menyimpang dari kit_config.FIELDS: {sorted(drift)}"
+
+
+def test_plugin_default_check_still_detects_missing_and_stray_keys():
+    """Bukti uji sinkron di atas tidak tumpul: kunci hilang / berlebih di plugin tetap dilaporkan."""
+    settings, onboarding = dict(roster_mod.SETTINGS_DEFAULTS), dict(roster_mod.ONBOARDING_DEFAULTS)
+    assert not kit_config.plugin_default_problems(settings, onboarding)
+    missing = next(iter(settings))
+    del settings[missing]
+    settings["hantu"] = 1
+    problems = kit_config.plugin_default_problems(settings, onboarding)
+    assert any(missing in p and "tambahkan" in p for p in problems)
+    assert any("hantu" in p for p in problems)
 
 
 def test_plugin_source_only_reads_setting_keys_the_kit_produces(tc):

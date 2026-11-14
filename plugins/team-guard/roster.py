@@ -127,6 +127,36 @@ class Roster:
                 return {"personal": "member"}.get(str(entry.get("kind")), str(entry.get("kind") or "other"))
         return "other"
 
+    def _profile_entry(self, profile: str) -> dict:
+        for entry in self.channels.values():
+            if entry.get("profile") == profile:
+                return entry
+        return {}
+
+    def profile_cron_exempt(self, profile: str) -> bool:
+        """Profile ini boleh membuat cron job rapat? Kit menulis `cron_exempt: true` di entri channel jenisnya
+        (PROFILE_KINDS); roster lama tanpa kunci itu: hanya jenis `admin`."""
+        entry = self._profile_entry(profile)
+        if "cron_exempt" in entry:
+            return bool(entry["cron_exempt"])
+        return entry.get("kind") == "admin"
+
+    def channel_is_admin(self, entry: dict) -> bool:
+        """Channel milik role admin? Kit menulis `role: "admin"` untuk jenis ber-role admin; roster lama: kind admin."""
+        if "role" in entry:
+            return entry["role"] == "admin"
+        return entry.get("kind") == "admin"
+
+    def kind_channel(self, kind: str) -> str:
+        """ID channel pertama yang berjenis `kind` ("" bila tidak ada) — untuk placeholder `{<kind>_channel}`."""
+        for cid, entry in sorted(self.channels.items()):
+            if entry.get("kind") == kind:
+                return str(cid)
+        return ""
+
+    def kinds(self) -> set[str]:
+        return {str(e.get("kind")) for e in self.channels.values() if e.get("kind") and e.get("kind") != "personal"}
+
     def profiles(self) -> set[str]:
         return {str(e.get("profile")) for e in self.channels.values() if e.get("profile")}
 

@@ -47,12 +47,23 @@ def render_welcome(template: str, **fields: Any) -> str:
     (lapisan kedua setelah AllowedMentions) dan panjang dipotong ke batas Discord."""
     def _sub(match: re.Match) -> str:
         key = match.group(1)
-        return str(fields.get(key, "")) if key in PLACEHOLDERS else match.group(0)
+        return str(fields.get(key, "")) if key in PLACEHOLDERS or key in fields else match.group(0)
 
     text = re.sub(r"\{(\w+)\}", _sub, template or "")
     text = text.replace("@everyone", "@​everyone").replace("@here", "@​here")
     text = re.sub(r"<@&(\d+)>", "@role", text)
     return text[:2000]
+
+
+def kind_channel_fields(roster: Any) -> dict:
+    """`{<jenis>_channel}` untuk tiap jenis channel di roster (mis. jenis baru `ops` -> `{ops_channel}`). Tidak
+    menimpa placeholder bawaan; jenis tanpa channel tidak menghasilkan kunci."""
+    out = {}
+    for kind in sorted(roster.kinds()):
+        key = f"{kind}_channel"
+        if re.fullmatch(r"\w+", key) and key not in PLACEHOLDERS and roster.kind_channel(kind):
+            out[key] = f"<#{roster.kind_channel(kind)}>"
+    return out
 
 
 def welcome_fields(roster: Any, user_id: str, info: dict) -> dict:
@@ -68,6 +79,7 @@ def welcome_fields(roster: Any, user_id: str, info: dict) -> dict:
         "channel": f"<#{channel}>" if channel else "", "shared_channel": f"<#{roster.shared_channel}>",
         "admin_channel": f"<#{roster.admin_channel}>",
         "profile": str(info.get("profile") or user.get("profile") or ""),
+        **kind_channel_fields(roster),
     }
 
 

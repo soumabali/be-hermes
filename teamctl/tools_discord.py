@@ -351,6 +351,73 @@ def discord_delete_channel(ctl, args: dict) -> PlanFn:
     return plan
 
 
+def _perm_request(args: dict) -> tuple:
+    """(remove, allow, deny) dari argumen; tolak kombinasi yang tidak masuk akal."""
+    remove = bool(args.get("remove"))
+    allow = ht.permission_bits(args.get("allow") or [])
+    deny = ht.permission_bits(args.get("deny") or [])
+    if remove and (allow or deny):
+        raise ToolError("remove=true tidak bisa digabung dengan allow/deny")
+    if allow & deny:
+        raise ToolError("izin yang sama ada di allow dan deny: " + _perm_list(allow & deny))
+    if not remove and not (allow or deny):
+        raise ToolError("isi allow dan/atau deny, atau remove=true")
+    return remove, allow, deny
+
+
+def _perm_new_overwrites(srv, kind, where, target_label, target_id, kind_id, current, others, remove, allow, deny):
+    """(new_allow, new_deny, new_ows) setelah perubahan; pagar: hapus izin channel tim ditolak, bit berbahaya dicek."""
+    old_allow, old_deny = int((current or {}).get("allow") or 0), int((current or {}).get("deny") or 0)
+    if remove:
+        if kind:
+            raise ToolError(f"{where} adalah {kind}: pengaturan izin khususnya tidak bisa dihapus lewat Hermes "
+                            "(bisa membuka channel tim ke orang lain); ubah manual di Discord")
+        if current is None:
+            raise ToolError(f"{target_label} tidak punya pengaturan izin khusus di {where}")
+        return 0, 0, others
+    new_allow, new_deny = (old_allow | allow) & ~deny, (old_deny | deny) & ~allow
+    srv.check_bits(new_allow & ~old_allow, "allow")
+    return new_allow, new_deny, others + [{"id": target_id, "type": kind_id, "allow": str(new_allow),
+                                           "deny": str(new_deny)}]
+
+
+def _perm_effect(srv, ch, target_id, target_label, kind_id, target_member, new_ows) -> tuple:
+    """(effect, gained, lost, after): izin efektif target sebelum vs sesudah, sebagai teks pratinjau."""
+    role_ids = ([] if target_id == srv.g else [target_id]) if kind_id == 0 else (target_member or {}).get("roles") or []
+    uid = target_id if kind_id == 1 else None
+    before = srv.channel_perms(ch, role_ids, uid)
+    after = srv.channel_perms(ch, role_ids, uid, overwrites=new_ows)
+    gained, lost = after & ~before, before & ~after
+    scope = " (SEMUA orang di server)" if target_id == srv.g else ""
+    effects = []
+    if gained & VIEW:
+        effects.append(f"{target_label}{scope} akan BISA melihat channel ini")
+    if lost & VIEW:
+        effects.append(f"{target_label}{scope} TIDAK lagi bisa melihat channel ini")
+    if gained & ~VIEW:
+        effects.append(f"izin baru: {_perm_list(gained & ~VIEW)}")
+    if lost & ~VIEW:
+        effects.append(f"izin yang hilang: {_perm_list(lost & ~VIEW)}")
+    effect = "Efek: " + ("; ".join(effects) if effects else f"izin efektif {target_label} tidak berubah") + "."
+    return effect, gained, lost, after
+
+
+def _perm_preview(srv, kind, remove, target_id, target_label, where, effect, after, old, new) -> str:
+    note = ""
+    if kind == "channel admin tim" and after & VIEW and target_id not in srv.admins:
+        note = (" Catatan: ini #hermes-admin — yang bukan admin tim tetap tidak dilayani Hermes, tapi bisa "
+                "membaca isinya.")
+    old_allow, old_deny = old
+    if remove:
+        return (f"HAPUS pengaturan izin khusus {target_label} di {where} — yang dihapus: izinkan "
+                f"[{_perm_list(old_allow)}], tolak [{_perm_list(old_deny)}]; setelah itu ia mengikuti izin "
+                f"role/server. {effect}{note}")
+    new_allow, new_deny = new
+    return (f"Izin {target_label} di {where}: izinkan [{_perm_list(new_allow)}], "
+            f"tolak [{_perm_list(new_deny)}] (sebelumnya: izinkan [{_perm_list(old_allow)}], tolak "
+            f"[{_perm_list(old_deny)}]). {effect}{note}")
+
+
 @tool(
     "discord_set_channel_permissions",
     description="Atur izin khusus satu role/user di satu channel: allow & deny berisi nama izin (view_channel, "
@@ -376,15 +443,7 @@ def discord_set_channel_permissions(ctl, args: dict) -> PlanFn:
         if ch.get("type") in THREAD_TYPES:
             raise ToolError("thread mengikuti izin channel induknya; atur di channel induk")
         kind_id, target_id, target_label, target_member = srv.target(args.get("target"))
-        remove = bool(args.get("remove"))
-        allow = ht.permission_bits(args.get("allow") or [])
-        deny = ht.permission_bits(args.get("deny") or [])
-        if remove and (allow or deny):
-            raise ToolError("remove=true tidak bisa digabung dengan allow/deny")
-        if allow & deny:
-            raise ToolError("izin yang sama ada di allow dan deny: " + _perm_list(allow & deny))
-        if not remove and not (allow or deny):
-            raise ToolError("isi allow dan/atau deny, atau remove=true")
+        remove, allow, deny = _perm_request(args)
         srv.check_bits(allow, "allow")
         kind = srv.channel_kind(ch)
         where = srv.channel_label(ch)
@@ -394,49 +453,13 @@ def discord_set_channel_permissions(ctl, args: dict) -> PlanFn:
         # Digabung dari snapshot terbaru (rencana disusun ulang setelah disetujui).
         ows = srv.overwrites(ch)
         current = next((o for o in ows if str(o.get("id")) == target_id), None)
-        old_allow, old_deny = int((current or {}).get("allow") or 0), int((current or {}).get("deny") or 0)
+        old = (int((current or {}).get("allow") or 0), int((current or {}).get("deny") or 0))
         others = [o for o in ows if str(o.get("id")) != target_id]
-        if remove:
-            if kind:
-                raise ToolError(f"{where} adalah {kind}: pengaturan izin khususnya tidak bisa dihapus lewat Hermes "
-                                "(bisa membuka channel tim ke orang lain); ubah manual di Discord")
-            if current is None:
-                raise ToolError(f"{target_label} tidak punya pengaturan izin khusus di {where}")
-            new_allow = new_deny = 0
-            new_ows = others
-        else:
-            new_allow, new_deny = (old_allow | allow) & ~deny, (old_deny | deny) & ~allow
-            srv.check_bits(new_allow & ~old_allow, "allow")
-            new_ows = others + [{"id": target_id, "type": kind_id, "allow": str(new_allow), "deny": str(new_deny)}]
-        # Efek nyata untuk target: izin efektif sebelum vs sesudah.
-        role_ids = ([] if target_id == srv.g else [target_id]) if kind_id == 0 else (target_member or {}).get("roles") or []
-        uid = target_id if kind_id == 1 else None
-        before = srv.channel_perms(ch, role_ids, uid)
-        after = srv.channel_perms(ch, role_ids, uid, overwrites=new_ows)
-        gained, lost = after & ~before, before & ~after
-        scope = " (SEMUA orang di server)" if target_id == srv.g else ""
-        effects = []
-        if gained & VIEW:
-            effects.append(f"{target_label}{scope} akan BISA melihat channel ini")
-        if lost & VIEW:
-            effects.append(f"{target_label}{scope} TIDAK lagi bisa melihat channel ini")
-        if gained & ~VIEW:
-            effects.append(f"izin baru: {_perm_list(gained & ~VIEW)}")
-        if lost & ~VIEW:
-            effects.append(f"izin yang hilang: {_perm_list(lost & ~VIEW)}")
-        effect = "Efek: " + ("; ".join(effects) if effects else f"izin efektif {target_label} tidak berubah") + "."
-        note = ""
-        if kind == "channel admin tim" and after & VIEW and target_id not in srv.admins:
-            note = (" Catatan: ini #hermes-admin — yang bukan admin tim tetap tidak dilayani Hermes, tapi bisa "
-                    "membaca isinya.")
-        if remove:
-            preview = (f"HAPUS pengaturan izin khusus {target_label} di {where} — yang dihapus: izinkan "
-                       f"[{_perm_list(old_allow)}], tolak [{_perm_list(old_deny)}]; setelah itu ia mengikuti izin "
-                       f"role/server. {effect}{note}")
-        else:
-            preview = (f"Izin {target_label} di {where}: izinkan [{_perm_list(new_allow)}], "
-                       f"tolak [{_perm_list(new_deny)}] (sebelumnya: izinkan [{_perm_list(old_allow)}], tolak "
-                       f"[{_perm_list(old_deny)}]). {effect}{note}")
+        new_allow, new_deny, new_ows = _perm_new_overwrites(srv, kind, where, target_label, target_id, kind_id,
+                                                            current, others, remove, allow, deny)
+        effect, gained, lost, after = _perm_effect(srv, ch, target_id, target_label, kind_id, target_member, new_ows)
+        preview = _perm_preview(srv, kind, remove, target_id, target_label, where, effect, after, old,
+                                (new_allow, new_deny))
 
         def run() -> str:
             if remove:
@@ -448,7 +471,7 @@ def discord_set_channel_permissions(ctl, args: dict) -> PlanFn:
 
         # Audit mencatat nilai LAMA dan BARU yang benar-benar berlaku (remove → baru kosong).
         return Plan(team, preview, run, channel=str(ch["id"]), target=target_id, remove=remove,
-                    old_allow=ht.permission_names(old_allow), old_deny=ht.permission_names(old_deny),
+                    old_allow=ht.permission_names(old[0]), old_deny=ht.permission_names(old[1]),
                     allow=ht.permission_names(new_allow), deny=ht.permission_names(new_deny),
                     gained=ht.permission_names(gained), lost=ht.permission_names(lost))
 

@@ -482,3 +482,44 @@ def test_garbage_version_value_is_treated_as_version_one(env):
     _root, ledger = env
     _ledger_with_version(ledger, "bukan-angka")
     ul.open_ledger(ledger, readonly=True).close()
+
+
+# ----------------------------------------------------------------------------- helper hasil pemecahan collect/main
+def test_row_delta_plain_difference_and_counter_reset():
+    base = {m: 0 for m in ul.METRICS}
+    row = dict(base, requests=5, input_tokens=100, cost_usd=1.5)
+    snap = dict(base, requests=2, input_tokens=40, cost_usd=0.5)
+    d = ul.row_delta(row, snap)
+    assert (d["requests"], d["input_tokens"], d["cost_usd"]) == (3, 60, 1.0)
+    assert ul.row_delta(row, None)["requests"] == 5
+    reset = ul.row_delta(dict(base, requests=1), dict(base, requests=9))   # penghitung turun → dari nol
+    assert reset["requests"] == 1
+
+
+def test_row_delta_never_negative_cost():
+    base = {m: 0 for m in ul.METRICS}
+    assert ul.row_delta(dict(base, requests=2, cost_usd=1.0), dict(base, requests=1, cost_usd=3.0))["cost_usd"] == 0.0
+
+
+def test_collect_line_formats_summary_and_skipped():
+    s = {"day": "2026-01-02", "profiles": 2, "rows": 3, "requests": 4, "tokens": 5, "skipped": []}
+    assert ul.collect_line(s) == "2026-01-02: 2 profile, 3 baris baru, 4 request, 5 token"
+    s["skipped"] = [{"profile": "a", "reason": "x"}, {"profile": "b", "reason": "y"}]
+    assert ul.collect_line(s).endswith("; dilewati: a, b")
+
+
+def test_prune_drops_old_rows_and_records_last_collect(tmp_path):
+    con = ul.open_ledger(tmp_path / "u.db")
+    try:
+        now = ts(2026, 6, 1)
+        old = (datetime.fromtimestamp(now, timezone.utc).date().toordinal() - ul.RETENTION_DAYS - 5)
+        old_day = date.fromordinal(old).isoformat()
+        cols = ", ".join(ul.METRICS)
+        con.execute(f"INSERT INTO daily (day, user_key, profile, model, source, {cols}) VALUES (?,?,?,?,?,{','.join('0' * len(ul.METRICS))})",
+                    (old_day, "u", "p", "m", ""))
+        con.commit()
+        ul._prune(con, now, timezone.utc)
+        assert con.execute("SELECT COUNT(*) FROM daily").fetchone()[0] == 0
+        assert con.execute("SELECT 1 FROM meta WHERE key='last_collect'").fetchone()
+    finally:
+        con.close()

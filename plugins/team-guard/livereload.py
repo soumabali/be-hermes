@@ -36,7 +36,7 @@ def expected_routes(roster: Any) -> list[tuple[str, str, Optional[str]]]:
         kind, profile = entry.get("kind"), str(entry.get("profile") or "")
         if not profile:
             continue
-        user = entry.get("owner") if kind == "personal" else (admin if kind == "admin" else someone)
+        user = entry.get("owner") if kind == "personal" else (admin if roster.channel_is_admin(entry) else someone)
         out.append((cid, profile, str(user) if user else None))
     return out
 

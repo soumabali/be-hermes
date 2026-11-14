@@ -283,6 +283,63 @@ def user_key_for(row: dict, profile: str, owners: dict[str, str]) -> str:
     return owners.get(profile) or f"profile:{profile}"
 
 
+def row_delta(row: dict, snap) -> dict:
+    """Selisih satu baris state.db terhadap potretnya. Penghitung yang turun (di-reset) dihitung dari nol."""
+    delta = {m: (row[m] or 0) - ((snap[m] if snap else 0) or 0) for m in METRICS}
+    if any(delta[m] < 0 for m in METRICS if m != "cost_usd"):
+        delta = {m: row[m] or 0 for m in METRICS}      # penghitung di-reset → hitung dari nol
+    delta["cost_usd"] = max(0.0, float(delta["cost_usd"]))
+    return delta
+
+
+def _write_delta(con: sqlite3.Connection, profile: str, row: dict, delta: dict, day: str, key: str,
+                 now: float) -> None:
+    """Tambahkan selisih ke `daily`/`session_days` dan simpan potret baris itu."""
+    con.execute(
+        "INSERT INTO daily (day, user_key, profile, model, source, " + ", ".join(METRICS) + ") "
+        "VALUES (?,?,?,?,?," + ",".join("?" * len(METRICS)) + ") "
+        "ON CONFLICT(day, user_key, profile, model, source) DO UPDATE SET "
+        + ", ".join(f"{m} = {m} + excluded.{m}" for m in METRICS),
+        (day, key, profile, row["model"], str(row.get("source") or ""), *[delta[m] for m in METRICS]))
+    con.execute("INSERT OR IGNORE INTO session_days VALUES (?,?,?,?)", (day, key, profile, row["session_id"]))
+    con.execute(
+        "INSERT INTO snapshot (profile, row_key, " + ", ".join(METRICS) + ", seen) "
+        "VALUES (?,?," + ",".join("?" * len(METRICS)) + ",?) "
+        "ON CONFLICT(profile, row_key) DO UPDATE SET "
+        + ", ".join(f"{m} = excluded.{m}" for m in METRICS) + ", seen = excluded.seen",
+        (profile, row["row_key"], *[row[m] or 0 for m in METRICS], row["seen"] or now))
+
+
+def _collect_profile(con: sqlite3.Connection, profile: str, rows: list[dict], owners: dict[str, str],
+                     today: str, now: float, tz, summary: dict) -> None:
+    """Satu transaksi untuk satu profile; memperbarui `summary`."""
+    seeded = con.execute("SELECT 1 FROM meta WHERE key=?", (f"seeded:{profile}",)).fetchone()
+    snaps = {r["row_key"]: r for r in con.execute("SELECT * FROM snapshot WHERE profile=?", (profile,))}
+    with con:
+        for row in rows:
+            delta = row_delta(row, snaps.get(row["row_key"]))
+            if not any(delta[m] > 0 for m in METRICS):
+                continue
+            # Potret PERTAMA sebuah profile: riwayat lama ditaruh di hari sesi itu terakhir aktif.
+            day = day_of(row["seen"], tz) if (not seeded and row["seen"]) else today
+            _write_delta(con, profile, row, delta, day, user_key_for(row, profile, owners), now)
+            summary["rows"] += 1
+            summary["requests"] += int(delta["requests"])
+            summary["tokens"] += int(delta["input_tokens"] + delta["output_tokens"])
+        con.execute("INSERT OR REPLACE INTO meta VALUES (?, ?)", (f"seeded:{profile}", str(now)))
+
+
+def _prune(con: sqlite3.Connection, now: float, tz) -> None:
+    """Buang data lewat masa simpan dan catat waktu potret terakhir."""
+    with con:
+        cutoff = (datetime.fromtimestamp(now, tz).date() - timedelta(days=RETENTION_DAYS)).isoformat()
+        con.execute("DELETE FROM daily WHERE day < ?", (cutoff,))
+        con.execute("DELETE FROM session_days WHERE day < ?", (cutoff,))
+        # Potret sesi yang sudah lama tak berubah tidak perlu disimpan selamanya.
+        con.execute("DELETE FROM snapshot WHERE seen < ?", (now - RETENTION_DAYS * 86400,))
+        con.execute("INSERT OR REPLACE INTO meta VALUES ('last_collect', ?)", (str(now),))
+
+
 def collect(ledger: Path, hermes_root: Path, *, owners: Optional[dict[str, str]] = None,
             now: Optional[float] = None, tz=None) -> dict:
     """Potret selisih sejak potret terakhir ke tabel `daily`. Aman dijalankan kapan saja dan
@@ -302,46 +359,8 @@ def collect(ledger: Path, hermes_root: Path, *, owners: Optional[dict[str, str]]
                     summary["skipped"].append({"profile": profile, "reason": str(exc)})
                     continue
                 summary["profiles"] += 1
-                seeded = con.execute("SELECT 1 FROM meta WHERE key=?", (f"seeded:{profile}",)).fetchone()
-                snaps = {r["row_key"]: r for r in
-                         con.execute("SELECT * FROM snapshot WHERE profile=?", (profile,))}
-                with con:   # satu transaksi per profile
-                    for row in rows:
-                        snap = snaps.get(row["row_key"])
-                        delta = {m: (row[m] or 0) - ((snap[m] if snap else 0) or 0) for m in METRICS}
-                        if any(delta[m] < 0 for m in METRICS if m != "cost_usd"):
-                            delta = {m: row[m] or 0 for m in METRICS}      # penghitung di-reset → hitung dari nol
-                        delta["cost_usd"] = max(0.0, float(delta["cost_usd"]))
-                        if not any(delta[m] > 0 for m in METRICS):
-                            continue
-                        # Potret PERTAMA sebuah profile: riwayat lama ditaruh di hari sesi itu terakhir aktif.
-                        day = day_of(row["seen"], tz) if (not seeded and row["seen"]) else today
-                        key = user_key_for(row, profile, owners)
-                        con.execute(
-                            "INSERT INTO daily (day, user_key, profile, model, source, " + ", ".join(METRICS) + ") "
-                            "VALUES (?,?,?,?,?," + ",".join("?" * len(METRICS)) + ") "
-                            "ON CONFLICT(day, user_key, profile, model, source) DO UPDATE SET "
-                            + ", ".join(f"{m} = {m} + excluded.{m}" for m in METRICS),
-                            (day, key, profile, row["model"], str(row.get("source") or ""), *[delta[m] for m in METRICS]))
-                        con.execute("INSERT OR IGNORE INTO session_days VALUES (?,?,?,?)",
-                                    (day, key, profile, row["session_id"]))
-                        con.execute(
-                            "INSERT INTO snapshot (profile, row_key, " + ", ".join(METRICS) + ", seen) "
-                            "VALUES (?,?," + ",".join("?" * len(METRICS)) + ",?) "
-                            "ON CONFLICT(profile, row_key) DO UPDATE SET "
-                            + ", ".join(f"{m} = excluded.{m}" for m in METRICS) + ", seen = excluded.seen",
-                            (profile, row["row_key"], *[row[m] or 0 for m in METRICS], row["seen"] or now))
-                        summary["rows"] += 1
-                        summary["requests"] += int(delta["requests"])
-                        summary["tokens"] += int(delta["input_tokens"] + delta["output_tokens"])
-                    con.execute("INSERT OR REPLACE INTO meta VALUES (?, ?)", (f"seeded:{profile}", str(now)))
-            with con:
-                cutoff = (datetime.fromtimestamp(now, tz).date() - timedelta(days=RETENTION_DAYS)).isoformat()
-                con.execute("DELETE FROM daily WHERE day < ?", (cutoff,))
-                con.execute("DELETE FROM session_days WHERE day < ?", (cutoff,))
-                # Potret sesi yang sudah lama tak berubah tidak perlu disimpan selamanya.
-                con.execute("DELETE FROM snapshot WHERE seen < ?", (now - RETENTION_DAYS * 86400,))
-                con.execute("INSERT OR REPLACE INTO meta VALUES ('last_collect', ?)", (str(now),))
+                _collect_profile(con, profile, rows, owners, today, now, tz, summary)
+            _prune(con, now, tz)
         finally:
             con.close()
     return summary
@@ -501,7 +520,7 @@ def report(ledger: Path, period: str = "day", *, offset: int = 0, last: int = 0,
 
 
 # ----------------------------------------------------------------------------- CLI
-def main(argv: Optional[list[str]] = None) -> int:
+def _build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description="Buku besar pemakaian LLM tim (token & request per orang).")
     ap.add_argument("--ledger", help="berkas buku besar (default: $HERMES_TEAM_DIR/state/usage.db, "
                                      "kalau tidak ~/.hermes-team/state/usage.db)")
@@ -518,23 +537,35 @@ def main(argv: Optional[list[str]] = None) -> int:
     rp.add_argument("--user", help="saring satu orang (nama anggota, nama tampilan, atau ID user)")
     rp.add_argument("--format", choices=("text", "markdown", "json"), default="text")
     rp.add_argument("--no-collect", action="store_true", help="jangan memotret dulu (pakai data terakhir)")
-    args = ap.parse_args(argv)
+    return ap
+
+
+def collect_line(s: dict) -> str:
+    """Satu baris ringkasan hasil `collect`."""
+    skipped = f"; dilewati: {', '.join(x['profile'] for x in s['skipped'])}" if s["skipped"] else ""
+    return f"{s['day']}: {s['profiles']} profile, {s['rows']} baris baru, {s['requests']} request, {s['tokens']} token{skipped}"
+
+
+def _dispatch(args, ledger: Path, tz, owners: dict, people: dict) -> int:
+    if args.cmd == "collect":
+        print(collect_line(collect(ledger, Path(args.hermes_root), owners=owners, tz=tz)))
+        return 0
+    if not args.no_collect:
+        with contextlib.suppress(OSError, sqlite3.Error):
+            collect(ledger, Path(args.hermes_root), owners=owners, tz=tz)
+    print(report(ledger, args.period, offset=args.offset, last=args.last, user=args.user, fmt=args.format,
+                 people=people, tz=tz))
+    return 0
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    args = _build_parser().parse_args(argv)
     ledger = Path(args.ledger).expanduser() if args.ledger else default_ledger_path()
     members = Path(args.members_file).expanduser() if args.members_file else kit_paths.members_file()
     try:
         tz = resolve_tz(args.tz)
         owners, people = load_members(members)
-        if args.cmd == "collect":
-            s = collect(ledger, Path(args.hermes_root), owners=owners, tz=tz)
-            print(f"{s['day']}: {s['profiles']} profile, {s['rows']} baris baru, {s['requests']} request, "
-                  f"{s['tokens']} token" + (f"; dilewati: {', '.join(x['profile'] for x in s['skipped'])}" if s["skipped"] else ""))
-            return 0
-        if not args.no_collect:
-            with contextlib.suppress(OSError, sqlite3.Error):
-                collect(ledger, Path(args.hermes_root), owners=owners, tz=tz)
-        print(report(ledger, args.period, offset=args.offset, last=args.last, user=args.user, fmt=args.format,
-                     people=people, tz=tz))
-        return 0
+        return _dispatch(args, ledger, tz, owners, people)
     except LedgerError as exc:
         print(f"usage_ledger: {exc}", file=sys.stderr)
         return 2
