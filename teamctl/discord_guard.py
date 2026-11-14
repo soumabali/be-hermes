@@ -2,8 +2,11 @@
 konstanta tipe channel/izin, dan pembungkus data ber-nonce untuk hasil baca dari Discord."""
 from __future__ import annotations
 
+import json
 import re
 import secrets
+import sys
+from pathlib import Path
 from typing import Any, Callable, Optional
 
 import hermes_team as ht
@@ -26,6 +29,67 @@ _TOKEN_RE = re.compile(
 VIEW = ht.PERM["VIEW_CHANNEL"]
 ADMINISTRATOR = ht.PERM["ADMINISTRATOR"]
 ALL_PERMS = sum(ht.PERM.values())
+
+# Izin yang TIDAK boleh DIBERIKAN lewat Hermes (role baru/diubah, overwrite channel), selain ELEVATED_MASK milik kit
+# (kit_discord.ELEVATED_PERMISSIONS, tidak diubah di sini). Sengaja terpisah dari ELEVATED_MASK: izin di bawah ini
+# ada di @everyone/role biasa pada server baru, jadi memakainya untuk "pemegang izin tinggi tidak boleh di-kick" atau
+# "role berizin tinggi tidak boleh diubah" akan melindungi hampir semua orang. Yang dicek hanya bit yang BARU ditambah.
+# Opt-out tetap server_admin.allow_elevated_permissions.
+EXTRA_GRANT_BLOCKED = {
+    # undangan: orang luar bisa masuk ke server tim lewat tautan (jalur masuk tak terkontrol)
+    "create_instant_invite",
+    # event terjadwal tampil ke seluruh server dan memuat tautan eksternal (jalur phishing/pengumuman palsu)
+    "create_events",
+    # aplikasi eksternal: bot/aplikasi luar yang tidak terpasang bisa memposting ke channel atas nama pemakai
+    "use_external_apps",
+}
+# Sengaja TIDAK diblokir (ditimbang): priority_speaker, stream, send_tts_messages, change_nickname, create_expressions,
+# use_soundboard/use_external_sounds, send_voice_messages, set_voice_channel_status, bypass_slowmode (hanya
+# melonggarkan slowmode), pin_messages, create_*_threads, send_polls, use_embedded_activities,
+# use_external_emojis/stickers, request_to_speak. mention_everyone sudah diblokir kit.
+GRANT_BLOCKED_MASK = ht.ELEVATED_MASK | sum(1 << ht.PERMISSIONS[p] for p in EXTRA_GRANT_BLOCKED)
+
+TOMBSTONE_FILE = "removed_channels.json"
+_tombstone_warned = False
+
+
+def load_tombstones(team: dict) -> dict:
+    """Channel anggota yang sudah dikeluarkan permanen (ditulis kit/membership.py::remove_member):
+    {channel_id: {"name", "member", "removed_at"}}. File hilang/rusak = kosong (rusak dilaporkan sekali ke stderr)."""
+    global _tombstone_warned
+    path = Path(team["paths"]["state_dir"]) / TOMBSTONE_FILE
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        channels = data.get("channels")
+        if not isinstance(channels, dict):
+            raise ValueError("kunci 'channels' bukan objek")
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError, AttributeError) as exc:
+        if not _tombstone_warned:
+            _tombstone_warned = True
+            print(f"teamctl: {path} tidak terbaca ({type(exc).__name__}: {exc}); dianggap kosong — pagar channel "
+                  "pribadi tetap memakai members.yaml dan aturan kategori+awalan.", file=sys.stderr, flush=True)
+        return {}
+    return {str(cid): (info if isinstance(info, dict) else {}) for cid, info in channels.items()}
+
+
+class GuardedAPI(ht.DiscordAPI):
+    """DiscordAPI dengan mode baca-saja: `read_only=True` → semua method selain GET ditolak SEBELUM keluar ke jaringan.
+    Dipakai TeamCtl.api() selama tool baca berjalan (lapisan pertahanan tambahan di samping lint registry)."""
+
+    def __init__(self, *args: Any, read_only: bool = False, **kwargs: Any):
+        super().__init__(*args, **kwargs)
+        self._read_only = bool(read_only)
+
+    @property
+    def read_only(self) -> bool:
+        return self._read_only
+
+    def request(self, method: str, path: str, *args: Any, **kwargs: Any) -> Any:
+        if self._read_only and str(method).upper() != "GET":
+            raise ToolError(f"tool baca tidak boleh mengubah Discord ({str(method).upper()} {path} ditolak)")
+        return super().request(method, path, *args, **kwargs)
 
 
 def _pos(ch: dict) -> tuple:
@@ -61,8 +125,12 @@ class Server:
         self.g = team["guild_id"]
         self.conf = team["server_admin"]
         self.personal = {m["channel_id"]: m for m in team["members"]}       # aktif & nonaktif
+        self.removed = load_tombstones(team)                                # anggota yang sudah dikeluarkan permanen
         self.team_channels = {team["shared"]["channel_id"]: "channel bersama tim",
                               team["admin"]["channel_id"]: "channel admin tim"}
+        report = str(((team.get("usage") or {}).get("report_channel_id")) or "")
+        if report:
+            self.team_channels.setdefault(report, "channel laporan pemakaian tim")
         self.team_roles = {rid: label for rid, label in ((team["member_role"], "role anggota tim (@backend)"),
                                                          (team["admin_role"], "role admin tim"),
                                                          (team["entry_role"], "role entry")) if rid}
@@ -209,29 +277,76 @@ class Server:
             return 1, str(mem["user"]["id"]), "user " + self.member_label(mem), mem
 
     # ---- pagar
+    def _parent(self, ch: dict) -> Optional[dict]:
+        pid = str(ch.get("parent_id") or "")
+        if not pid:
+            return None
+        hit = next((c for c in self.channels() if str(c["id"]) == pid), None)
+        return hit if hit is not None else self._cached("channel:" + pid, lambda: self.api.get_channel(pid))
+
+    def _private_texts(self, ch: dict) -> Optional[tuple]:
+        """(teks jenis untuk channelnya, teks jenis untuk thread di dalamnya) bila `ch` (bukan thread) PRIBADI:
+        channel anggota (aktif/nonaktif), channel anggota yang sudah dikeluarkan (tombstone), atau channel apa pun
+        di kategori tim berawalan channel_prefix yang bukan channel tim (bersama/admin/laporan)."""
+        cid = str(ch.get("id"))
+        if cid in self.personal:
+            who = _name(self.personal[cid]["name"])
+            return f"channel pribadi anggota {who}", f"thread di channel pribadi {who}"
+        if cid in self.removed:
+            info = self.removed[cid]
+            who = _name(info.get("member") or info.get("name") or cid)
+            return (f"channel pribadi anggota {who} (sudah dikeluarkan dari tim; riwayatnya tetap pribadi)",
+                    f"thread di channel pribadi {who} (anggota sudah dikeluarkan dari tim)")
+        cat, prefix = str(self.team["category_id"] or ""), str(self.team["channel_prefix"] or "")
+        if (cat and cid not in self.team_channels and ch.get("type") not in THREAD_TYPES and ch.get("type") != 4
+                and str(ch.get("parent_id") or "") == cat and str(ch.get("name") or "").lower().startswith(prefix.lower())):
+            tag = f"awalan {_q(prefix, 30)} di kategori tim, tidak terdaftar di members.yaml"
+            return f"channel pribadi tak terdaftar ({tag})", f"thread di channel pribadi tak terdaftar ({tag})"
+        return None
+
+    def _private_kind(self, ch: dict) -> Optional[str]:
+        """Teks jenis bila `ch` (channel atau thread) adalah channel pribadi / thread di channel pribadi."""
+        if ch.get("type") not in THREAD_TYPES:
+            texts = self._private_texts(ch)
+            return texts[0] if texts else None
+        parent_id = str(ch.get("parent_id") or "")
+        stub = {"id": parent_id}
+        texts = self._private_texts(stub) if (parent_id in self.personal or parent_id in self.removed) else None
+        if texts is None and parent_id and parent_id not in self.team_channels:
+            parent = self._parent(ch)
+            texts = self._private_texts(parent) if parent is not None else None
+        return texts[1] if texts else None
+
     def channel_kind(self, ch: dict) -> Optional[str]:
         cid, parent = str(ch.get("id")), str(ch.get("parent_id") or "")
-        if cid in self.personal:
-            return f"channel pribadi anggota {self.personal[cid]['name']}"
+        private = self._private_kind(ch)
+        if private:
+            return private
         if cid in self.team_channels:
             return self.team_channels[cid]
         if self.team["category_id"] and cid == self.team["category_id"]:
             return "kategori tim Hermes"
-        if ch.get("type") in THREAD_TYPES and parent in self.personal:
-            return f"thread di channel pribadi {self.personal[parent]['name']}"
+        if ch.get("type") in THREAD_TYPES and parent in self.team_channels:   # thread mewarisi jenis induknya
+            return f"thread di {self.team_channels[parent]}"
         return None
 
     def is_personal(self, ch: dict) -> bool:
-        cid, parent = str(ch.get("id")), str(ch.get("parent_id") or "")
-        return cid in self.personal or (ch.get("type") in THREAD_TYPES and parent in self.personal)
+        return self._private_kind(ch) is not None
+
+    def is_team_thread(self, ch: dict) -> bool:
+        return ch.get("type") in THREAD_TYPES and str(ch.get("parent_id") or "") in self.team_channels
 
     def refuse_personal(self, ch: dict, verb: str) -> None:
-        if self.is_personal(ch):
-            raise ToolError(f"{self.channel_kind(ch)} tidak boleh {verb} lewat Hermes")
+        kind = self._private_kind(ch)
+        if kind:
+            raise ToolError(f"{kind} tidak boleh {verb} lewat Hermes")
 
-    def check_bits(self, bits: int, what: str) -> None:
-        if bits & ht.ELEVATED_MASK and not self.conf["allow_elevated_permissions"]:
-            raise ToolError(f"{what} memuat izin tinggi ({_perm_list(bits & ht.ELEVATED_MASK)}) — "
+    def check_bits(self, bits: int, what: str, existing: int = 0) -> None:
+        """Tolak pemberian izin tinggi. `existing` = bit yang sudah dimiliki sebelumnya (hanya yang BARU dicek untuk
+        izin tambahan di GRANT_BLOCKED_MASK; izin tinggi kit sudah ditolak lebih awal oleh pemanggil bila sudah ada)."""
+        blocked = (bits & ht.ELEVATED_MASK) | (bits & GRANT_BLOCKED_MASK & ~existing)
+        if blocked and not self.conf["allow_elevated_permissions"]:
+            raise ToolError(f"{what} memuat izin tinggi ({_perm_list(blocked)}) — "
                             "berikan manual lewat Discord (atau set server_admin.allow_elevated_permissions: true)")
 
     def role_elevated(self, role: dict) -> bool:

@@ -713,7 +713,7 @@ def _set_model(team: dict, hermes: Hermes, target: str, alias: str) -> dict:
         touched: list[tuple[str, str, Optional[dict]]] = []
         if target in MODEL_TARGETS:
             fresh["model_overrides"][target] = alias
-            profile = "default" if target == "lobby" else fresh[target]["profile"]
+            profile = fresh[target]["profile"] if PROFILE_KINDS[target].needs_channel else "default"   # lobby = host
             touched.append((target, profile, None))
         elif target in ("all", "semua", "all-members"):
             for m in fresh["members"]:
@@ -734,7 +734,7 @@ def _set_model(team: dict, hermes: Hermes, target: str, alias: str) -> dict:
             continue
         # Ambang kompresi mengikuti model (llm.models.<alias>), jadi ikut ditulis ulang saat model berganti.
         settings = model_settings(team, alias) + compression_settings(team, alias)
-        hermes.config_set("default" if role == "lobby" else profile, settings)
+        hermes.config_set(profile, settings)
     write_roster(team, hermes)
     return {"target": target, "model": alias, "profiles": [p for _, p, _ in touched], "failures": list(hermes.failures)}
 

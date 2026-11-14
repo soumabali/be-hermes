@@ -58,6 +58,7 @@ class ProtocolMixin:
         self.writers: list[threading.Thread] = []
         self.closing = threading.Event()
         self.local = threading.local()
+        self._unreadable_logged = False
         self.ids = itertools.count(1)
         self.client_caps: dict = {}
         self.protocol = "2025-06-18"
@@ -237,11 +238,20 @@ class ProtocolMixin:
         """Jalankan handler `spec`. Tool pengubah: handler hanya MENYUSUN rencana; kerangka inilah yang
         menjalankannya lewat `_guarded` (konfirmasi admin, susun ulang, audit), jadi handler tidak bisa
         melewatinya."""
-        out = spec.handler(self, args)
         if not spec.mutating:
+            # Pertahanan tambahan di samping lint registry: selama handler baca berjalan (di thread ini), klien
+            # Discord dari self.api() menolak method selain GET. Tidak mencakup thread baru / klien yang dibuat
+            # sendiri (mis. ht.DiscordAPI(...)) — lihat docstring registry.py.
+            depth = getattr(self.local, "readonly_depth", 0)
+            self.local.readonly_depth = depth + 1
+            try:
+                out = spec.handler(self, args)
+            finally:
+                self.local.readonly_depth = depth
             if not isinstance(out, str):
                 raise TypeError(f"tool baca {spec.name} harus mengembalikan str, bukan {type(out).__name__}")
             return out
+        out = spec.handler(self, args)
         planner = out if isinstance(out, Planner) else Planner(out)
         if not callable(planner.plan):
             raise TypeError(f"tool pengubah {spec.name} harus mengembalikan fungsi plan() atau Planner")
@@ -272,8 +282,14 @@ class ProtocolMixin:
         """Tool yang ditampilkan: grup yang dimatikan konfigurasi (group_enabled) tidak ikut."""
         try:
             team = self.team()
-        except Exception:
+        except Exception as exc:
             team = None
+            if not self._unreadable_logged:   # sekali per gangguan, bukan tiap tools/list
+                self._unreadable_logged = True
+                print(f"teamctl: konfigurasi tim tidak terbaca ({type(exc).__name__}: {exc}); grup tool bergerbang "
+                      "(discord) DISEMBUNYIKAN sampai konfigurasi terbaca lagi.", file=sys.stderr, flush=True)
+        else:
+            self._unreadable_logged = False
         return self.registry.visible(team)
 
     def supports_elicitation(self) -> bool:

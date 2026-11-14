@@ -88,7 +88,7 @@ import hermes_team as ht  # noqa: E402
 from teamctl import tools_discord, tools_team, tools_usage  # noqa: E402,F401  (mendaftarkan semua @tool)
 from teamctl.confirm import (GuardMixin, Plan, PlanFn, Planner, _clean, _clean_message, _INVISIBLE, _name,  # noqa: E402,F401
                              _q)
-from teamctl.discord_guard import (ADMINISTRATOR, ALL_PERMS, CHANNEL_TYPES, THREAD_TYPES, TYPE_NAMES, VIEW,  # noqa: E402,F401
+from teamctl.discord_guard import (ADMINISTRATOR, ALL_PERMS, CHANNEL_TYPES, GRANT_BLOCKED_MASK, GuardedAPI, THREAD_TYPES, TYPE_NAMES, VIEW,  # noqa: E402,F401
                                    VOICE_ALLOW, Server, _data_block, _parse_color, _perm_list, _pos, _TOKEN_RE)
 from teamctl.errors import ToolError  # noqa: E402,F401
 from teamctl.protocol import (ELICITATION_SINCE, HANDSHAKE_VERSIONS, INSTRUCTIONS, MAX_PENDING_ACTIONS,  # noqa: E402,F401
@@ -124,7 +124,9 @@ class TeamCtl(UsageMixin, GuardMixin, ProtocolMixin):
         return ht.Hermes(self.hermes_bin, self.hermes_root, quiet=True)
 
     def api(self) -> ht.DiscordAPI:
-        return ht.DiscordAPI(ht.discord_token(self.hermes_root))
+        """Klien Discord. Selama tool BACA berjalan (run_tool, thread ini) klien ini baca-saja: non-GET ditolak."""
+        read_only = getattr(self.local, "readonly_depth", 0) > 0
+        return GuardedAPI(ht.discord_token(self.hermes_root), read_only=read_only)
 
     def server(self, team: dict) -> "Server":
         if not team["server_admin"]["enabled"]:

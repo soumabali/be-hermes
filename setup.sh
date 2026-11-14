@@ -21,5 +21,10 @@ if ! command -v python3 >/dev/null 2>&1 || ! python3 -c 'import yaml' >/dev/null
   apt-get install -y python3 python3-yaml
 fi
 
+# Dijalankan sebagai root dari folder yang bisa saja dimiliki user lain: jangan menulis bytecode ke sana dan jangan
+# biarkan lingkungan memuat kode tambahan ke interpreter ini.
+export PYTHONDONTWRITEBYTECODE=1
+unset PYTHONPATH PYTHONSTARTUP PYTHONHOME PYTHONINSPECT
+
 cd "$HERE"
 exec python3 "$HERE/kit_setup.py" "$@"

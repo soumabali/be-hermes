@@ -50,7 +50,7 @@ if _HERE not in sys.path:
 import yaml
 
 import kit_paths
-from kit.profiles import SYSTEM_KINDS
+from kit.profiles import PROFILE_KINDS, SYSTEM_KINDS
 
 ERROR, WARN, INFO = "error", "warn", "info"
 SYSTEM_PROFILES_KEYS = SYSTEM_KINDS      # jenis profile ber-channel sendiri (kit/profiles.py)
@@ -687,7 +687,7 @@ def _check_one_team_channel(team: dict, rep: Report, ht: Any, api: Any, state: G
     edit = f"Edit Channel #{ch.get('name') or cid} → Permissions"
     everyone_base = _bits((state.roles.get(guild) or {}).get("permissions"))
     if must_be_private and channel_permissions(everyone_base, ch, guild, [], "", ht) & view:
-        who = "role member" if key.startswith("shared") else "role admin"
+        who = f"role {PROFILE_KINDS[key.partition('.')[0]].role}" if key.partition(".")[0] in PROFILE_KINDS else "role admin"
         rep.add(ERROR, "discord", f"channel {key} #{ch.get('name')} bisa dilihat @everyone: siapa pun di server "
                 "dilayani profile itu",
                 f"{edit} → @everyone: matikan View Channel; lalu beri View Channel ke {who} dan ke bot")

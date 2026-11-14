@@ -37,7 +37,9 @@ runner perintah tiruan, prompter tiruan, direktori sementara, dan server Discord
    10 write_config    hermes_team.py check (team.yaml yang dihasilkan diuji dengan load_team asli)
    11 provision       hermes_team.py apply / managed
    12 extras          docker build, systemctl --user
-   13 gateway         hermes gateway install/start/status, hermes logs
+   13 gateway         hermes gateway install/start, systemctl --user is-active/show, hermes gateway status, hermes logs
+                      (tafsir keluaran status diuji dengan string yang disalin dari sumber Hermes hulu; BELUM dicoba pada
+                      systemd/Hermes sungguhan)
    14 verify          kit_doctor.py --discord, tests/selftest.sh
   Tidak diuji sama sekali: runuser + `env -i` di sistem sungguhan, perilaku systemd/linger, apt.
 
@@ -735,7 +737,7 @@ class Context:
         self.kit_dir = Path(kit_dir)
         self.source_dir = Path(source_dir) if source_dir else Path(__file__).resolve().parent
         self.etc_dir, self.linger_dir = Path(etc_dir), Path(linger_dir)
-        self.discord_base, self.no_systemd = str(discord_base).rstrip("/"), bool(no_systemd)
+        self.discord_base, self.no_systemd = str(discord_base or DISCORD_API_BASE).rstrip("/"), bool(no_systemd)
         self.dry_run = dry_run
         self._out = out
         self.secrets: List[str] = []
@@ -1590,10 +1592,11 @@ class DiscordServer(Step):
 
     def plan(self, ctx):
         return ["periksa izin bot di server (dari role-nya)",
-                "cari/buat role entry, backend, hermes-admin (tanpa izin)",
+                "cari/buat role entry, backend, hermes-admin (tanpa izin); role/channel yang sudah ada tapi berizin/publik hanya "
+                "diadopsi setelah persetujuan eksplisit (adopt_existing_roles / adopt_existing_channels)",
                 "periksa role bot berada di atas ketiganya",
                 "cari/buat kategori Hermes, #hermes-shared (backend + bot), #hermes-admin (hermes-admin + bot)",
-                "tanya admin tim (ID atau username) dan beri mereka role hermes-admin"]
+                "tanya admin tim (user ID atau mention; username hanya bila persis dan interaktif) dan beri mereka role hermes-admin"]
 
     def bot_view(self, api, guild_id, bot_id):
         roles = api.guild_roles(guild_id)
@@ -1778,7 +1781,8 @@ def probe_llm(http: Callable[..., Tuple[int, Any]], base: str, key: str, model: 
         if ids and model not in ids:
             lines.append(f"model '{model}' tidak ada di daftar /models (contoh: {', '.join(ids[:5])})")
     else:
-        lines.append(f"GET /models → {status or 'tidak terjangkau'}" + (f" ({body})" if status == 0 else " (diabaikan)"))
+        lines.append(f"GET /models → {status or 'tidak terjangkau'}"
+                     + (f" ({body})" if status == 0 or 300 <= status < 400 else " (diabaikan)"))
     status, body = http("POST", f"{base}/chat/completions", headers,
                         {"model": model, "messages": [{"role": "user", "content": "ping"}], "max_tokens": 5})
     if status == 200:

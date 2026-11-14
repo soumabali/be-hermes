@@ -13,7 +13,8 @@ parameter callback, dan `discord` baru diimpor di dalam fungsi.
 import asyncio
 from typing import Any, Callable, Optional
 
-from .secrets import SecretStore, check_env_name, check_env_value, stale_names, sync_passthrough
+from .secrets import (EnvWriteError, SecretStore, check_env_name, check_env_value, normalize_env_name, stale_names,
+                      sync_passthrough)
 from .shared import log, log_once
 from .upstream import HermesGateway
 
@@ -57,11 +58,20 @@ def _live_allow(names: list) -> None:
     _UPSTREAM.register_env_passthrough(names)
 
 
+def _sync_blocking(roster: Any, profile: str, store: SecretStore, removed: Any, runner: Any) -> tuple:
+    """`sync_passthrough` dijalankan dari thread pekerja (event loop sendiri) supaya kunci profil bisa dipegang
+    selama subproses `hermes config set` berjalan tanpa memblokir event loop gateway."""
+    return asyncio.run(sync_passthrough(roster, profile, store, removed=removed, runner=runner))
+
+
 async def do_env_set(roster: Any, profile: str, name: Any, value: Any, by: Any = "", *,
                      store: Optional[SecretStore] = None, runner: Any = None) -> tuple:
-    """Simpan secret ke `.env` profile. (berhasil?, pesan untuk pemanggil). Nilai tidak pernah ada di pesan."""
+    """Simpan secret ke `.env` profile. (berhasil?, pesan untuk pemanggil). Nilai tidak pernah ada di pesan.
+
+    Cek `max_keys`, penulisan `.env` (diverifikasi ulang), dan sinkron `terminal.env_passthrough` berlangsung di
+    BAWAH SATU kunci per profile; daftar passthrough dihitung dari isi `.env` AKHIR di bawah kunci itu."""
     settings = roster.settings
-    name = str(name or "").strip().upper()
+    name = normalize_env_name(name)                  # huruf besar hanya untuk ASCII murni (bukan `ſ`→`S`)
     ok, why = check_env_name(name, reserved=roster.reserved_env, allow=settings.get("allow_names") or [],
                              deny=settings.get("deny_names") or [], upstream=_upstream_blocklist())
     if not ok:
@@ -71,17 +81,32 @@ async def do_env_set(roster: Any, profile: str, name: Any, value: Any, by: Any =
     if not ok:
         return False, "❌ " + why
     store = store or SecretStore(roster.profile_home(profile))
-    names = store.names()
-    if name not in names and len(names) >= int(settings.get("max_keys") or 40):
-        return False, (f"❌ Batas {int(settings.get('max_keys') or 40)} secret per profile tercapai. Hapus yang "
-                       "tidak dipakai dengan `/env-unset`.")
+    limit = int(settings.get("max_keys") or 40)
+
+    def critical() -> tuple:
+        with store.exclusive():
+            names = store.names()
+            if name not in names and len(names) >= limit:
+                return "full", None, None
+            fresh = store.set(name, value, str(by))
+            _live_allow([name])
+            passed, detail = _sync_blocking(roster, profile, store, (), runner)
+            return "ok", fresh, (passed, detail)
+
     try:
-        fresh = await asyncio.to_thread(store.set, name, value, str(by))
+        state, fresh, synced = await asyncio.to_thread(critical)
+    except EnvWriteError as exc:
+        log.warning("team-guard: .env profile %s ditolak/dibatalkan saat penulisan (%s)", profile, exc)
+        return False, ("❌ Secret tidak disimpan: penulisan `.env` dibatalkan karena hasilnya tidak sesuai "
+                       "(nilai tidak aman atau verifikasi gagal). Tidak ada yang berubah. Hubungi admin tim bila "
+                       "berulang.")
     except OSError as exc:
         log.warning("team-guard: .env profile %s tidak bisa ditulis (%s)", profile, exc)
         return False, "❌ Secret gagal disimpan (berkas .env profile tidak bisa ditulis). Hubungi admin tim."
-    _live_allow([name])
-    passed, detail = await sync_passthrough(roster, profile, store, runner=runner)
+    if state == "full":
+        return False, (f"❌ Batas {limit} secret per profile tercapai. Hapus yang "
+                       "tidak dipakai dengan `/env-unset`.")
+    passed, detail = synced
     verb = "disimpan" if fresh else "diperbarui"
     text = (f"✅ `{name}` {verb} untuk profile `{profile}`. Pakai sebagai `${name}` di perintah sandbox; "
             "nilainya tidak pernah terlihat oleh AI maupun anggota lain.")
@@ -122,15 +147,25 @@ async def do_env_list(roster: Any, profile: str, *, store: Optional[SecretStore]
 
 async def do_env_unset(roster: Any, profile: str, name: Any, *, store: Optional[SecretStore] = None,
                        runner: Any = None) -> tuple:
-    name = str(name or "").strip().upper()
+    name = normalize_env_name(name)
     store = store or SecretStore(roster.profile_home(profile))
+
+    def critical() -> bool:
+        with store.exclusive():                      # kunci yang sama dengan /env-set
+            if not store.unset(name):
+                return False
+            _sync_blocking(roster, profile, store, [name], runner)
+            return True
+
     try:
-        removed = await asyncio.to_thread(store.unset, name)
+        removed = await asyncio.to_thread(critical)
+    except EnvWriteError as exc:
+        log.warning("team-guard: .env profile %s: penghapusan dibatalkan (%s)", profile, exc)
+        return False, "❌ Secret gagal dihapus (verifikasi `.env` gagal; tidak ada yang berubah). Hubungi admin tim."
     except OSError:
         return False, "❌ Secret gagal dihapus (berkas .env profile tidak bisa ditulis)."
     if not removed:
         return False, f"`{name}` tidak ada di daftar secret profile `{profile}` (lihat `/env-list`)."
-    await sync_passthrough(roster, profile, store, removed=[name], runner=runner)
     return True, f"🗑️ `{name}` dihapus dari profile `{profile}`."
 
 

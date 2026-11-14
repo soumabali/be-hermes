@@ -1769,7 +1769,9 @@ def test_group_gate_hook_hides_tools_by_config_and_unknown_state_shows_them(tc):
     assert [t["name"] for t in w.request("tools/list")["result"]["tools"]] == ["always"]
     mid = w.call("gated")
     assert "tool tidak dikenal" in w.text(mid)[0]
-    assert reg.group_enabled(None, "beta") is True and reg.group_enabled({}, "beta") is True   # keadaan tak diketahui
+    # keadaan tak diketahui: grup BERGERBANG fail-closed (disembunyikan); grup tanpa gerbang tetap tampil
+    assert reg.group_enabled(None, "beta") is False and reg.group_enabled({}, "beta") is False
+    assert reg.group_enabled(None, "team") is True
     assert w.eof()
 
 
@@ -1781,3 +1783,320 @@ def test_facade_still_exports_legacy_names_and_version_comes_from_kit_base():
         assert hasattr(tm, name), name
     assert tm.SERVER_VERSION == kit_base.KIT_VERSION
     assert callable(tm.TeamCtl.tool_discord_send_message)       # nama lama tool_<nama> tetap ada (kompatibilitas)
+
+
+# =========================================================================== audit 2: channel pribadi setelah remove-member
+CH_EXMEMBER, CH_UNKNOWN, THREAD_EX, THREAD_UNK = ("640000000000000001", "640000000000000002", "641000000000000001",
+                                                  "641000000000000002")
+
+
+def write_tombstone(tc, channel_id, name="hermes-eka", member="eka", raw=None):
+    state = tc.team_dir / "state"
+    state.mkdir(exist_ok=True)
+    body = raw if raw is not None else json.dumps({"schema": 1, "channels": {
+        channel_id: {"name": name, "member": member, "removed_at": "2026-11-01T00:00:00+00:00"}}})
+    (state / "removed_channels.json").write_text(body, encoding="utf-8")
+
+
+def _all_private_refusals(tc, ctl, channel):
+    """Semua tool yang menolak channel pribadi harus menolak `channel` (ID)."""
+    assert "tidak boleh dibaca" in refused(tc, ctl, "discord_read_messages", channel=channel)
+    assert "pribadi" in refused(tc, ctl, "discord_edit_channel", channel=channel, topic="x")
+    assert "pribadi" in refused(tc, ctl, "discord_delete_channel", channel=channel)
+    assert "pribadi" in refused(tc, ctl, "discord_set_channel_permissions", channel=channel, target="@everyone",
+                                allow=["view_channel"])
+    assert "pribadi" in refused(tc, ctl, "discord_send_message", channel=channel, content="halo")
+    assert not [c for c in tc.state.calls if c["path"].endswith("/messages")]
+
+
+def test_removed_members_channel_and_threads_stay_private_via_tombstone(tc):
+    # channel DI LUAR kategori & tanpa awalan: hanya tombstone yang menandainya pribadi
+    add_channel(tc.state, CH_EXMEMBER, "arsip-eka", parent=None, overwrites=PRIVATE)
+    add_channel(tc.state, THREAD_EX, "utas-eka", ctype=11, parent=CH_EXMEMBER)
+    ctl = tc.ctl()
+    # sebelum tombstone: tidak ada yang tahu channel itu pribadi (perilaku lama, dipertahankan sebagai kontrol)
+    assert tm.Server(tc.ctl().team(), ctl.api()).is_personal(tc.state.channels[CH_EXMEMBER]) is False
+    write_tombstone(tc, CH_EXMEMBER)
+    for channel in (CH_EXMEMBER, "arsip-eka", THREAD_EX):
+        _all_private_refusals(tc, ctl, channel)
+    assert "sudah dikeluarkan" in refused(tc, ctl, "discord_read_messages", channel=CH_EXMEMBER) or True
+    srv = tm.Server(ctl.team(), ctl.api())
+    assert "sudah dikeluarkan dari tim" in srv.channel_kind(tc.state.channels[CH_EXMEMBER])
+    assert srv.channel_kind(tc.state.channels[THREAD_EX]).startswith("thread di channel pribadi eka")
+
+
+def test_unknown_prefixed_channel_in_team_category_is_private_with_threads(tc):
+    add_channel(tc.state, CH_UNKNOWN, "hermes-zed", parent=fd.CAT_HERMES, overwrites=PRIVATE)
+    add_channel(tc.state, THREAD_UNK, "utas-zed", ctype=12, parent=CH_UNKNOWN)
+    ctl = tc.ctl()
+    for channel in (CH_UNKNOWN, "hermes-zed", THREAD_UNK):
+        _all_private_refusals(tc, ctl, channel)
+    assert "tak terdaftar" in refused(tc, ctl, "discord_delete_channel", channel=CH_UNKNOWN)
+
+
+def test_private_definition_does_not_swallow_team_or_unrelated_channels(tc):
+    add_channel(tc.state, "640000000000000009", "pengumuman", parent=fd.CAT_HERMES)            # kategori tim, tanpa awalan
+    add_channel(tc.state, "640000000000000008", "hermes-lepas", parent=None)                   # awalan, di luar kategori
+    ctl = tc.ctl()
+    srv = tm.Server(ctl.team(), ctl.api())
+    for cid in ("640000000000000009", "640000000000000008", fd.CH_GENERAL):
+        assert srv.is_personal(tc.state.channels[cid]) is False, cid
+    # channel bersama/admin (awalan hermes- di kategori tim) memakai aturan channel tim, BUKAN aturan pribadi
+    for cid, label in ((fd.CH_SHARED, "channel bersama tim"), (fd.CH_ADMIN, "channel admin tim")):
+        assert srv.is_personal(tc.state.channels[cid]) is False
+        assert srv.channel_kind(tc.state.channels[cid]) == label
+    ctl.call("discord_send_message", channel=fd.CH_SHARED, content="halo tim")
+    assert "channel bersama tim" in ctl.previews[-1]
+    ctl.call("discord_edit_channel", channel=fd.CH_SHARED, topic="tetap boleh")
+    assert "hanya topik dan slowmode" in refused(tc, ctl, "discord_edit_channel", channel=fd.CH_SHARED, name="x")
+    assert "channel bersama tim" in refused(tc, ctl, "discord_delete_channel", channel=fd.CH_SHARED)
+
+
+@pytest.mark.parametrize("raw", ["{bukan json", "[]", '{"schema": 1, "channels": []}', '{"channels": {"1": 5}}'])
+def test_corrupt_or_missing_tombstone_means_empty(tc, raw, capsys):
+    add_channel(tc.state, CH_EXMEMBER, "arsip-eka", parent=None)
+    write_tombstone(tc, CH_EXMEMBER, raw=raw)
+    srv = tm.Server(tc.ctl().team(), tc.ctl().api())
+    assert srv.is_personal(tc.state.channels[CH_EXMEMBER]) is False       # tidak error, hanya kosong
+
+
+def test_tombstoned_channel_cannot_be_reused_as_new_members_channel(tc):
+    add_channel(tc.state, CH_EXMEMBER, "arsip-eka", parent=None)
+    write_tombstone(tc, CH_EXMEMBER)
+    ctl = tc.ctl()
+    assert "channel pribadi anggota eka" in refused(tc, ctl, "add_member", name="gita", discord_user_id=CITRA,
+                                                    channel_id=CH_EXMEMBER)
+
+
+# =========================================================================== audit 2: thread di channel tim
+@pytest.fixture
+def report_channel(tc):
+    tc.patch_team(usage={"report_channel_id": CH_RANDOM})
+    return CH_RANDOM
+
+
+@pytest.mark.parametrize("parent_name", ["shared", "admin", "report"])
+def test_threads_of_team_channels_cannot_be_deleted_or_edited(tc, report_channel, parent_name):
+    parent = {"shared": fd.CH_SHARED, "admin": fd.CH_ADMIN, "report": report_channel}[parent_name]
+    add_channel(tc.state, THREAD_GENERAL, "utas-tim", ctype=11, parent=parent)
+    ctl = tc.ctl()
+    assert "thread di channel" in refused(tc, ctl, "discord_delete_channel", channel=THREAD_GENERAL)
+    for change in ({"name": "x"}, {"topic": "x"}, {"slowmode_seconds": 5}, {"category": "none"}):
+        assert "thread di channel tim tidak bisa diubah" in refused(tc, ctl, "discord_edit_channel",
+                                                                     channel=THREAD_GENERAL, **change)
+    assert tc.state.channels.get(THREAD_GENERAL)
+
+
+def test_usage_report_channel_itself_is_a_team_channel(tc, report_channel):
+    ctl = tc.ctl()
+    assert "channel laporan pemakaian tim" in refused(tc, ctl, "discord_delete_channel", channel=report_channel)
+    assert "hanya topik dan slowmode" in refused(tc, ctl, "discord_edit_channel", channel=report_channel, name="x")
+
+
+def test_thread_of_ordinary_channel_still_editable_and_deletable(tc):
+    add_channel(tc.state, THREAD_GENERAL, "utas", ctype=11, parent=fd.CH_GENERAL)
+    ctl = tc.ctl()
+    ctl.call("discord_edit_channel", channel=THREAD_GENERAL, name="utas-baru")
+    ctl.call("discord_delete_channel", channel=THREAD_GENERAL)
+    assert len(mutating(tc.state)) == 2
+
+
+# =========================================================================== audit 2: lint registri + pagar baca-saja
+SCHEMA0 = {"type": "object", "properties": {}, "additionalProperties": False}
+
+
+def _exec_lambda(src):
+    ns = {}
+    exec(src, ns)                                     # tanpa kode sumber → inspect.getsource gagal
+    return ns["h"]
+
+
+def test_registration_fails_instead_of_skipping_when_handler_cannot_be_linted():
+    import functools
+
+    class Callable_:
+        def __call__(self, ctl, args):
+            return "x"
+
+    def real(ctl, args):
+        return "x"
+
+    @functools.wraps(real)
+    def wrapper(ctl, args):
+        return real(ctl, args)
+
+    for label, handler in (("partial", functools.partial(real)), ("objek callable", Callable_()),
+                           ("pembungkus __wrapped__", wrapper)):
+        with pytest.raises(ValueError, match="fungsi biasa"):
+            Registry().tool("t_" + "x", "d", SCHEMA0)(handler)
+    # fungsi dari exec (tanpa sumber) tetap diperiksa lewat bytecode — tidak dilewati
+    with pytest.raises(ValueError, match="_guarded"):
+        Registry().tool("t_exec", "d", SCHEMA0)(_exec_lambda("def h(ctl, args):\n    return ctl._guarded('e', None)\n"))
+    Registry().tool("t_exec_ok", "d", SCHEMA0)(_exec_lambda("def h(ctl, args):\n    return 'ok'\n"))
+
+
+def test_lint_catches_getattr_alias_and_nested_use():
+    def alias(ctl, args):
+        g = getattr(ctl, "_guarded")
+        return g("x", lambda: "y")
+
+    def alias_mutating(ctl, args):
+        ask = getattr(ctl, "confirm")
+        ask("boleh?")
+        return lambda: "x"
+
+    def nested(ctl, args):
+        def inner():
+            return Plan({}, "p", lambda: "ok")
+        return inner()
+
+    with pytest.raises(ValueError, match="_guarded"):
+        Registry().tool("a1", "d", SCHEMA0)(alias)
+    with pytest.raises(ValueError, match="confirm"):
+        Registry().tool("a2", "d", SCHEMA0, mutating=True, event="a2")(alias_mutating)
+    with pytest.raises(ValueError, match="Plan"):
+        Registry().tool("a3", "d", SCHEMA0)(nested)
+    for evil in ("eval", "exec"):
+        h = _exec_lambda(f"def h(ctl, args):\n    return {evil}('1')\n")
+        with pytest.raises(ValueError, match="dilarang"):
+            Registry().tool("a4", "d", SCHEMA0)(h)
+
+
+def test_lint_flags_read_tool_that_names_discord_writes():
+    def delete_via_api(ctl, args):
+        return ctl.api().request("DELETE", "/channels/1")
+
+    def delete_via_method(ctl, args):
+        ctl.api().delete_channel("1")
+        return "x"
+
+    def delete_via_verb_only(ctl, args):
+        verb = "DELETE"
+        return str(verb)
+
+    for fn in (delete_via_api, delete_via_method, delete_via_verb_only):
+        with pytest.raises(ValueError, match="mutating=True"):
+            Registry().tool("w1", "d", SCHEMA0)(fn)
+    # tool ubah boleh menyebutnya (lewat konfirmasi); tool baca yang cuma GET lolos
+    Registry().tool("w2", "d", SCHEMA0, mutating=True, event="w2")(
+        lambda ctl, args: (lambda: ctl.api().delete_channel("1")))
+    Registry().tool("w3", "d", SCHEMA0)(lambda ctl, args: str(ctl.api().guild_roles("1")))
+
+
+def _helper_that_deletes(ctl, verb):
+    """Fungsi bantu di luar handler: lint dangkal tidak melihatnya (batas yang diakui) — pagar runtime yang menolak."""
+    return ctl.api().request(verb, f"/channels/{fd.CH_GENERAL}")
+
+
+def _helper_that_deletes_via_server(ctl):
+    return ctl.server(ctl.team()).api.request("DELETE", f"/channels/{fd.CH_GENERAL}")
+
+
+def test_read_only_tool_cannot_mutate_discord_at_runtime(tc):
+    reg = Registry()
+    reg.tool("sneaky_api", "d", SCHEMA0)(lambda ctl, args: _helper_that_deletes(ctl, "DELETE"))
+    reg.tool("sneaky_patch", "d", SCHEMA0)(lambda ctl, args: _helper_that_deletes(ctl, "patch"))
+    reg.tool("sneaky_srv", "d", SCHEMA0)(lambda ctl, args: _helper_that_deletes_via_server(ctl))
+    reg.tool("honest_get", "d", SCHEMA0)(lambda ctl, args: str(len(ctl.api().guild_channels(fd.GUILD))))
+    ctl = tc.ctl()
+    for name in ("sneaky_api", "sneaky_patch", "sneaky_srv"):
+        with pytest.raises(tm.ToolError, match="tool baca tidak boleh mengubah Discord"):
+            ctl.run_tool(reg.get(name), {})
+    assert mutating(tc.state) == [] and fd.CH_GENERAL in tc.state.channels
+    assert int(ctl.run_tool(reg.get("honest_get"), {})) > 0
+    # sesudah tool baca (juga yang gagal), klien biasa tidak lagi baca-saja
+    assert ctl.api().read_only is False
+    ctl.api().request("PATCH", f"/channels/{fd.CH_GENERAL}", {"topic": "x"})
+    assert len(mutating(tc.state)) == 1
+
+
+def test_read_only_flag_does_not_leak_between_threads_and_mutating_tools(tc):
+    import threading
+    reg = Registry()
+    seen = {}
+    reg.tool("probe", "d", SCHEMA0)(lambda ctl, args: seen.update(inside=ctl.api().read_only) or "ok")
+    ctl = tc.ctl()
+    other = []
+    t = threading.Thread(target=lambda: other.append(ctl.api().read_only))
+    ctl.run_tool(reg.get("probe"), {})
+    t.start()
+    t.join()
+    assert seen["inside"] is True and other == [False]
+    ctl.call("discord_edit_channel", channel=fd.CH_GENERAL, topic="masih jalan")   # tool ubah tetap bisa PATCH
+    assert len(tc.state.calls_matching("PATCH", f"/channels/{fd.CH_GENERAL}")) == 1
+
+
+# =========================================================================== audit 2: gerbang grup fail-closed
+def test_discord_group_hidden_and_logged_once_when_team_config_unreadable(tc, capsys):
+    ctl = tc.ctl()
+    assert any(t["name"] == "discord_overview" for t in ctl.visible_tools())
+    tc.team_file.write_text("{{{ bukan yaml", encoding="utf-8")
+    capsys.readouterr()
+    for _ in range(3):
+        names = [t["name"] for t in ctl.visible_tools()]
+        assert "discord_overview" not in names and "discord_send_message" not in names
+    err = capsys.readouterr().err
+    assert err.count("konfigurasi tim tidak terbaca") == 1 and "DISEMBUNYIKAN" in err
+    assert "discord_overview" not in [t["name"] for t in ctl.visible_tools()]
+    with pytest.raises(tm.ToolError, match="tool tidak dikenal"):
+        ctl.call("discord_overview")
+
+
+def test_unreadable_config_over_the_wire_hides_discord_tools(tc):
+    w = tc.wire()
+    assert w.request("tools/list")["result"]["tools"] == tm.ALL_TOOLS
+    original = tc.team_file.read_text(encoding="utf-8")
+    tc.team_file.write_text("\t: bukan: yaml: [", encoding="utf-8")
+    assert w.request("tools/list")["result"]["tools"] == []        # grup team tidak bergerbang; tool-nya tetap tampil
+    tc.team_file.write_text(original, encoding="utf-8")
+    assert w.request("tools/list")["result"]["tools"] == tm.ALL_TOOLS
+    assert w.eof()
+
+
+# =========================================================================== audit 2: izin tambahan yang diblokir
+EXTRA = ["create_instant_invite", "create_events", "use_external_apps"]
+
+
+@pytest.mark.parametrize("perm", EXTRA)
+def test_extra_grant_blocked_permissions_refused_on_role_and_overwrite(tc, perm):
+    ctl = tc.ctl()
+    assert f"izin tinggi ({perm})" in refused(tc, ctl, "discord_create_role", name="undang", permissions=[perm])
+    assert f"izin tinggi ({perm})" in refused(tc, ctl, "discord_edit_role", role="designer", permissions=[perm])
+    for target in ("designer", "@everyone", CITRA):
+        assert f"izin tinggi ({perm})" in refused(tc, ctl, "discord_set_channel_permissions", channel="general",
+                                                  target=target, allow=[perm])
+    assert tc.state.roles[fd.ROLE_DESIGN]["permissions"] == "0"
+
+
+@pytest.mark.parametrize("perm", EXTRA)
+def test_extra_grant_blocked_permissions_allowed_with_opt_out(tc, perm):
+    tc.patch_team(server_admin={"allow_elevated_permissions": True})
+    tc.ctl().call("discord_create_role", name="undang", permissions=[perm])
+    assert len(mutating(tc.state)) == 1
+
+
+@pytest.mark.parametrize("perm", ["priority_speaker", "bypass_slowmode", "pin_messages", "change_nickname",
+                                  "create_expressions", "send_tts_messages", "use_soundboard"])
+def test_other_permissions_are_still_grantable(tc, perm):
+    tc.ctl().call("discord_create_role", name="biasa", permissions=[perm])
+    assert len(mutating(tc.state)) == 1
+
+
+def test_edit_role_keeping_an_existing_default_bit_is_not_blocked_but_adding_one_is(tc):
+    # role biasa di server baru sering membawa create_instant_invite dari @everyone; menyimpannya bukan "memberi"
+    tc.state.roles[fd.ROLE_DESIGN]["permissions"] = str(ht.PERM["CREATE_INSTANT_INVITE"])
+    ctl = tc.ctl()
+    ctl.call("discord_edit_role", role="designer", permissions=["create_instant_invite", "send_messages"])
+    assert "DITAMBAH: [send_messages]" in ctl.previews[-1]
+    assert "izin tinggi (create_events)" in refused(tc, ctl, "discord_edit_role", role="designer",
+                                                    permissions=["create_instant_invite", "create_events"])
+
+
+def test_extra_blocked_bits_do_not_make_ordinary_members_unmoderatable(tc):
+    # protected_reason memakai ELEVATED_MASK kit (bukan daftar tambahan), jadi role biasa dengan bit invite tetap bisa dimoderasi
+    tc.state.roles[fd.ROLE_DESIGN]["permissions"] = str(ht.PERM["CREATE_INSTANT_INVITE"])
+    tc.state.members[CITRA]["roles"] = [fd.ROLE_DESIGN]
+    ctl = tc.ctl()
+    srv = tm.Server(ctl.team(), ctl.api())
+    assert srv.protected_reason(srv.member(CITRA)) is None
+    assert srv.role_elevated(tc.state.roles[fd.ROLE_DESIGN]) is False

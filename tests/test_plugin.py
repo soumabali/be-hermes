@@ -3819,3 +3819,242 @@ class TestIntegrationWithRealHermes:
         assert callable(checker) and checker("OPENAI_API_KEY") is True and checker("MY_OWN_TOKEN") is False
         assert gw.event_get_command(MessageEvent(text="/stop")) == (True, "stop")
 
+
+
+# ============================================================================= audit 2: regresi keamanan
+INJECTION_CHARS = ["\n", "\r", "\x00", "\x0b", "\x0c", "\x1c", "\x1d", "\x1e", "\x85", " ", " ",
+                   "\x07", "\x1b", "\x7f"]
+
+
+class TestEnvLineInjection:
+    """`/env-set` memeriksa NAMA saja; `splitlines()` (kit DAN Hermes hulu agent/secret_scope.py::_parse_env_text)
+    memecah baris juga di \\x0b \\x0c \\x1c-\\x1e \\x85 U+2028 U+2029 — satu nilai bisa jadi dua entri .env."""
+
+    @staticmethod
+    def _ok_runner():
+        async def runner(argv, environ):
+            return 0, ""
+        return runner
+
+    @pytest.mark.parametrize("char", INJECTION_CHARS)
+    def test_env_set_rejects_value_that_splits_into_two_env_entries(self, env, char):
+        value = "aaaaaaa" + char + "OPENAI_BASE_URL=http://evil.example"
+        roster = env.rt().roster()
+        ok, text = run(commands.do_env_set(roster, "be-budi", "MY_A", value, S.U_BUDI, runner=self._ok_runner()))
+        assert not ok and "evil.example" not in text
+        assert not (env.home("be-budi") / ".env").exists()
+
+    @pytest.mark.parametrize("char", INJECTION_CHARS)
+    def test_check_env_value_rejects_every_line_boundary_and_control_char(self, char):
+        assert secrets.check_env_value("aaaaaaa" + char + "bbbb")[0] is False
+        assert secrets.check_env_value("aaaaaaa" + char)[0] is False
+
+    def test_check_env_value_allows_space_and_tab_and_unicode_text(self):
+        assert secrets.check_env_value("kata sandi\tdengan spasi é ñ 日本")[0] is True
+
+    @pytest.mark.parametrize("value", ["abc${OPENAI_API_KEY}xyz", "${X:-default}", "pre${"])
+    def test_value_with_dotenv_template_is_rejected(self, env, value):
+        """Hermes mengembang `${VAR}` saat membaca .env (secret_scope._expand_dotenv_templates)."""
+        ok, why = secrets.check_env_value(value, 4)
+        assert not ok and "${" in why
+        res = run(commands.do_env_set(env.rt().roster(), "be-budi", "MY_T", value + "zzzz", S.U_BUDI,
+                                      runner=self._ok_runner()))
+        assert not res[0] and not (env.home("be-budi") / ".env").exists()
+
+    def test_dollar_without_brace_backtick_and_paren_are_literal_and_allowed(self):
+        """Python-dotenv hanya mengembang `${…}`; `$VAR`, `$(…)`, backtick tidak pernah dievaluasi (nilai
+        diteruskan sebagai variabel lingkungan, bukan disisipkan ke skrip shell)."""
+        assert secrets.check_env_value("$HOME $(id) `id` \\n tail")[0] is True
+
+    @pytest.mark.parametrize("char", INJECTION_CHARS)
+    def test_writer_refuses_unsafe_value_on_its_own(self, tmp_path, char):
+        """Pertahanan berlapis: penulis tidak bergantung pada pemeriksa."""
+        store = secrets.SecretStore(tmp_path, extra_env=())
+        store.set("MY_KEEP", "nilai-aman-1")
+        before = store.env_path.read_text()
+        with pytest.raises(ValueError):
+            store.set("MY_A", "aaaaaaa" + char + "OPENAI_BASE_URL=http://evil")
+        assert store.env_path.read_text() == before and store.names() == ["MY_KEEP"]
+
+    def test_writer_refuses_template_and_bad_names(self, tmp_path):
+        store = secrets.SecretStore(tmp_path, extra_env=())
+        for name, value in [("MY_A", "x${Y}zzzz"), ("MY_A\nOPENAI_API_KEY", "valid-value-1"),
+                            ("MY_AB\n", "valid-value-1"), ("my_ab", "valid-value-1"), ("MY_ſECRET", "valid-value-1")]:
+            with pytest.raises(ValueError):
+                store.set(name, value)
+        assert not store.env_path.exists()
+
+    def test_verify_after_write_rolls_back_and_reports(self, tmp_path, monkeypatch):
+        store = secrets.SecretStore(tmp_path, extra_env=())
+        store.set("MY_KEEP", "nilai-aman-1")
+        before = store.env_path.read_text()
+        index_before = store.index_path.read_text()
+        real = secrets.rewrite_env_text
+        # penulis yang rusak: menyelipkan entri kedua (mensimulasikan celah parser di masa depan)
+        monkeypatch.setattr(secrets, "rewrite_env_text",
+                            lambda text, key, value: real(text, key, value) + "OPENAI_BASE_URL=http://evil\n")
+        with pytest.raises(secrets.EnvWriteError):
+            store.set("MY_NEW", "nilai-baru-123")
+        assert store.env_path.read_text() == before and store.index_path.read_text() == index_before
+        assert store.read_env() == {"MY_KEEP": "nilai-aman-1"}
+
+    def test_verify_after_write_on_fresh_file_removes_it(self, tmp_path, monkeypatch):
+        store = secrets.SecretStore(tmp_path, extra_env=())
+        monkeypatch.setattr(secrets, "rewrite_env_text", lambda text, key, value: "A_B=1\nMY_NEW=x\n")
+        with pytest.raises(secrets.EnvWriteError):
+            store.set("MY_NEW", "nilai-baru-123")
+        assert not store.env_path.exists() and not store.index_path.exists()
+
+    def test_verify_after_write_detects_changed_value(self, tmp_path, monkeypatch):
+        store = secrets.SecretStore(tmp_path, extra_env=())
+        monkeypatch.setattr(secrets, "rewrite_env_text", lambda text, key, value: f"{key}='lain'\n")
+        with pytest.raises(secrets.EnvWriteError):
+            store.set("MY_NEW", "nilai-baru-123")
+        assert not store.env_path.exists()
+
+    def test_command_reports_verify_failure_without_leaking_value(self, env, monkeypatch):
+        monkeypatch.setattr(secrets, "rewrite_env_text", lambda text, key, value: f"{key}='lain'\nX_Y=1\n")
+        ok, text = run(commands.do_env_set(env.rt().roster(), "be-budi", "MY_NEW", "nilai-baru-123", S.U_BUDI,
+                                           runner=self._ok_runner()))
+        assert not ok and "dibatalkan" in text and "nilai-baru-123" not in text
+        assert not (env.home("be-budi") / ".env").exists()
+
+    def test_unset_is_verified_too(self, tmp_path, monkeypatch):
+        store = secrets.SecretStore(tmp_path, extra_env=())
+        store.set("MY_A", "nilai-aman-1")
+        store.set("MY_B", "nilai-aman-2")
+        before = store.env_path.read_text()
+        monkeypatch.setattr(secrets, "rewrite_env_text", lambda text, key, value: "")
+        with pytest.raises(secrets.EnvWriteError):
+            store.unset("MY_A")
+        assert store.env_path.read_text() == before and store.names() == ["MY_A", "MY_B"]
+
+    def test_name_regex_is_ascii_and_anchored_with_end_of_string(self):
+        assert secrets.check_env_name("MY_AB\n")[0] is False
+        assert secrets.check_env_name("MY_AB\n\n")[0] is False
+        assert secrets.check_env_name("MY_ＡＢ")[0] is False                   # huruf fullwidth
+        assert secrets.check_env_name("MY_AB")[0] is True
+
+    @pytest.mark.parametrize("raw", ["MY_ſECRET", "my_ſecret", "MY_ıD", "MY_ﬁLE", "MY_A B", "MY_A\x0bB"])
+    def test_env_set_name_is_not_normalised_into_ascii(self, env, raw):
+        """`.upper()` mengubah `ſ`→`S`, `ı`→`I`, `ﬁ`→`FI`: nama non-ASCII tidak boleh 'lolos' lewat normalisasi."""
+        ok, _text = run(commands.do_env_set(env.rt().roster(), "be-budi", raw, "nilai-aman-123", S.U_BUDI,
+                                            runner=self._ok_runner()))
+        assert not ok and not (env.home("be-budi") / ".env").exists()
+
+    def test_env_set_still_accepts_lowercase_ascii_name(self, env):
+        ok, _t = run(commands.do_env_set(env.rt().roster(), "be-budi", " my_ok_name ", "nilai-aman-123", S.U_BUDI,
+                                         runner=self._ok_runner()))
+        assert ok and secrets.SecretStore(env.home("be-budi"), extra_env=()).read_env() == {"MY_OK_NAME": "nilai-aman-123"}
+
+    def test_unreadable_env_is_not_treated_as_empty_and_overwritten(self, tmp_path, monkeypatch):
+        """Regresi: `except OSError: text = ''` menimpa .env yang hanya sementara tidak terbaca."""
+        store = secrets.SecretStore(tmp_path, extra_env=())
+        store.set("MY_KEEP", "nilai-aman-1")
+        before = store.env_path.read_bytes()
+        real = type(store.env_path).read_bytes
+
+        def boom(self):
+            if self == store.env_path:
+                raise PermissionError("denied")
+            return real(self)
+
+        monkeypatch.setattr(type(store.env_path), "read_bytes", boom)
+        monkeypatch.setattr(type(store.env_path), "read_text", lambda self, *a, **k: boom(self).decode())
+        with pytest.raises(OSError):
+            store.set("MY_NEW", "nilai-baru-123")
+        monkeypatch.undo()
+        assert store.env_path.read_bytes() == before
+
+    def test_non_utf8_env_file_does_not_crash_set(self, tmp_path):
+        """Hermes membaca .env non-UTF-8 sebagai latin-1; set() dulu melempar UnicodeDecodeError."""
+        (tmp_path / ".env").write_bytes(b"LAMA=caf\xe9\n")
+        store = secrets.SecretStore(tmp_path, extra_env=())
+        store.set("MY_NEW", "nilai-baru-123")
+        assert store.read_env() == {"LAMA": "café", "MY_NEW": "nilai-baru-123"}
+
+
+class TestEnvSetRaces:
+    """check max_keys + tulis + sinkron env_passthrough dalam SATU kunci per profile."""
+
+    def _roster(self, env, **settings):
+        env.set("settings", **settings)
+        return env.rt().roster(force=True)
+
+    def test_max_keys_cannot_be_exceeded_by_simultaneous_sets(self, env):
+        roster = self._roster(env, max_keys=1)
+        barrier = threading.Barrier(2)
+
+        class Store(secrets.SecretStore):
+            def names(self):
+                try:
+                    barrier.wait(0.5)               # jendela balapan: keduanya melihat «0 secret»
+                except threading.BrokenBarrierError:
+                    pass
+                return super().names()
+
+        store = Store(env.home("be-budi"), extra_env=())
+        results = []
+
+        async def runner(argv, environ):
+            return 0, ""
+
+        def go(name):
+            results.append(run(commands.do_env_set(roster, "be-budi", name, "nilai-aman-123", S.U_BUDI,
+                                                   store=store, runner=runner)))
+
+        threads = [threading.Thread(target=go, args=(n,)) for n in ("MY_AAA", "MY_BBB")]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert sorted(r[0] for r in results) == [False, True], results
+        assert len(secrets.SecretStore(env.home("be-budi"), extra_env=()).names()) == 1
+
+    def test_concurrent_passthrough_sync_never_leaves_the_older_list(self, env):
+        roster = self._roster(env)
+        home = env.home("be-budi")
+        (home / "config.yaml").write_text("terminal:\n  env_passthrough: []\n")
+        import time as _time
+        import yaml
+        calls = []
+
+        async def runner(argv, environ):
+            names = json.loads(argv[-1])
+            calls.append(names)
+            await asyncio.sleep(0.4 if len(calls) == 1 else 0.0)      # panggilan pertama selesai TERAKHIR
+            (home / "config.yaml").write_text(yaml.safe_dump({"terminal": {"env_passthrough": names}}))
+            return 0, ""
+
+        def go(name, delay):
+            _time.sleep(delay)
+            run(commands.do_env_set(roster, "be-budi", name, "nilai-aman-123", S.U_BUDI, runner=runner))
+
+        threads = [threading.Thread(target=go, args=("MY_AAA", 0)), threading.Thread(target=go, args=("MY_BBB", 0.15))]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        final = yaml.safe_load((home / "config.yaml").read_text())["terminal"]["env_passthrough"]
+        assert sorted(final) == ["MY_AAA", "MY_BBB"], (final, calls)
+
+    def test_unset_and_set_share_the_same_lock(self, env):
+        roster = self._roster(env)
+        store = secrets.SecretStore(env.home("be-budi"), extra_env=())
+        store.set("MY_OLD", "nilai-aman-123")
+        order = []
+
+        async def runner(argv, environ):
+            order.append(("start", argv[-1]))
+            await asyncio.sleep(0.2)
+            order.append(("end", argv[-1]))
+            return 0, ""
+
+        t1 = threading.Thread(target=lambda: run(commands.do_env_unset(roster, "be-budi", "MY_OLD", runner=runner)))
+        t1.start()
+        import time as _time
+        _time.sleep(0.05)
+        run(commands.do_env_set(roster, "be-budi", "MY_NEW", "nilai-aman-123", S.U_BUDI, runner=runner))
+        t1.join()
+        kinds = [k for k, _ in order]
+        assert kinds == ["start", "end", "start", "end"], order          # tidak tumpang tindih

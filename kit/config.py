@@ -18,7 +18,7 @@ import kit_config
 from kit.constants import (ALIAS_RE, ALLOW_PLACEHOLDERS_ENV, DEFAULT_USER_COMMANDS, ENV_NAME_RE, GOAL_COMMANDS,
                            MODEL_COMPRESSION_KEYS, NAME_RE, PLACEHOLDER_ID_RE, SANDBOX_CPU_RANGE,
                            SANDBOX_MEMORY_MB_RANGE, SECRET_LIKE_KEYS)
-from kit.profiles import MODEL_TARGETS, SYSTEM_KINDS
+from kit.profiles import MODEL_TARGETS, SYSTEM_KINDS  # noqa: F401
 from kit.util import _read_yaml_file, atomic_write, dump_yaml, file_lock
 from kit_base import TeamError, _id
 from kit_config import _bool, _int, _number, _profile, _report_time  # noqa: F401  (nama lama tetap tersedia)
@@ -110,7 +110,7 @@ def _load_llm(raw: dict) -> dict:
     if not models:
         raise TeamError("llm.models: minimal satu model")
     out = {"providers": providers, "models": models}
-    for key in ("default_model", "admin_model", "shared_model", "lobby_model", "aux_model"):
+    for key in kit_config.llm_model_keys():
         value = str(llm.get(key) or llm.get("default_model") or "")
         if value not in models:
             raise TeamError(f"llm.{key}: '{value}' tidak ada di llm.models")

@@ -5,15 +5,23 @@ Sebelumnya tiap jenis tersebar di ~20 percabangan (`if role in ("member","templa
 registri ini: setelan dasar per jenis, teks SOUL, apakah butuh channel, toolset tambahan yang dimatikan,
 dan apakah namanya dicadangkan (tidak boleh jadi nama anggota).
 
-Tambah jenis baru = satu `ProfileKind` di `PROFILE_KINDS` (+ teks SOUL di kit/templates/).
+Tambah jenis baru yang punya channel sendiri (`needs_channel`) / jadi target set-model (`model_target`):
+daftarkan satu `ProfileKind` di `PROFILE_KINDS` — argumen `soul` (teks SOUL.md) WAJIB karena tidak bisa diturunkan.
+Selebihnya DITURUNKAN dari registri ini: blok `<kind>.{profile,channel_id,auto_skills}` dan baris
+`llm.<kind>_model` di skema (kit_config), rute gateway, alias model + `models:` di members.yaml, channel/kind di
+roster, check/describe/status, cek channel doctor, urutan provisioning, dan nama yang dicadangkan.
+Yang TIDAK generik (lihat docs/PENGEMBANGAN.md): `teamctl` set-model, berbagi skill ("shared"), channel rumah
+(admin), dan plugin team-guard (menafsirkan `kind` channel).
+`SYSTEM_KINDS`, `MODEL_TARGETS`, `RESERVED_NAMES` adalah TAMPILAN malas atas `PROFILE_KINDS` (selalu mutakhir).
 Hanya bergantung pada kit.constants dan kit.templates (tanpa siklus ke config/derive).
 """
 from __future__ import annotations
 
+import collections.abc
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Sequence
 
 from kit.constants import (CRON_TOOLSET, HOST_SIDE_TOOLSETS, KIT_SKILLS, LOBBY_DISABLED_TOOLSETS, TEAMCTL,
                            WORKER_DISABLED_TOOLSETS)
@@ -91,6 +99,10 @@ class ProfileKind:
     extra_disabled_toolsets: tuple = ()        # toolset tambahan yang dimatikan (lobby: semua)
     note: str = ""                             # keterangan di tampilan `status`
     channel_label: str = ""                    # "channel bersama" — dipakai pesan bila channel dipakai jenis ini
+    role: str = "member"                       # role Discord yang boleh melihat channel-nya: "member" | "admin"
+    admin_routes: bool = False                 # rute dikunci per user_id admin bila `strict_admin_routes` (admin)
+    free_response: bool = False                # channel tanpa @mention (admin); False = wajib @mention (shared)
+    model_label: str = ""                      # kata untuk deskripsi llm.<kind>_model ("" = nama jenis)
 
     @property
     def alias_kind(self) -> str:
@@ -100,21 +112,69 @@ class ProfileKind:
 MEMBER = ProfileKind("member", SOUL_MEMBER, _member_settings, per_member=True, model_as="member")
 TEMPLATE = ProfileKind("template", SOUL_MEMBER, _member_settings, reserved=True, model_as="member")
 SHARED = ProfileKind("shared", SOUL_SHARED, _shared_settings, needs_channel=True, reserved=True, model_target=True,
-                     note="bersama, @mention → thread", channel_label="channel bersama")
+                     note="bersama, @mention → thread", channel_label="channel bersama",
+                     model_label="bersama")
 ADMIN = ProfileKind("admin", SOUL_ADMIN, _admin_settings, needs_channel=True, reserved=True, model_target=True,
-                    cron_exempt=True, note="admin, tanpa @mention", channel_label="channel admin")
+                    cron_exempt=True, note="admin, tanpa @mention", channel_label="channel admin",
+                    role="admin", admin_routes=True, free_response=True, model_label="admin")
 LOBBY = ProfileKind("lobby", SOUL_LOBBY, None, reserved=True, model_target=True,
-                    extra_disabled_toolsets=tuple(LOBBY_DISABLED_TOOLSETS))
+                    extra_disabled_toolsets=tuple(LOBBY_DISABLED_TOOLSETS), model_label="default (lobby)")
 
 PROFILE_KINDS: dict[str, ProfileKind] = {k.name: k for k in (MEMBER, TEMPLATE, SHARED, ADMIN, LOBBY)}
 
+class _KindView(collections.abc.Sequence):
+    """Urutan jenis yang dihitung ULANG dari PROFILE_KINDS setiap diakses (bukan salinan saat impor)."""
+
+    def __init__(self, pick: Callable[[ProfileKind], bool]):
+        self._pick = pick
+
+    def _names(self) -> tuple[str, ...]:
+        return tuple(k.name for k in PROFILE_KINDS.values() if self._pick(k))
+
+    def __getitem__(self, index):
+        return self._names()[index]
+
+    def __len__(self) -> int:
+        return len(self._names())
+
+    def __eq__(self, other) -> bool:
+        return isinstance(other, (tuple, list, _KindView)) and self._names() == tuple(other)
+
+    __hash__ = None  # type: ignore[assignment]
+
+    def __repr__(self) -> str:
+        return repr(self._names())
+
+
+class _ReservedView(collections.abc.Set):
+    @staticmethod
+    def _names() -> frozenset:
+        return frozenset(GENERIC_RESERVED | {k.name for k in PROFILE_KINDS.values() if k.reserved})
+
+    @classmethod
+    def _from_iterable(cls, it):
+        return frozenset(it)
+
+    def __contains__(self, name) -> bool:
+        return name in self._names()
+
+    def __iter__(self):
+        return iter(self._names())
+
+    def __len__(self) -> int:
+        return len(self._names())
+
+    def __repr__(self) -> str:
+        return repr(set(self._names()))
+
+
 # Kind yang punya blok sendiri di team.yaml (profile + channel_id + auto_skills): shared, admin.
-SYSTEM_KINDS: tuple[str, ...] = tuple(k.name for k in PROFILE_KINDS.values() if k.needs_channel and not k.per_member)
+SYSTEM_KINDS: Sequence = _KindView(lambda k: k.needs_channel and not k.per_member)
 # Target set-model / llm-key selain nama anggota: shared, admin, lobby.
-MODEL_TARGETS: tuple[str, ...] = tuple(k.name for k in PROFILE_KINDS.values() if k.model_target)
+MODEL_TARGETS: Sequence = _KindView(lambda k: k.model_target)
 # Nama di luar jenis profile yang bentrok dengan target set-model / profile bawaan Hermes.
 GENERIC_RESERVED = frozenset({"all", "semua", "all-members", "default", "main"})
-RESERVED_NAMES = set(GENERIC_RESERVED | {k.name for k in PROFILE_KINDS.values() if k.reserved})
+RESERVED_NAMES = _ReservedView()
 
 
 def kind_of(role: str) -> ProfileKind:

@@ -44,16 +44,17 @@ def build_routes(team: dict) -> list[dict]:
         if team["strict"]:
             route["user_id"] = m["user_id"]
         routes.append(route)
-    routes.append({"name": team["shared"]["profile"], "platform": "discord", "guild_id": g,
-                   "chat_id": team["shared"]["channel_id"], "profile": team["shared"]["profile"]})
-    if team["admin_strict"]:
-        for i, admin in enumerate(team["admins"]):
-            routes.append({"name": f"{team['admin']['profile']}-{i + 1}", "platform": "discord",
-                           "guild_id": g, "chat_id": team["admin"]["channel_id"], "user_id": admin,
-                           "profile": team["admin"]["profile"]})
-    else:
-        routes.append({"name": team["admin"]["profile"], "platform": "discord", "guild_id": g,
-                       "chat_id": team["admin"]["channel_id"], "profile": team["admin"]["profile"]})
+    for kind in SYSTEM_KINDS:
+        block, spec = team[kind], PROFILE_KINDS[kind]
+        if spec.admin_routes and team["admin_strict"]:
+            # Channel khusus admin: satu rute per user_id admin (user lain jatuh ke lobby).
+            for i, admin in enumerate(team["admins"]):
+                routes.append({"name": f"{block['profile']}-{i + 1}", "platform": "discord",
+                               "guild_id": g, "chat_id": block["channel_id"], "user_id": admin,
+                               "profile": block["profile"]})
+        else:
+            routes.append({"name": block["profile"], "platform": "discord", "guild_id": g,
+                           "chat_id": block["channel_id"], "profile": block["profile"]})
     routes.extend(team["extra_routes"])
     return routes
 
@@ -106,9 +107,9 @@ def host_memory_mb(path: Optional[Path] = None) -> Optional[int]:
 
 
 def sandbox_worst_case_mb(team: dict) -> int:
-    """Plafon RAM bila SEMUA sandbox penuh sekaligus: anggota aktif + shared + admin."""
+    """Plafon RAM bila SEMUA sandbox penuh sekaligus: anggota aktif + satu per jenis ber-channel (shared, admin)."""
     return (sum(sandbox_limits(team, m)[1] for m in active_members(team))
-            + 2 * sandbox_limits(team)[1])
+            + len(SYSTEM_KINDS) * sandbox_limits(team)[1])
 
 
 def sandbox_warnings(team: dict) -> list[str]:
@@ -165,10 +166,10 @@ def plugin_settings(team: dict) -> list[tuple[str, object]]:
 def gateway_channels(team: dict) -> tuple[list[str], list[str]]:
     """(allowed_channels, free_response_channels) untuk adapter Discord host."""
     personal = [m["channel_id"] for m in active_members(team)]
-    shared, admin = team["shared"]["channel_id"], team["admin"]["channel_id"]
+    system = [(team[k]["channel_id"], PROFILE_KINDS[k]) for k in SYSTEM_KINDS]
     # Bot hanya hidup di channel terdaftar; thread ikut lewat parent channel-nya.
-    # Channel pribadi & admin: tanpa @mention. #hermes-shared: wajib @mention → thread.
-    return personal + [shared, admin], personal + [admin]
+    # Channel pribadi & admin: tanpa @mention. #hermes-shared: wajib @mention → thread (`free_response` per jenis).
+    return personal + [cid for cid, _ in system], personal + [cid for cid, spec in system if spec.free_response]
 
 
 def host_settings(team: dict) -> list[tuple[str, object]]:

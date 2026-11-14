@@ -30,7 +30,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Iterable, Optional
 
 from kit.constants import PROFILE_RE, REPORT_KINDS
-from kit.profiles import SYSTEM_KINDS
+from kit.profiles import MODEL_TARGETS, PROFILE_KINDS, SYSTEM_KINDS
 from kit.templates import DEFAULT_WELCOME, DEFAULT_WELCOME_BACK
 from kit_base import TeamError, _id
 
@@ -180,7 +180,10 @@ def _plugin(path: str, type: str, default: Any, desc: str, key: str = "", sectio
     return Field(path, type, default, desc, plugin_key=key or path.rpartition(".")[2], plugin_section=section, **kw)
 
 
-FIELDS: tuple[Field, ...] = (
+def _build_fields() -> tuple[Field, ...]:
+    """Seluruh tabel. Baris per jenis profile (`<kind>.*`, `llm.<kind>_model`) DIBANGUN dari registri
+    kit.profiles setiap dipanggil, jadi jenis yang terdaftar ikut dapat blok + baris model tanpa baris manual."""
+    return (
     # --- tingkat atas
     _row("team_name", "str", "Backend", "Nama tim (muncul di SOUL.md dan pesan sambutan).", strip=False),
     _row("guild_id", "id", None, "ID server Discord."),
@@ -222,9 +225,8 @@ FIELDS: tuple[Field, ...] = (
     _row("llm.models", "custom", {}, "Katalog model: alias → {provider, model, [compression_threshold_tokens, "
          "proactive_prune_tokens]}."),
     _row("llm.default_model", "custom", "", "Model anggota tanpa `model` di members.yaml."),
-    _row("llm.admin_model", "custom", "", "Model profile admin."),
-    _row("llm.shared_model", "custom", "", "Model profile bersama."),
-    _row("llm.lobby_model", "custom", "", "Model profile default (lobby)."),
+    *(_row(f"llm.{kind}_model", "custom", "", f"Model profile {PROFILE_KINDS[kind].model_label or kind}.")
+      for kind in MODEL_TARGETS if PROFILE_KINDS[kind].alias_kind == kind),
     _row("llm.aux_model", "custom", "", "Model murah untuk tugas auxiliary (kompresi, judul, review, cron)."),
     _row("llm.fallback", "custom", [], "Rantai model cadangan saat model utama error/throttle."),
     _row("llm.per_user_keys", "custom", False, "true = tiap profile boleh punya API key sendiri (llm-key)."),
@@ -314,10 +316,10 @@ FIELDS: tuple[Field, ...] = (
     _row("server_admin.allow_elevated_permissions", "bool", False,
          "Izin tinggi (Administrator, Manage Roles, ...) lewat Hermes."),
     _row("server_admin.read_messages", "bool", True, "discord_read_messages (channel pribadi selalu ditolak)."),
-)
+    )
 
-FIELD_BY_PATH: dict[str, Field] = {f.path: f for f in FIELDS}
-assert len(FIELD_BY_PATH) == len(FIELDS), "path ganda di FIELDS"
+FIELDS: tuple[Field, ...] = ()
+FIELD_BY_PATH: dict[str, Field] = {}
 
 
 @dataclass(frozen=True)
@@ -327,26 +329,47 @@ class Section:
     falsy_ok: bool = False              # `false`/null dibaca sebagai mapping kosong
 
 
-SECTIONS: dict[str, Section] = {
-    "roles": Section(),
-    **{kind: Section() for kind in SYSTEM_KINDS},
-    "threads": Section(hint=True),
-    "sandbox": Section(),
-    "scale": Section(),
-    "usage": Section(hint=True),
-    "usage.reports": Section(hint=True, unknown="error", falsy_ok=True),
-    "secrets": Section(),
-    "onboarding": Section(unknown="error"),
-    "server_admin": Section(),
-    "llm": Section(),
-}
-# Urutan bagian saat melaporkan key tak dikenal (sama dengan perilaku lama).
-WARN_ORDER = ("roles", *SYSTEM_KINDS, "threads", "sandbox", "scale", "usage", "secrets", "server_admin", "llm")
+SECTIONS: dict[str, Section] = {}
+WARN_ORDER: tuple[str, ...] = ()
+
+
+def rebuild_schema() -> None:
+    """Bangun ulang FIELDS / FIELD_BY_PATH / SECTIONS / WARN_ORDER dari registri jenis profile.
+
+    Dipanggil sekali saat impor. Uji yang mendaftarkan jenis palsu di kit.profiles memanggilnya lagi (dan sekali
+    lagi setelah registri dipulihkan); kode produksi tidak perlu."""
+    global FIELDS, FIELD_BY_PATH, SECTIONS, WARN_ORDER
+    FIELDS = _build_fields()
+    FIELD_BY_PATH = {f.path: f for f in FIELDS}
+    assert len(FIELD_BY_PATH) == len(FIELDS), "path ganda di FIELDS"
+    SECTIONS = {
+        "roles": Section(),
+        **{kind: Section() for kind in SYSTEM_KINDS},
+        "threads": Section(hint=True),
+        "sandbox": Section(),
+        "scale": Section(),
+        "usage": Section(hint=True),
+        "usage.reports": Section(hint=True, unknown="error", falsy_ok=True),
+        "secrets": Section(),
+        "onboarding": Section(unknown="error"),
+        "server_admin": Section(),
+        "llm": Section(),
+    }
+    # Urutan bagian saat melaporkan key tak dikenal (sama dengan perilaku lama).
+    WARN_ORDER = ("roles", *SYSTEM_KINDS, "threads", "sandbox", "scale", "usage", "secrets", "server_admin", "llm")
+
+
+rebuild_schema()
 
 # Key opsional di llm.models.<alias> dan di members.yaml (hanya untuk peringatan key tak dikenal + dokumentasi).
 LLM_MODEL_KEYS = ("provider", "model", "compression_threshold_tokens", "proactive_prune_tokens")
 MEMBERS_FILE_KEYS = ("members", "models")
 MEMBER_KEYS = ("name", "display_name", "discord_user_id", "channel_id", "model", "active", "forward_env", "sandbox")
+
+
+def llm_model_keys() -> tuple[str, ...]:
+    """Key `llm.*` yang menamai model: default, satu per jenis target set-model (dari registri), aux."""
+    return ("default_model", *(f"{k}_model" for k in MODEL_TARGETS if PROFILE_KINDS[k].alias_kind == k), "aux_model")
 
 
 def fields_in(section: str) -> list[Field]:
@@ -411,7 +434,7 @@ def _parse_value(f: Field, value: Any, where: str, present: bool = True) -> Any:
     if kind == "ids":
         return [_id(v, f"{where}[{i}]") for i, v in enumerate(value or [])]
     if kind == "strs":
-        if value is not None and not isinstance(value, (list, tuple)):
+        if value and not isinstance(value, (list, tuple)):          # "", {}, 0, False = kosong (perilaku lama)
             raise TeamError(f"{where}: harus daftar")
         return [str(v) for v in (value or [])]
     if kind == "text":
@@ -424,6 +447,12 @@ def _parse_value(f: Field, value: Any, where: str, present: bool = True) -> Any:
     if kind == "profile":
         return _profile(str(value or ""), where)
     raise ValueError(f"tipe field tidak dikenal: {kind} ({where})")
+
+
+def _blank_profile(f: Field, value: Any) -> bool:
+    """Nama profile yang dikosongkan (None, "", 0, false, [], {}) = pakai bawaan, seperti kit lama.
+    Nilai tak-kosong yang salah tetap ditolak dengan pesan yang menyebut key-nya."""
+    return f.type == "profile" and not value
 
 
 def _mapping(raw: Any, section: str) -> dict:
@@ -455,7 +484,7 @@ def parse_section(section: str, raw: Any, ctx: Optional[dict] = None) -> dict:
         if f.type == "custom":
             continue
         present = f.key in mapping
-        value = mapping[f.key] if present else f.default_value(ctx)
+        value = mapping[f.key] if present and not _blank_profile(f, mapping[f.key]) else f.default_value(ctx)
         out[f.path] = _parse_value(f, value, f.path, present)
     for name in SECTIONS:
         if name.rpartition(".")[0] == section and name != "llm":
@@ -493,7 +522,8 @@ def parse_top_level(raw: dict) -> dict:
         root = f.path.partition(".")[0]
         if f.section == "":
             present = f.key in raw
-            value = parse_one(f, raw[f.key] if present else f.default_value(ctx), present)
+            given = raw[f.key] if present and not _blank_profile(f, raw[f.key]) else f.default_value(ctx)
+            value = parse_one(f, given, present)
             _put(team, f.target, value)
             ctx[f.key] = value
         elif root not in parsed_sections:

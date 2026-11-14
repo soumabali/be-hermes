@@ -236,12 +236,11 @@ class LLMHandler(BaseHTTPRequestHandler):
 
 
 ACTIVE = {"base": None}      # URL Discord tiruan yang dipakai Context/Wizard di uji ini
-SUPPORTS_BASE = "discord_base" in ks.Context.__init__.__code__.co_varnames
 
 
 def discord_context_overrides():
     """Wizard TIDAK membaca TEAMCTL_DISCORD_API (root bisa punya env itu); uji menyuntik URL lewat Context."""
-    return {"discord_base": ACTIVE["base"]} if SUPPORTS_BASE and ACTIVE["base"] else {}
+    return {"discord_base": ACTIVE["base"]} if ACTIVE["base"] else {}
 
 
 @pytest.fixture
@@ -253,10 +252,7 @@ def discord(monkeypatch):
     # mengadopsinya tanpa persetujuan; uji adopsi memasangnya lagi secara eksplisit.
     state.roles[fd.ROLE_ADMIN]["permissions"] = "0"
     ACTIVE["base"] = base
-    if SUPPORTS_BASE:
-        monkeypatch.delenv("TEAMCTL_DISCORD_API", raising=False)
-    else:
-        monkeypatch.setenv("TEAMCTL_DISCORD_API", base)
+    monkeypatch.delenv("TEAMCTL_DISCORD_API", raising=False)       # membuktikan wizard tidak bergantung padanya
     monkeypatch.delenv("DISCORD_BOT_TOKEN", raising=False)
     yield state
     ACTIVE["base"] = None
@@ -494,6 +490,10 @@ def test_server_bootstrap_creates_once_and_is_idempotent(tmp_path, discord):
 
 
 def test_server_bootstrap_reuses_existing_and_fixes_their_overwrites(tmp_path, discord):
+    # Role dan channel yang dipakai ulang di sini aman diadopsi tanpa pertanyaan: role berizin 0, channel di kategori
+    # Hermes tanpa pelihat tambahan. (Versi lama uji ini ikut "merestui" role hermes-admin ber-ADMINISTRATOR; kini
+    # itu butuh persetujuan eksplisit — lihat test_existing_administrator_role_is_not_adopted_silently.)
+    assert all(discord.roles[r]["permissions"] == "0" for r in (fd.ROLE_ENTRY, fd.ROLE_MEMBER, fd.ROLE_ADMIN))
     ctx = discord_ready(make_ctx(tmp_path, {"admins": fd.ADMIN}))
     ks.DiscordServer().run(ctx)
     assert not discord.calls_matching("POST", f"/guilds/{fd.GUILD}/roles")
@@ -542,36 +542,44 @@ def test_missing_bot_permissions_detected(tmp_path, discord):
     assert not posts(discord)
 
 
-def test_admin_lookup_by_id_username_and_ambiguous(tmp_path, discord):
+def test_admin_lookup_by_id_mention_exact_name_and_candidates(tmp_path, discord):
     discord.add_member("500000000000000091", "dodi")
     discord.add_member("500000000000000092", "sari.a")
     discord.add_member("500000000000000093", "sari.b")
     api = kd.DiscordAPI(TOKEN, base=discord.base)
     ctx = make_ctx(tmp_path)
     assert ks.resolve_admin(ctx, api, fd.GUILD, fd.ADMIN)["user"]["username"] == "adminbe"
-    assert ks.resolve_admin(ctx, api, fd.GUILD, "@adminbe")["user"]["id"] == fd.ADMIN
-    assert ks.resolve_admin(ctx, api, fd.GUILD, "dodi")["user"]["id"] == "500000000000000091"   # persis menang
-    assert ks.resolve_admin(ctx, api, fd.GUILD, "cit")["user"]["username"] == "citra"            # satu hasil
-    with pytest.raises(ks.StepError) as err:
-        ks.resolve_admin(ctx, api, fd.GUILD, "sari")
-    assert "cocok dengan 2 anggota" in err.value.message and "500000000000000093" in err.value.message
-    with pytest.raises(ks.StepError):
-        ks.resolve_admin(ctx, api, fd.GUILD, "tidakada")
+    assert ks.resolve_admin(ctx, api, fd.GUILD, "@" + fd.ADMIN)["user"]["id"] == fd.ADMIN
     with pytest.raises(ks.StepError) as err:
         ks.resolve_admin(ctx, api, fd.GUILD, "123456789012345678")
     assert "bukan anggota server" in err.value.message
     with pytest.raises(ks.StepError):
-        ks.resolve_admin(ctx, api, fd.GUILD, "herm")            # bot tidak pernah jadi kandidat admin
-    interactive = make_ctx(tmp_path, non_interactive=False, inputs=["x", "2"])
+        ks.resolve_admin(ctx, api, fd.GUILD, "tidakada")
+    with pytest.raises(ks.StepError) as err:                   # non-interaktif: nama (walau persis) tidak diterima
+        ks.resolve_admin(ctx, api, fd.GUILD, "sari")
+    assert "bukan user ID" in err.value.message and "500000000000000093" in err.value.message
+    interactive = make_ctx(tmp_path, non_interactive=False, inputs=[])
+    assert ks.resolve_admin(interactive, api, fd.GUILD, "dodi")["user"]["id"] == "500000000000000091"    # persis menang
+    assert ks.resolve_admin(interactive, api, fd.GUILD, "@adminbe")["user"]["id"] == fd.ADMIN
+    interactive = make_ctx(tmp_path, non_interactive=False, inputs=["2"])
     assert ks.resolve_admin(interactive, api, fd.GUILD, "sari")["user"]["id"] == "500000000000000093"
+    with pytest.raises(ks.StepError):
+        ks.resolve_admin(make_ctx(tmp_path), api, fd.GUILD, "herm")        # bot tidak pernah jadi kandidat nama
 
 
-def test_admins_from_usernames_get_the_role(tmp_path, discord):
-    ctx = discord_ready(make_ctx(tmp_path, {"admins": ["citra", fd.OWNER, "citra"]}))
+def test_admins_given_as_ids_and_mentions_get_the_role(tmp_path, discord):
+    ctx = discord_ready(make_ctx(tmp_path, {"admins": ["500000000000000003", fd.OWNER, "<@500000000000000003>"]}))
     ks.DiscordServer().run(ctx)
     assert ctx.data["admins"] == ["500000000000000003", fd.OWNER]
     assert fd.ROLE_ADMIN in discord.members["500000000000000003"]["roles"]
     assert fd.ROLE_ADMIN in discord.members[fd.OWNER]["roles"]
+
+
+def test_admins_given_by_name_are_refused_non_interactively_before_any_role_is_given(tmp_path, discord):
+    with pytest.raises(ks.StepError) as err:
+        ks.DiscordServer().run(discord_ready(make_ctx(tmp_path, {"admins": ["citra"]})))
+    assert "bukan user ID" in err.value.message and "500000000000000003" in err.value.message
+    assert not discord.calls_matching("PUT", f"/guilds/{fd.GUILD}/members/")
 
 
 # --------------------------------------------------------------------------- langkah llm
@@ -799,9 +807,9 @@ def test_non_interactive_end_to_end(tmp_path, discord, llm, secrets_env):
 
     # perintah, berurutan
     cmds = wizard.sys.commands()
-    expected_order = ["apt-get update", "apt-get install -y git ca-certificates", "curl -fsSL https://get.docker.com -o", "sh ", "docker --version", "adduser --disabled-password --gecos  hermes",
+    expected_order = ["apt-get update", "apt-get install -y git ca-certificates", "curl --proto =https --tlsv1.2 -fsSL https://get.docker.com -o", "sh ", "docker --version", "adduser --disabled-password --gecos  hermes",
                       "usermod -aG docker hermes", "loginctl enable-linger hermes", "docker run --rm hello-world",
-                      "bash -c set -o pipefail; curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash -s -- "
+                      "bash -c set -o pipefail; curl --proto '=https' --tlsv1.2 -fsSL https://hermes-agent.nousresearch.com/install.sh | bash -s -- "
                       "--non-interactive --skip-setup", "hermes --version", "hermes doctor", "chown -R root:root",
                       "chmod -R a+rX,go-w", "hermes_team.py check", "hermes_team.py apply", "hermes_team.py managed",
                       "hermes_team.py apply", "systemctl --user enable --now hermes-usage-collect.timer",
@@ -1072,20 +1080,13 @@ def test_preflight_warnings_and_unreachable_discord(tmp_path):
 
 def test_gateway_failure_shows_logs_and_known_cause(tmp_path):
     system = FakeSystem(tmp_path, with_user=True)
-
-    def fail(cmd):
-        if cmd[:3] == ["hermes", "gateway", "status"]:
-            return ks.Result(3, "gateway: failed\n")
-        if cmd[:2] == ["hermes", "logs"]:
-            return ks.Result(0, "ERROR discord.errors.PrivilegedIntentsRequired: Shard ID None is requesting...\n")
-        return None
-
-    system.fail = fail
+    system.script_cmd("systemctl --user is-active", ks.Result(3, "failed\n"))
+    system.script_cmd("hermes logs", ks.Result(0, "ERROR discord.errors.PrivilegedIntentsRequired: Shard ID None is requesting...\n"))
     ctx = make_ctx(tmp_path, system=system)
     with pytest.raises(ks.StepError) as err:
         ks.Gateway().run(ctx)
     assert err.value.cause == "intent belum dihidupkan" and "Server Members Intent" in err.value.fix
-    assert "PrivilegedIntentsRequired" in "\n".join(ctx.lines) and system.slept == 8
+    assert "PrivilegedIntentsRequired" in "\n".join(ctx.lines) and system.slept == 0
 
 
 # --------------------------------------------------------------------------- setup.sh
@@ -1369,15 +1370,16 @@ def test_kit_copy_is_an_allowlist_not_a_copytree(tmp_path):
                                                                  ".pytest_cache", "venv", ".venv"))
     strays = [".env", "jawaban.yaml", "id_rsa", "team.yaml", "members.yaml", "catatan.txt", "rahasia.pem",
               "tests/.env", "docs/id_ed25519", "kit/jawaban-prod.yaml", "tools/.env.production"]
+    marker = "RAHASIA-" + "LOKAL"                                  # tidak boleh muncul utuh di kode uji ini
     for rel in strays:
-        (src / rel).write_text("RAHASIA-LOKAL")
+        (src / rel).write_text(marker)
     (src / "tautan").symlink_to("/etc/hostname")
     (src / "docs" / "tautan.md").symlink_to("/etc/hostname")
     dst = tmp_path / "opt" / "hermes-team"
     ks.KitInstall().run(kit_ctx(tmp_path, dst, source=src))
     for rel in strays + ["tautan", "docs/tautan.md"]:
         assert not os.path.lexists(dst / rel), rel
-    assert not [p for p in dst.rglob("*") if p.is_file() and b"RAHASIA-LOKAL" in p.read_bytes()]
+    assert not [p for p in dst.rglob("*") if p.is_file() and marker.encode() in p.read_bytes()]
     for rel in ("hermes_team.py", "kit_setup.py", "kit/cli.py", "teamctl/schema.py", "plugins/team-guard/plugin.yaml",
                 "systemd/hermes-usage-collect.timer", "tools/usage_post.py", "docker/sandbox/Dockerfile",
                 "docs/INSTALL.md", "tests/selftest.sh", "tests/test_setup.py", "VERSION", "team.example.yaml",
@@ -1855,3 +1857,46 @@ def test_downloads_force_https_and_tls12(tmp_path):
     ks.Packages().run(make_ctx(tmp_path, {"install_docker": True}, system=system))
     curl = next(c for c in system.commands() if c.startswith("curl "))
     assert curl.startswith("curl --proto =https --tlsv1.2 -fsSL https://get.docker.com -o ")
+
+
+# --------------------------------------------------------------------------- tambahan
+def test_host_system_fchown_and_real_write_file_on_a_real_descriptor(tmp_path):
+    import grp
+    import pwd
+    me = pwd.getpwuid(os.getuid()).pw_name
+    group = grp.getgrgid(os.getgid()).gr_name
+    state = ks.State(tmp_path / "var" / "s.json")
+    ctx = ks.Context(ks.HostSystem(), state, ks.Prompter({}, {}, True), user=me, etc_dir=tmp_path / "etc",
+                     out=lambda _l: None)
+    ctx.home = lambda: None                      # tulis di luar home mana pun: jalur untuk direktori milik root
+    (tmp_path / "etc").mkdir()
+    ctx.write_file(tmp_path / "etc" / ".env", "A=1\n", 0o640, me, group)
+    info = (tmp_path / "etc" / ".env").stat()
+    assert stat.S_IMODE(info.st_mode) == 0o640 and info.st_uid == os.getuid() and info.st_gid == os.getgid()
+    assert [p.name for p in (tmp_path / "etc").iterdir()] == [".env"]
+
+
+def test_from_in_dry_run_changes_nothing_but_reports_what_it_would_redo(tmp_path, discord, llm, secrets_env):
+    wizard, code = run_end_to_end(tmp_path, llm[0])
+    assert code == 0
+    frozen, calls = wizard.state_file.read_bytes(), len(wizard.sys.calls)
+    dry = Wizard(tmp_path, wizard.sys)
+    assert dry.main("--dry-run", "--from", "llm", "--non-interactive") == 0
+    assert wizard.state_file.read_bytes() == frozen and len(wizard.sys.calls) == calls
+    assert "--from llm: 9 langkah diulang" in dry.text and "sudah selesai — dilewati" not in dry.text
+
+
+def test_usage_channel_that_is_public_needs_confirmation_too(tmp_path, discord):
+    discord.add_channel("400000000000000088", "hermes-usage", parent=None, overwrites=[])
+    ctx = discord_ready(make_ctx(tmp_path, {"usage_reports": True, "timezone": "Asia/Makassar"}))
+    ctx.data.update(category_id=fd.CAT_HERMES, role_admin_id=fd.ROLE_ADMIN)
+    with pytest.raises(ks.StepError) as err:
+        ks.Options().run(ctx)
+    assert "adopt_existing_channels" in err.value.message and mutating(discord) == []
+    ctx = discord_ready(make_ctx(tmp_path / "ok", {"usage_reports": True, "timezone": "Asia/Makassar",
+                                                   "adopt_existing_channels": True}))
+    ctx.data.update(category_id=fd.CAT_HERMES, role_admin_id=fd.ROLE_ADMIN)
+    ks.Options().run(ctx)
+    assert ctx.data["usage_channel_id"] == "400000000000000088"
+    overwrites = {o["id"] for o in discord.channels["400000000000000088"]["permission_overwrites"]}
+    assert overwrites == {fd.GUILD, fd.ROLE_ADMIN, fd.BOT}

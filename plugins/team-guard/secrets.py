@@ -5,17 +5,20 @@ Murni Python (PyYAML opsional, hanya untuk membaca config.yaml profile).
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
 import threading
+import unicodedata
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Iterable, Optional
 
 from .redact import Redactor
 from .state import atomic_write, file_lock, now_iso
 
-ENV_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]{1,63}$")
+# `\Z` (bukan `$`): `$` juga cocok sebelum "\n" di akhir string. `[A-Z]` tanpa re.I/re.U → hanya ASCII.
+ENV_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]{1,63}\Z")
 SECRET_NAME_RE = re.compile(
     r"(?:^|_)(?:API_?KEY|KEY|TOKEN|SECRET|PASSWORD|PASSWD|PASS|PWD|CREDENTIALS?|AUTH|PAT|PRIVATE_KEY|DSN)(?:_|$)")
 MAX_VALUE = 8192
@@ -206,18 +209,71 @@ def stale_names(names: Iterable[str], *, reserved: Iterable[str] = (), allow: It
     return out
 
 
+class EnvWriteError(ValueError):
+    """Penulisan `.env` ditolak/dibatalkan (nilai/nama tidak aman, atau hasil tulis tidak sama dengan yang
+    diminta). Pesannya tidak pernah memuat nilai secret."""
+
+
+# Kategori Unicode yang tidak boleh ada di nilai: Cc (kontrol: \n \r \x00 \x0b \x0c \x1c-\x1e \x85 …),
+# Zl/Zp (U+2028/U+2029) — semuanya memecah baris di `str.splitlines()` yang dipakai kit DAN Hermes hulu
+# (agent/secret_scope.py::_parse_env_text) atau merusak berkas — serta Cs (surrogat tunggal, tidak bisa di-UTF-8).
+# Spasi biasa dan TAB (\t) diizinkan.
+_FORBIDDEN_CATEGORIES = frozenset({"Cc", "Cs", "Zl", "Zp"})
+
+
+def value_problem(value: str) -> str:
+    """"" = aman; "control" = karakter kontrol / pemisah baris; "template" = memuat `${` (dikembangkan Hermes)."""
+    if len(value.splitlines()) > 1 or any(
+            ch != "\t" and unicodedata.category(ch) in _FORBIDDEN_CATEGORIES for ch in value):
+        return "control"
+    if "${" in value:
+        # secret_scope._expand_dotenv_templates / env_loader._resolve_dotenv_assignments mengembang `${VAR}` dan
+        # `${VAR:-bawaan}` dari nilai dotenv; tidak ada cara meloloskannya di dalam tanda kutip.
+        return "template"
+    return ""
+
+
+MSG_VALUE_CONTROL = ("Nilai multi-baris atau berisi karakter kontrol/pemisah baris tidak didukung. Simpan sebagai "
+                     "base64 (mis. `base64 -w0 id_ed25519`) dengan nama berawalan `MY_` dan berakhiran `_B64`, "
+                     "mis. `MY_DEPLOY_KEY_B64`.")
+MSG_VALUE_TEMPLATE = ("Nilai memuat `${` — Hermes mengembang `${VAR}` saat membaca `.env` (bisa menarik nilai "
+                      "variabel lain), jadi tidak diizinkan. Simpan sebagai base64 (nama berawalan `MY_`, "
+                      "berakhiran `_B64`) bila memang perlu.")
+
+
 def check_env_value(value: Any, min_length: int = 6) -> tuple[bool, str]:
     if not isinstance(value, str):
         return False, "Nilai harus teks."
-    if "\n" in value or "\r" in value or "\x00" in value:
-        return False, ("Nilai multi-baris tidak didukung. Simpan sebagai base64 (mis. `base64 -w0 id_ed25519`) dengan "
-                       "nama berawalan `MY_` dan berakhiran `_B64`, mis. `MY_DEPLOY_KEY_B64`.")
+    problem = value_problem(value)
+    if problem == "control":
+        return False, MSG_VALUE_CONTROL
+    if problem == "template":
+        return False, MSG_VALUE_TEMPLATE
     if len(value) < int(min_length):
         return False, (f"Nilai terlalu pendek (minimal {int(min_length)} karakter) — nilai sependek itu tidak "
                        "bisa disamarkan dengan aman.")
     if len(value) > MAX_VALUE:
         return False, f"Nilai terlalu panjang (maks {MAX_VALUE} karakter)."
     return True, ""
+
+
+def normalize_env_name(raw: Any) -> str:
+    """Nama dari masukan pengguna: strip + huruf besar HANYA bila murni ASCII. `str.upper()` mengubah
+    `ſ`→`S`, `ı`→`I`, `ﬁ`→`FI`; nama non-ASCII dibiarkan apa adanya supaya ditolak `ENV_NAME_RE`."""
+    name = str(raw or "").strip()
+    return name.upper() if name.isascii() else name
+
+
+def validate_for_write(name: Any, value: Any) -> None:
+    """Pemeriksaan penulis (lapis kedua, tidak bergantung pada `check_env_name/value`): nama ASCII murni
+    berbentuk `ENV_NAME_RE`, nilai tanpa karakter kontrol / pemisah baris / `${`."""
+    if not isinstance(name, str) or not ENV_NAME_RE.match(name):
+        raise EnvWriteError("nama secret tidak valid")
+    if value is not None:
+        if not isinstance(value, str):
+            raise EnvWriteError("nilai harus teks")
+        if value_problem(value):
+            raise EnvWriteError("nilai memuat karakter yang tidak aman untuk .env")
 
 
 # ----------------------------------------------------------------------------- .env
@@ -269,6 +325,11 @@ def rewrite_env_text(text: str, key: str, value: Optional[str]) -> str:
     return ("\n".join(out) + "\n") if out else ""
 
 
+_PROFILE_LOCKS: dict[str, threading.RLock] = {}
+_PROFILE_LOCKS_GUARD = threading.Lock()
+_HELD = threading.local()
+
+
 class SecretStore:
     """Secret satu profile: `<home>/.env` + indeks nama `<home>/team-guard/secrets.json`."""
 
@@ -283,10 +344,23 @@ class SecretStore:
         self.on_change: Optional[Callable[[dict[str, str]], None]] = None
 
     # ------------------------------------------------------------------ baca
+    def _read_text(self) -> Optional[str]:
+        """Isi `.env` (None bila belum ada). Dekode seperti Hermes (agent/secret_scope.py::_decode_env_bytes):
+        UTF-8 (BOM dibuang), kalau gagal latin-1. Galat baca selain "tidak ada" dilempar — JANGAN dianggap
+        kosong, karena penulisan berikutnya akan menimpa semua secret."""
+        try:
+            raw = self.env_path.read_bytes()
+        except FileNotFoundError:
+            return None
+        try:
+            return raw.decode("utf-8-sig")
+        except UnicodeDecodeError:
+            return raw.decode("latin-1")
+
     def read_env(self) -> dict[str, str]:
         try:
-            return parse_env_text(self.env_path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeDecodeError):
+            return parse_env_text(self._read_text() or "")
+        except OSError:
             return {}
 
     def index(self) -> dict[str, dict]:
@@ -351,15 +425,53 @@ class SecretStore:
         atomic_write(self.index_path, json.dumps({"version": 1, "keys": keys}, indent=2, sort_keys=True) + "\n",
                      0o600)
 
+    @contextlib.contextmanager
+    def exclusive(self):
+        """Kunci per profile: kunci dalam-proses (satu `RLock` per berkas kunci, dibagi semua instans
+        `SecretStore`) + `flock` antar proses. Reentrant per thread. Dipakai untuk satu bagian kritis utuh:
+        cek `max_keys` + tulis `.env` + sinkron `terminal.env_passthrough`."""
+        key = str(self.lock_path)
+        with _PROFILE_LOCKS_GUARD:
+            rlock = _PROFILE_LOCKS.setdefault(key, threading.RLock())
+        with rlock:
+            held = _HELD.__dict__.setdefault("keys", set())
+            if key in held:
+                yield
+                return
+            with file_lock(self.lock_path):
+                held.add(key)
+                try:
+                    yield
+                finally:
+                    held.discard(key)
+
+    def _commit(self, old_text: Optional[str], new_text: str, expected: dict[str, str]) -> None:
+        """Tulis `new_text`, baca ulang dan pastikan hasil parse (`parse_env_text`, berbasis `splitlines()` seperti
+        Hermes) PERSIS `expected`; kalau tidak, kembalikan isi lama dan lapor. Caller memegang kunci."""
+        if parse_env_text(new_text) != expected:                 # sebelum menyentuh disk
+            raise EnvWriteError("hasil tulis .env tidak sesuai permintaan; perubahan dibatalkan")
+        atomic_write(self.env_path, new_text, 0o600)
+        try:
+            got = parse_env_text(self._read_text() or "")
+        except (OSError, ValueError):
+            got = None
+        if got != expected:
+            with contextlib.suppress(OSError):
+                if old_text is None:
+                    self.env_path.unlink()
+                else:
+                    atomic_write(self.env_path, old_text, 0o600)
+            raise EnvWriteError("verifikasi .env setelah ditulis gagal; perubahan dibatalkan")
+
     def set(self, name: str, value: str, by: str = "") -> bool:
-        """Simpan secret. True bila nama baru (bukan penggantian)."""
-        with self._lock, file_lock(self.lock_path):
-            try:
-                text = self.env_path.read_text(encoding="utf-8")
-            except OSError:
-                text = ""
-            fresh = name not in parse_env_text(text)
-            atomic_write(self.env_path, rewrite_env_text(text, name, value), 0o600)
+        """Simpan secret. True bila nama baru (bukan penggantian). `EnvWriteError` (ValueError) bila nama/nilai
+        tidak aman atau verifikasi setelah-tulis gagal (isi `.env` lama dikembalikan)."""
+        validate_for_write(name, value)
+        with self._lock, self.exclusive():
+            old_text = self._read_text()
+            previous = parse_env_text(old_text or "")
+            fresh = name not in previous
+            self._commit(old_text, rewrite_env_text(old_text or "", name, value), {**previous, name: value})
             keys = self.index()
             keys[name] = {"set_at": now_iso(), "by": str(by)}
             self._write_index(keys)
@@ -367,16 +479,16 @@ class SecretStore:
             return fresh
 
     def unset(self, name: str) -> bool:
-        with self._lock, file_lock(self.lock_path):
-            try:
-                text = self.env_path.read_text(encoding="utf-8")
-            except OSError:
-                text = ""
+        if not isinstance(name, str) or not ENV_NAME_RE.match(name):
+            return False                                   # nama tidak sah tidak mungkin tersimpan lewat set()
+        with self._lock, self.exclusive():
+            old_text = self._read_text()
+            previous = parse_env_text(old_text or "")
             keys = self.index()
-            existed = name in parse_env_text(text) and name in keys
-            if not existed:
+            if not (name in previous and name in keys):
                 return False
-            atomic_write(self.env_path, rewrite_env_text(text, name, None), 0o600)
+            self._commit(old_text, rewrite_env_text(old_text or "", name, None),
+                         {k: v for k, v in previous.items() if k != name})
             keys.pop(name, None)
             self._write_index(keys)
             self._cache = None

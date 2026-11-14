@@ -13,7 +13,7 @@ import kit_config
 import kit_paths
 from kit_base import KIT_VERSION, TeamError, rewrite_env_text
 from kit.constants import PLUGIN_NAME
-from kit.profiles import PROFILE_KINDS, SYSTEM_KINDS
+from kit.profiles import MODEL_TARGETS, PROFILE_KINDS, SYSTEM_KINDS
 from kit.util import atomic_write
 from kit.config import load_team, placeholder_ids, placeholder_message, placeholders_allowed, reload_team, team_lock
 from kit.derive import _get_nested, active_members, fallback_warnings, host_memory_mb, host_settings, install_managed, managed_diff, managed_diff_clean, managed_diff_lines, managed_install_command, managed_yaml, model_alias, nested_yaml, sandbox_limits, sandbox_warnings, sandbox_worst_case_mb
@@ -100,7 +100,7 @@ def describe(team: dict, hermes: Optional[Hermes] = None) -> str:
     default_cpu, default_memory = sandbox_limits(team)
     total, host = sandbox_worst_case_mb(team), host_memory_mb()
     lines.append(f"Sandbox: {default_memory} MB, {default_cpu} CPU per profile; plafon RAM terburuk {total} MB "
-                 f"({len(active_members(team))} anggota aktif + shared + admin)"
+                 f"({len(active_members(team))} anggota aktif + {' + '.join(SYSTEM_KINDS)})"
                  + (f" dari RAM server {host} MB" + (" — MELEBIHI" if total > host else "") if host else ""))
     for m in team["members"]:
         if m.get("sandbox"):
@@ -218,7 +218,7 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     p.add_argument("--keep-channel-access", action="store_true", help="jangan cabut izin melihat channel")
     p.add_argument("--events", action="store_true")
     p = sub.add_parser("set-model", parents=[common], help="ganti model")
-    p.add_argument("target", help="nama anggota | all | shared | admin | lobby")
+    p.add_argument("target", help="nama anggota | all | " + " | ".join(MODEL_TARGETS))
     p.add_argument("model", help="alias di llm.models")
     p = sub.add_parser("set-sandbox", parents=[common], help="batas RAM/CPU sandbox khusus satu anggota")
     p.add_argument("member", help="nama anggota")

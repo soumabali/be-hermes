@@ -270,6 +270,9 @@ def discord_edit_channel(ctl, args: dict) -> PlanFn:
         ch = srv.channel(args.get("channel"))
         srv.refuse_personal(ch, "diubah")
         kind = srv.channel_kind(ch)
+        if srv.is_team_thread(ch):
+            raise ToolError(f"{srv.channel_label(ch)} adalah {kind}: thread di channel tim tidak bisa diubah "
+                            "(nama, arsip, kunci, slowmode) lewat Hermes; ubah manual di Discord bila perlu")
         body: dict = {}
         changes = []
         if args.get("name"):
@@ -536,7 +539,7 @@ def discord_edit_role(ctl, args: dict) -> PlanFn:
             if old & ht.ELEVATED_MASK and not srv.conf["allow_elevated_permissions"]:
                 raise ToolError(f"role {label} memuat izin tinggi ({_perm_list(old & ht.ELEVATED_MASK)}); izinnya "
                                 "tidak bisa diubah/dilucuti lewat Hermes — atur manual di Discord")
-            srv.check_bits(bits, "izin role")
+            srv.check_bits(bits, "izin role", existing=old)
             added, removed = bits & ~old, old & ~bits
             body["permissions"] = str(bits)
             changes.append(f"izin → [{_perm_list(bits, 'kosong')}]; DITAMBAH: [{_perm_list(added)}]; "
