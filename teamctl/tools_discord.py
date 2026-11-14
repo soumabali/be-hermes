@@ -404,7 +404,7 @@ def _perm_effect(srv, ch, target_id, target_label, kind_id, target_member, new_o
 
 def _perm_preview(srv, kind, remove, target_id, target_label, where, effect, after, old, new) -> str:
     note = ""
-    if kind == "channel admin tim" and after & VIEW and target_id not in srv.admins:
+    if kind in srv.admin_labels and after & VIEW and target_id not in srv.admins:
         note = (" Catatan: ini #hermes-admin — yang bukan admin tim tetap tidak dilayani Hermes, tapi bisa "
                 "membaca isinya.")
     old_allow, old_deny = old
@@ -654,7 +654,7 @@ def discord_assign_role(ctl, args: dict) -> PlanFn:
                 raise ToolError(f"role {role_text} punya izin tinggi di {srv.channel_label(ch)} "
                                 f"({_perm_list(allow & ht.ELEVATED_MASK)}) — berikan manual lewat Discord")
             kind = srv.channel_kind(ch)
-            if allow & VIEW and (srv.is_personal(ch) or kind == "channel admin tim"):
+            if allow & VIEW and (srv.is_personal(ch) or kind in srv.admin_labels):
                 raise ToolError(f"role {role_text} membuka {kind} {srv.channel_label(ch)} — tidak bisa diberikan "
                                 "lewat Hermes")
         roles_now = [str(r) for r in member.get("roles") or []]
@@ -664,7 +664,7 @@ def discord_assign_role(ctl, args: dict) -> PlanFn:
         opened = [c for cid, c in srv.visible_private(roles_now + [rid], uid).items() if cid not in before]
         for ch in opened:
             kind = srv.channel_kind(ch)
-            if srv.is_personal(ch) or kind == "channel admin tim":
+            if srv.is_personal(ch) or kind in srv.admin_labels:
                 raise ToolError(f"role {role_text} membuat {label} bisa melihat {kind} {srv.channel_label(ch)} — "
                                 "tidak bisa diberikan lewat Hermes")
         ob = team["onboarding"]

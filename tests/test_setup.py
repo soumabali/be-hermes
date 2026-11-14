@@ -1686,7 +1686,9 @@ def test_plain_http_to_a_public_host_needs_explicit_approval(tmp_path, host):
 def test_plain_http_to_loopback_or_private_hosts_is_fine(tmp_path, host):
     system = FakeSystem(tmp_path, with_user=True)
     system.http_json = lambda *a, **k: (200, {"data": []})
-    ks.LLMEndpoint().run(make_ctx(tmp_path, {"llm_base_url": f"http://{host}:8080/v1"}, system=system))
+    ctx = make_ctx(tmp_path, {"llm_base_url": f"http://{host}:8080/v1"}, system=system)
+    ks.LLMEndpoint().run(ctx)
+    assert not [w for w in ctx.warnings if "http" in w.lower()]           # loopback / jaringan privat: tanpa peringatan
 
 
 def test_plain_http_can_be_declined_interactively(tmp_path):

@@ -26,13 +26,13 @@ DEFAULT_TEAM_DIR = kit_paths.team_dir()     # nilai saat impor; pakai kit_paths.
 PROFILE_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")     # aturan nama profile Hermes
 
 
-NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,40}$")         # nama anggota
+NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,40}\Z")         # nama anggota
 
 
 ALIAS_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,79}$")
 
 
-ENV_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]{1,63}$")
+ENV_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]{1,63}\Z")
 
 
 

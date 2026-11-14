@@ -8,7 +8,7 @@
 | Ganti model | Chat atau `set-model`; berlaku di sesi baru |
 | Ubah batas skala / sandbox / provider | Edit `team.yaml` → `apply` → `managed` → pasang ulang `/etc/hermes/config.yaml` → `/restart` |
 | Update kit | Lihat [Upgrade](INSTALL.md#upgrade-dari-v30): perbarui `/opt/hermes-team` → `apply` → `managed --install` → `apply` → `/restart`; perubahan ada di `CHANGELOG.md` |
-| Pasang kebijakan managed | `sudo python3 /opt/hermes-team/hermes_team.py managed --install …` dari salinan kit milik root (bukan dari folder user); selain itu ditolak |
+| Pasang kebijakan managed | `sudo python3 /opt/hermes-team/hermes_team.py managed --install …` dari salinan kit milik root (bukan dari folder user). Kit user-owned ditolak, tetapi itu hanya pencegah salah pasang: kode kit sudah diimpor sebelum pemeriksaan, jadi pastikan sendiri `/opt/hermes-team` milik root |
 | Hapus anggota permanen | Nonaktifkan dulu, lalu `hermes_team.py remove-member <nama> --delete-profile --delete-channel` (`--dry-run` untuk melihat dulu) |
 | Cek berkas managed | `hermes_team.py managed --diff` |
 | Versi kit | `hermes_team.py --version` |

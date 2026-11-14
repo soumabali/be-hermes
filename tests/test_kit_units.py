@@ -3426,3 +3426,38 @@ class TestSharedSkillTargetsFollowRegistry:
         from kit import skills as kit_skills
         team = self._ops(kit, register_kind, role="admin", admin_routes=True, free_response=True)
         assert kit_skills.shared_brain_kinds(team) == [("shared", "team-shared")]
+
+
+class TestAuditFollowUps:
+    """Temuan audit independen: setiap perbaikan punya uji sendiri."""
+
+    @pytest.mark.parametrize("value", ["bob\n", "bob\r\n"])
+    def test_member_name_regex_rejects_trailing_newline(self, value):
+        from kit.constants import NAME_RE
+        assert NAME_RE.match("bob") and not NAME_RE.match(value)
+
+    def test_env_name_regex_rejects_trailing_newline(self):
+        from kit.constants import ENV_NAME_RE
+        assert ENV_NAME_RE.match("TD_KEY") and not ENV_NAME_RE.match("TD_KEY\n")
+
+    def test_corrupt_tombstone_file_is_kept_as_backup_not_silently_dropped(self, kit, capsys):
+        from kit import membership
+        team = kit.team()
+        path = membership.removed_channels_path(team)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{bukan json")
+        membership.record_removed_channel(team, {"name": "budi", "channel_id": "123456789012345678"})
+        backups = list(path.parent.glob(path.name + ".corrupt-*"))
+        assert len(backups) == 1 and backups[0].read_text() == "{bukan json"
+        assert "PERINGATAN" in capsys.readouterr().err
+        assert "123456789012345678" in json.loads(path.read_text())["channels"]
+
+    def test_admin_channel_guard_follows_registry_role(self, kit, register_kind):
+        from teamctl.discord_guard import Server
+        register_kind(kit_profiles.ProfileKind(
+            "oncall", ht.SOUL_SHARED, kit_profiles._shared_settings, needs_channel=True, reserved=True,
+            model_target=True, channel_label="channel oncall", role="admin"))
+        llm = {**__import__("conftest").LLM, "oncall_model": "td-normal"}
+        kit.write_team(oncall={"profile": "team-oncall", "channel_id": OPS_CH}, llm=llm)
+        srv = Server(kit.team(), object())
+        assert srv.admin_labels == {"channel admin tim", "channel oncall tim"}

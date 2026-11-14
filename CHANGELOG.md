@@ -7,6 +7,9 @@ Versi plugin (`plugins/team-guard/plugin.yaml`) dan `pyproject.toml` mengikutiny
 ## [Belum dirilis]
 
 ### Perbaikan hasil audit putaran kedua
+- Hasil audit independen atas perbaikan: wizard tidak lagi melebarkan izin baca pada direktori kit yang dipakai di tempat
+  (hanya `go-w`); `removed_channels.json` yang rusak disimpan sebagai `.corrupt-<waktu>` dengan peringatan (bukan dibuang diam-diam);
+  penjaga channel admin di tool Discord diturunkan dari `role` registri, bukan label teks; `NAME_RE`/`ENV_NAME_RE` memakai `\Z`.
 - `docs/AKSEPTANSI.md`: daftar pemeriksaan server sungguhan (B1–B20) dan pekerjaan kode tersisa menuju 10/10; `sandbox_idle` kini terbukti memakai Docker dengan benar (hentikan yang diam, biarkan yang sibuk, tidak `rm`).
 - **Wizard `setup.sh`**: kesiapan gateway diperiksa lewat `systemctl --user is-active` + polling 60 dtk + cek stabil
   (bukan sekadar perintah start sukses); `--kit-dir` divalidasi; penulisan sebagai root tanpa mengikuti symlink;
@@ -26,7 +29,8 @@ Versi plugin (`plugins/team-guard/plugin.yaml`) dan `pyproject.toml` mengikutiny
 - **Inti kit**: jenis profile yang didaftarkan di `PROFILE_KINDS` kini terhubung penuh (rute, skema, model);
   `hermes_team.py config-doc --write docs/KONFIGURASI.md`; nilai kosong untuk profile/`auto_skills` kembali diterima
   (memakai bawaan); `remove-member` menulis `state/removed_channels.json`; `managed --install` sebagai root menolak
-  kit yang bisa ditulis user (`--allow-user-owned-kit` untuk pengecualian).
+  kit yang bisa ditulis user (`--allow-user-owned-kit` untuk pengecualian; ini pencegah salah pasang, bukan
+  perlindungan terhadap kit yang sudah diubah, karena kodenya sudah diimpor sebelum pemeriksaan).
 - Ledger pemakaian menolak skema yang lebih baru dari kit (`LedgerError`: perbarui kit); `kit_doctor.check_discord_setup` dipecah.
 
 ### Struktur dan kemudahan dikembangkan (hasil audit arsitektur)

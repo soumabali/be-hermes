@@ -2131,7 +2131,9 @@ class KitInstall(Step):
         else:
             target = self.install_copy(ctx, src, dst)
         ctx.run(["chown", "-R", "root:root", str(target)], what="chown kit")
-        ctx.run(["chmod", "-R", "a+rX,go-w", str(target)], what="chmod kit")
+        # Hanya salinan buatan wizard (allowlist) yang boleh dibuka bacanya; direktori yang dipakai di tempat
+        # mungkin memuat .env / team.yaml / kunci milik operator, jadi cukup cabut tulis grup/lain.
+        ctx.run(["chmod", "-R", "a+rX,go-w" if target != dst else "go-w", str(target)], what="chmod kit")
         if target != dst:
             self.swap(ctx, target, dst)
 

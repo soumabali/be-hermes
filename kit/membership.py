@@ -1,9 +1,12 @@
 """Bagian dari kit tim (dipecah dari hermes_team.py). Lihat docs/KONTRAK.md dan README."""
 from __future__ import annotations
 import json
+import os
 import re
 import shlex
 import shutil
+import sys
+import time
 import unicodedata
 from pathlib import Path
 from typing import Any, Callable, Iterable, Optional
@@ -868,14 +871,29 @@ def removed_channels_path(team: dict) -> Path:
     return Path(team["paths"]["state_dir"]) / REMOVED_CHANNELS_FILE
 
 
+def _quarantine_removed_channels(path: Path) -> None:
+    """File nisan rusak: simpan salinannya (`.corrupt-<waktu>`) dan beri tahu, jangan diam-diam membuang isinya."""
+    backup = path.with_name(f"{path.name}.corrupt-{int(time.time())}")
+    try:
+        os.replace(path, backup)
+        print(f"PERINGATAN: {path} rusak; disimpan sebagai {backup} dan dibuat baru. Periksa isinya: nisan lama "
+              "mungkin perlu dipulihkan agar channel anggota yang dikeluarkan tetap terlindungi.", file=sys.stderr)
+    except OSError:
+        pass
+
+
 def _load_removed_channels(path: Path) -> dict:
     """Isi `removed_channels.json` yang sah; berkas hilang / rusak / bentuk salah → daftar kosong baru."""
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
     except (OSError, ValueError):
+        _quarantine_removed_channels(path)
         return {}
     channels = data.get("channels") if isinstance(data, dict) else None
     if not isinstance(channels, dict):
+        _quarantine_removed_channels(path)
         return {}
     return {str(cid): entry for cid, entry in channels.items() if isinstance(entry, dict)}
 

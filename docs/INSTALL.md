@@ -284,6 +284,8 @@ python3 $H apply                  # pertama kali: beberapa menit
 Pasang kebijakan *managed* (dipin untuk semua profile, tidak bisa diubah anggota). Perintah ini
 menjalankan kode kit sebagai root, jadi kit harus berada di tempat milik root dan tidak bisa ditulis
 group/other (wizard memakai `/opt/hermes-team`); dari salinan milik user, perintah ditolak.
+Pemeriksaan ini mencegah salah pasang, BUKAN perlindungan terhadap kit yang sudah dimodifikasi: Python sudah mengimpor
+kode kit sebelum pemeriksaan jalan. Pastikan sendiri bahwa `/opt/hermes-team` milik root sebelum menjalankan `sudo`.
 `--allow-user-owned-kit` hanya untuk uji atau pengaturan tak lazim:
 
 ```bash

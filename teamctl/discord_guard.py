@@ -129,6 +129,8 @@ class Server:
         self.removed = load_tombstones(team)                                # anggota yang sudah dikeluarkan permanen
         self.team_channels = {team[k]["channel_id"]: f"{PROFILE_KINDS[k].channel_label or 'channel ' + k} tim"
                               for k in SYSTEM_KINDS}               # shared, admin, + jenis terdaftar lain
+        self.admin_labels = {f"{PROFILE_KINDS[k].channel_label or 'channel ' + k} tim"
+                             for k in SYSTEM_KINDS if PROFILE_KINDS[k].role == "admin"}
         report = str(((team.get("usage") or {}).get("report_channel_id")) or "")
         if report:
             self.team_channels.setdefault(report, "channel laporan pemakaian tim")
