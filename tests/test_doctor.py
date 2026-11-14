@@ -355,7 +355,7 @@ def test_managed_file_missing_is_error_with_install_command(env):
 def test_managed_drift_is_warning_listing_keys_and_clean_file_is_silent(env):
     team, _root, tmp = env
     folder = tmp / "etc-hermes"
-    ht.install_managed(team, target_dir=folder, euid=0)
+    ht.install_managed(team, target_dir=folder, euid=0, allow_user_owned_kit=True)
     assert [i for i in managed_report(team, folder).items if i["area"] == "managed"] == []
     data = yaml.safe_load((folder / "config.yaml").read_text())
     data["agent"]["max_turns"] = 7
@@ -374,7 +374,7 @@ def test_managed_drift_is_warning_listing_keys_and_clean_file_is_silent(env):
 def test_keys_moved_out_of_managed_are_an_error_with_the_three_step_fix(env):
     team, _root, tmp = env
     folder = tmp / "etc-hermes"
-    ht.install_managed(team, target_dir=folder, euid=0)
+    ht.install_managed(team, target_dir=folder, euid=0, allow_user_owned_kit=True)
     data = yaml.safe_load((folder / "config.yaml").read_text())
     data["terminal"].update({"container_cpu": 1, "container_memory": 1024})
     data["compression"]["threshold_tokens"] = 64000
@@ -394,7 +394,7 @@ def test_managed_env_must_exist_be_private_and_hold_every_key_env(env):
     (tmp / "team" / "team.yaml").write_text(yaml.safe_dump(dict(TEAM, llm=LLM)))
     team = ht.load_team(tmp / "team" / "team.yaml")
     folder = tmp / "etc-hermes"
-    ht.install_managed(team, target_dir=folder, euid=0)
+    ht.install_managed(team, target_dir=folder, euid=0, allow_user_owned_kit=True)
     env_file = folder / ".env"
     rep = managed_report(team, folder)
     item = next(i for i in rep.items if ".env" in i["message"])
@@ -421,7 +421,7 @@ def test_managed_env_per_user_keys_downgrades_missing_key_to_warning(env):
     (tmp / "team" / "team.yaml").write_text(yaml.safe_dump(dict(TEAM, llm=dict(LLM, per_user_keys=True))))
     team = ht.load_team(tmp / "team" / "team.yaml")
     folder = tmp / "etc-hermes"
-    ht.install_managed(team, target_dir=folder, euid=0)
+    ht.install_managed(team, target_dir=folder, euid=0, allow_user_owned_kit=True)
     rep = managed_report(team, folder)
     assert rep.errors == 0 and any("per_user_keys" in i["message"] for i in rep.items)
 
@@ -517,7 +517,7 @@ def test_main_runs_system_checks_with_injected_runner(env, monkeypatch, capsys):
     out = json.loads(capsys.readouterr().out)
     assert [i["area"] for i in out["items"] if i["level"] == "error"] == ["managed"]
     assert {c[0] for c in calls} == {"loginctl", "systemctl"}
-    ht.install_managed(team, target_dir=folder, euid=0)
+    ht.install_managed(team, target_dir=folder, euid=0, allow_user_owned_kit=True)
     assert kd.main(argv, run=run) == 0
 
 
@@ -712,7 +712,7 @@ def test_main_discord_runs_preflight_before_gateway_and_with_no_members(env, ser
     team = team_with(tmp)
     sync(team, root)
     folder = tmp / "etc-hermes"
-    ht.install_managed(team, target_dir=folder, euid=0)
+    ht.install_managed(team, target_dir=folder, euid=0, allow_user_owned_kit=True)
     monkeypatch.setenv("HERMES_MANAGED_DIR", str(folder))
     monkeypatch.setenv("HERMES_TEAM_ALLOW_PLACEHOLDERS", "1")
     run = runner({"loginctl": (0, "Linger=yes"), "hermes-usage-collect.timer": (0, "enabled"),

@@ -11,6 +11,7 @@ import re
 import socket
 import stat
 import subprocess
+import types
 import urllib.error
 
 import pytest
@@ -2560,14 +2561,15 @@ class TestManagedDiffAndInstall:                                                
     def test_install_writes_atomically_with_0644(self, kit, monkeypatch, capsys):
         team = kit.team()
         target = kit.managed_dir / "sub" / "config.yaml"
-        path = ht.install_managed(team, target_dir=target.parent, euid=0)
+        path = ht.install_managed(team, target_dir=target.parent, euid=0, allow_user_owned_kit=True)
         assert path == target and stat.S_IMODE(target.stat().st_mode) == 0o644
         assert target.read_text() == ht.managed_yaml(team)
         assert [p.name for p in target.parent.iterdir()] == ["config.yaml"]          # tanpa berkas sementara
-        assert ht.install_managed(team, target_dir=kit.managed_dir / "kering", euid=0, dry_run=True)
+        assert ht.install_managed(team, target_dir=kit.managed_dir / "kering", euid=0, dry_run=True,
+                                  allow_user_owned_kit=True)
         assert not (kit.managed_dir / "kering").exists()
         monkeypatch.setattr(ht.os, "geteuid", lambda: 0)
-        ht.main(cli(kit, "managed", "--install"))
+        ht.main(cli(kit, "managed", "--install", "--allow-user-owned-kit"))
         assert "ditulis (0644)" in capsys.readouterr().out
         assert ht.managed_diff_clean(ht.managed_diff(team))
         ht.main(cli(kit, "managed"))                                                 # tanpa flag: tetap mencetak YAML
@@ -3335,7 +3337,14 @@ class TestManagedInstallKitTrust:
         (copy / "hermes_team.py").write_text("# x\n")
         (copy / "kit" / "a.py").write_text("# x\n")
         os.chmod(copy / "kit" / "a.py", 0o666)
-        bad = ht.untrusted_kit_paths(copy)
+        from kit import derive as kit_derive
+        real_stat = kit_derive._kit_stat
+
+        def as_root_owned(path):                  # kepemilikan tak relevan di sini; yang diuji: bit mode dari stat sungguhan
+            info = real_stat(path)
+            return types.SimpleNamespace(st_uid=0, st_mode=info.st_mode)
+
+        bad = ht.untrusted_kit_paths(copy, stat_fn=as_root_owned)
         assert any("a.py" in line and "bisa ditulis" in line for line in bad)
 
     def test_uid_lookups_are_injectable_so_tests_pass_unprivileged_too(self, tmp_path):
