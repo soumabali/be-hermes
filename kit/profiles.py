@@ -150,7 +150,7 @@ class _KindView(collections.abc.Sequence):
 class _ReservedView(collections.abc.Set):
     @staticmethod
     def _names() -> frozenset:
-        return frozenset(GENERIC_RESERVED | {k.name for k in PROFILE_KINDS.values() if k.reserved})
+        return frozenset(GENERIC_RESERVED | {k.name for k in PROFILE_KINDS.values() if k.reserved or k.needs_channel})
 
     @classmethod
     def _from_iterable(cls, it):

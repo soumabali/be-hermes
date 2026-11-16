@@ -716,6 +716,12 @@ class TestDiscordClient:
             api.request("POST", f"/guilds/{fd.GUILD}/channels", {"name": "x", "type": 0})
         assert err.value.status == status and api.naps == []
 
+    def test_patch_is_not_retried_on_5xx(self, api, discord):
+        discord.fault("PATCH", f"/channels/{BE1_CH}", status=503, times=1)
+        with pytest.raises(ht.DiscordHTTPError) as err:
+            api.request("PATCH", f"/channels/{BE1_CH}", {"topic": "x"})
+        assert err.value.status == 503 and api.naps == []
+
     def test_persistent_5xx_raises_http_error(self, api, discord):
         discord.fault("GET", "/users/@me", status=503, times=10)
         with pytest.raises(ht.DiscordHTTPError) as err:
@@ -3426,6 +3432,25 @@ class TestSharedSkillTargetsFollowRegistry:
         from kit import skills as kit_skills
         team = self._ops(kit, register_kind, role="admin", admin_routes=True, free_response=True)
         assert kit_skills.shared_brain_kinds(team) == [("shared", "team-shared")]
+
+    def test_unshare_still_reaches_a_kind_whose_role_became_admin(self, skills_kit, register_kind):
+        """Role jenis diubah jadi admin SETELAH skill terpasang: salinannya tetap bisa dicabut."""
+        import dataclasses
+        kit = skills_kit
+        team = self._ops(kit, register_kind)
+        kit.home("team-ops").mkdir(parents=True, exist_ok=True)
+        kit.make_skill("be-be1", "deploy-checklist")
+        shared = ht.share_skill(team, kit.hermes(), "deploy-checklist", "be1", ["all"])
+        copy = kit.home("team-ops") / "skills" / "shared" / "deploy-checklist"
+        assert "ops" in shared["results"] and copy.is_dir()
+        register_kind(dataclasses.replace(kit_profiles.PROFILE_KINDS["ops"], role="admin"))
+        ht.unshare_skill(kit.team(), kit.hermes(), "deploy-checklist")
+        assert not copy.exists()
+
+    def test_channel_bearing_kind_name_is_always_reserved(self, kit, register_kind):
+        """Jenis ber-channel yang lupa diberi reserved=True tetap tidak boleh jadi nama anggota (tujuan berbagi ambigu)."""
+        register_kind(kit_profiles.ProfileKind("ops", ht.SOUL_SHARED, kit_profiles._shared_settings, needs_channel=True))
+        assert "ops" in ht.RESERVED_NAMES
 
 
 class TestAuditFollowUps:

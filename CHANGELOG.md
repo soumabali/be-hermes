@@ -7,6 +7,8 @@ Versi plugin (`plugins/team-guard/plugin.yaml`) dan `pyproject.toml` mengikutiny
 ## [Belum dirilis]
 
 ### Perbaikan hasil audit putaran kedua
+- Sisa audit ulang: `unshare-skill` menjangkau semua jenis ber-channel (salinan tetap bisa dicabut walau role jenis berubah);
+  nama jenis ber-channel selalu dicadangkan; uji untuk PATCH tanpa pengulangan dan penjaga channel admin pada jenis baru ber-role admin.
 - Audit ulang kedua: `removed_channels.json` yang tidak terbaca (izin/I-O) kini galat jelas, bukan dikarantina; entri nisan
   berbentuk aneh dipertahankan; `cron_exempt` hanya berlaku bila boolean `true` dan tidak pernah untuk profile anggota;
   galat penjaga cron tidak lagi memblokir `list`; kit yang dipakai di tempat tetap terbaca user hermes (hanya kode kit).

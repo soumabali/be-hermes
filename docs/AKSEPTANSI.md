@@ -11,7 +11,7 @@ yang tersisa. Centang hanya setelah perintahnya benar-benar dijalankan dan kelua
 | Uji unit + integrasi hijau terhadap Hermes sungguhan (versi terpin dan `main`) | CI `ci.yml`: unit Python 3.10/3.11/3.14, integrasi `KIT_REQUIRE_HERMES=1` |
 | Titik masuk jalan dari salinan lain / `python -I` | `tests/test_entrypoints.py` |
 | `sandbox_idle` memakai Docker dengan benar: hentikan yang diam, biarkan yang sibuk, tidak pernah `rm` | Dijalankan terhadap container berlabel sungguhan (Docker 29.9.2); lihat docstring `tools/sandbox_idle.py` |
-| POST tidak diulang pada 5xx Discord (PATCH memakai jalur kode yang sama, tanpa uji sendiri) | `tests/test_kit_units.py` (`test_post_is_not_retried_on_5xx`) |
+| POST dan PATCH tidak diulang pada 5xx Discord | `tests/test_kit_units.py` (`test_post_is_not_retried_on_5xx`, `test_patch_is_not_retried_on_5xx`) |
 
 ## B. Menunggu server uji (butuh Discord, Hermes, systemd, Docker sungguhan)
 

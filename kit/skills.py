@@ -456,7 +456,11 @@ def _unshare_skill(team: dict, hermes: Hermes, skill: str, targets: Iterable[str
         raise TeamError(f"skill '{skill}' tidak ada di daftar skill yang dibagikan")
     wanted = [str(t).strip().lower() for t in targets]
     everyone = any(t in ("all", "semua") for t in wanted)
-    candidates = [(m["name"], m["profile"]) for m in team["members"]] + shared_brain_kinds(team)
+    # Pencabutan menjangkau SEMUA jenis ber-channel (bukan hanya penerima saat ini): bila role sebuah jenis diubah
+    # menjadi admin setelah skill terpasang, salinannya tetap bisa dicabut. Aman: hanya salinan yang asal-usulnya
+    # cocok dengan registri yang dihapus.
+    system = [(k, team[k]["profile"]) for k in SYSTEM_KINDS if (team.get(k) or {}).get("profile")]
+    candidates = [(m["name"], m["profile"]) for m in team["members"]] + system
     results = {}
     for name, profile in candidates:
         if not everyone and name not in wanted:

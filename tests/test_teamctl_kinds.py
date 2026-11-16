@@ -62,3 +62,20 @@ def test_registered_kind_channel_refuses_rename_and_permission_removal(tc, ops):
     with pytest.raises(tm.ToolError, match="tidak bisa dihapus lewat Hermes"):
         ctl.call("discord_set_channel_permissions", channel=OPS_CH, target="@everyone", remove=True)
     assert ctl.previews == []
+
+
+def test_admin_role_kind_channel_blocks_assign_role_like_the_builtin_admin_channel(tc, register_kind):
+    """Penjaga channel admin mengikuti `role="admin"` di registri: role yang membuka channel jenis itu tidak bisa diberikan."""
+    from teamctl_helpers import overwrite, set_overwrites, mutating
+    from teamctl.discord_guard import VIEW
+    register_kind(kit_profiles.ProfileKind(
+        "oncall", ht.SOUL_SHARED, kit_profiles._shared_settings, needs_channel=True, reserved=True,
+        model_target=True, channel_label="channel oncall", role="admin"))
+    tc.patch_team(oncall={"profile": "team-oncall", "channel_id": OPS_CH})
+    add_channel(tc.state, OPS_CH, "hermes-oncall", parent=fd.CAT_HERMES,
+                overwrites=[overwrite(fd.GUILD, deny=VIEW), overwrite(fd.ROLE_DESIGN, allow=VIEW)])
+    ctl = tc.ctl()
+    before = len(mutating(tc.state))
+    with pytest.raises((tm.ToolError, ht.TeamError), match="channel oncall tim"):
+        ctl.call("discord_assign_role", user="citra", role="designer")
+    assert ctl.previews == [] and len(mutating(tc.state)) == before
