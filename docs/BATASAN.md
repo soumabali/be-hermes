@@ -35,3 +35,26 @@
   yang sudah dimodifikasi (kodenya sudah diimpor sebelum pemeriksaan).
 - Nilai `/env-set` diperiksa dengan pengurai `.env` milik kit sendiri; kecocokannya dengan pengurai dotenv Hermes
   sungguhan baru dibuktikan oleh uji integrasi di CI, bukan oleh uji unit.
+
+## Batasan setelah audit ketiga
+
+- Orang yang hanya memegang role admin Discord tetapi tidak tercantum di `admins` maupun anggota aktif tidak dilayani
+  (pesan "belum terdaftar"). Anggota baru juga ditolak beberapa detik sampai onboarding menulis roster.
+- Roster salah bentuk saat gateway baru start (belum ada roster sah): dipakai dengan nilai aman, tetapi bila daftar
+  `channels` sendiri rusak, channel tim tidak dikenali dan gerbang/pembatas tidak berlaku sampai `hermes_team.py apply`.
+- Galat sebelum lingkup pesan diketahui: pesan tetap diteruskan (token tetap disamarkan). Galat di satu pembatas:
+  pembatas itu dilewati (gagal-terbuka); `limiter.<nama>` di capabilities.json tidak kembali sehat sampai gateway di-restart.
+- Penjaga cron menolak bentuk jadwal yang sah bagi Hermes tetapi tidak dikenalnya (mis. `every 1.5h`, `tomorrow 9am`).
+  Satuan detik dan makro `@…` diurai tanpa konfirmasi bahwa Hermes menerimanya.
+- Guard dump environment tetap upaya-terbaik: path `/proc` yang dirakit dari variabel, `vars(os)['environ']`, dan pemecahan
+  secret per karakter tidak tertangkap. Token pengguna Discord (bukan bot) dan `pk_live_` tidak disamarkan.
+- Anggaran tetap tidak memblokir saat buku besar tidak terbaca; kini hanya terlihat (log, `budget.stale`, `budget.ledger`).
+- Toolset baru dari Hermes tetap aktif otomatis di profile pekerja sampai kit diperbarui: uji drift di CI gagal saat hulu
+  menambah toolset, tetapi server yang memperbarui Hermes tanpa memperbarui kit tidak terlindungi.
+- Penjaga sandbox berjalan saat `apply`/onboarding, bukan terus-menerus: managed yang dihapus setelahnya baru ketahuan di
+  `apply` berikutnya atau `kit_doctor`. Nilai `docker_volumes` / `docker_extra_args` tidak dinilai (lihat `managed --diff`).
+  `sandbox.allow_unmanaged: true` mematikan penjaga ini.
+- User `hermes` anggota grup `docker`, jadi setara root di server itu. Kit milik root dan kebijakan managed bukan batas
+  terhadap gateway yang sudah dikuasai penyerang.
+- Pemulihan cadangan, pindah server, `hermes_repin`, dan pemantau gateway belum pernah dijalankan di server sungguhan.
+- Probe kapabilitas hanya memeriksa keberadaan nama di sumber Hermes, bukan tanda tangan atau perilakunya.

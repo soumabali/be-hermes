@@ -6,6 +6,43 @@ Versi plugin (`plugins/team-guard/plugin.yaml`) dan `pyproject.toml` mengikutiny
 
 ## [Belum dirilis]
 
+### Perbaikan hasil audit ketiga (keamanan, kemudahan dikembangkan, instalasi dan operasi)
+- **Keamanan, sandbox wajib:** `apply`, `onboard`, `onboard-batch`, `add-member`, dan `set-active on` menolak (dengan perintah
+  `sudo … managed --install` persisnya) bila `/etc/hermes/config.yaml` belum mem-pin sandbox Docker. `apply` pertama pada
+  instalasi baru hanya memprovisi profile; rute dan roster ditulis setelah managed terpasang. Jalan keluar:
+  `sandbox.allow_unmanaged: true` (diperingatkan keras).
+- **Keamanan, toolset:** profile pekerja memakai daftar toolset yang DIIZINKAN (`WORKER_ALLOWED_TOOLSETS`); uji integrasi
+  gagal bila Hermes menambah toolset yang belum diputuskan. Perilaku untuk toolset yang dikenal tidak berubah.
+- **Plugin team-guard:** roster.json salah bentuk tidak lagi mematikan gerbang (pembacaan total per field; roster sah terakhir
+  dipertahankan); tiap tahap `pre_gateway_dispatch` terisolasi (gerbang akses dan penyamaran token gagal-tertutup, tiap
+  pembatas gagal-terbuka sendiri); **non-admin hanya dilayani bila terdaftar aktif di roster** (pemegang role yang belum ada
+  di roster ditolak dengan pesan); satu tabel penolakan (`refusals.REFUSALS`), jenis tak terdaftar tetap menolak; penjaga
+  cron menolak jadwal yang tidak dipahaminya dan mengurai satuan detik serta makro `@hourly` dkk.; penyamaran chat mengenali
+  token bot Discord dan kunci `sk_live_`/`rk_live_`; guard dump environment mengenali glob `/proc/*/environ` dan alias
+  `os.environ`; `capabilities.json` memuat probe baru dan entri kesehatan `budget.ledger` / `limiter.<nama>`;
+  onboarding.json rusak disalin ke `.rusak`.
+- **teamctl:** teks buatan anggota tidak lagi sampai mentah ke AI admin (`list_member_skills`, `team_status`, `usage_report`,
+  `onboarding_status` dibersihkan dan diapit `<<<DATA-TIM …>>>`; galat tool satu baris bersih). Konfirmasi `share_skill`
+  menampilkan penerima sebenarnya, daftar berkas, dan cuplikan 600 karakter SKILL.md; tujuan salah ditolak sebelum konfirmasi.
+  `audit.log` 0600 tanpa mengikuti symlink. SOUL admin menyebut semua tool dan diuji terhadap registri. Menambah tool admin =
+  tiga hal terdokumentasi (dua uji gagal dengan pesan berisi nilainya).
+- **Kemudahan dikembangkan:** `ProfileKind.optional` (jenis ber-channel baru tidak mewajibkan blok `<jenis>` di setiap
+  `team.yaml`); `PROFILE_RE`, `ALIAS_RE`, nama provider memakai `\Z`.
+- **Wizard:** memasang Hermes pada commit yang diuji CI (berkas baru `HERMES_REF`, installer dipanggil dengan `--commit`,
+  commit terpasang dicatat dan dibandingkan; `hermes_pin` / `hermes_repin`); selftest bawaannya ya; langkah `gateway`
+  memeriksa unit benar-benar aktif saat diulang; menanyakan `daily_token_budget`, `team_daily_token_budget`,
+  `max_llm_parallel` dengan nilai saran (3 juta / 30 juta / 10, titik awal, bukan hasil ukur); menawarkan timer
+  `hermes-sandbox-idle` (hanya melapor) dan pemantau `hermes-gateway-watch`; berhenti di OS tanpa `apt-get`.
+  **Perubahan perilaku:** berkas jawaban lama tanpa kunci baru kini menghasilkan anggaran dan batas LLM paralel bukan nol.
+- **Baru:** `tools/gateway_watch.py` + unit `hermes-gateway-watch.*` (pesan webhook saat gateway mati/pulih),
+  `tools/hermes_contract.py` (daftar tunggal perintah Hermes yang dipakai kit).
+- **`kit_doctor`:** gateway hidup/mati, commit Hermes terpasang vs `HERMES_REF`, managed tanpa pin docker = error;
+  `check`/`apply`/`status`/doctor memperingatkan "tidak ada batas biaya" bila tiga batas `scale.*` semuanya 0.
+- **CI:** job wajib `installer-contract` (installer + CLI Hermes asli), job `lint` (ruff), Python 3.12/3.13, peringatan
+  terlihat saat uji terhadap Hermes `main` gagal, pembatalan putaran lama per branch.
+- **Dokumentasi:** upgrade/rollback untuk salinan wizard dan clone git; backup/pemulihan/pindah server ditulis ulang;
+  runbook "Gateway mati"; platform yang didukung dan langkah manual wizard.
+
 ### Perbaikan hasil audit putaran kedua
 - Sisa audit ulang: `unshare-skill` menjangkau semua jenis ber-channel (salinan tetap bisa dicabut walau role jenis berubah);
   nama jenis ber-channel selalu dicadangkan; uji untuk PATCH tanpa pengulangan dan penjaga channel admin pada jenis baru ber-role admin.
