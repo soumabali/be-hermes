@@ -7,6 +7,8 @@ Versi plugin (`plugins/team-guard/plugin.yaml`) dan `pyproject.toml` mengikutiny
 ## [Belum dirilis]
 
 ### Perbaikan hasil audit putaran kedua
+- Penjaga cron: aksi tool cron yang tidak dikenal ikut dihitung dalam jatah per jam; galat di penjaga kini menolak
+  panggilan tool cron (gagal-tertutup) tanpa memblokir tool lain.
 - Hasil audit independen atas perbaikan: wizard tidak lagi melebarkan izin baca pada direktori kit yang dipakai di tempat
   (hanya `go-w`); `removed_channels.json` yang rusak disimpan sebagai `.corrupt-<waktu>` dengan peringatan (bukan dibuang diam-diam);
   penjaga channel admin di tool Discord diturunkan dari `role` registri, bukan label teks; `NAME_RE`/`ENV_NAME_RE` memakai `\Z`.

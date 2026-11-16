@@ -4099,6 +4099,32 @@ class TestCronRate(ScaleBase):
         self.clock.advance(2)                                       # t=3601: slot t=0 bebas
         assert self.call(ctx) == []
 
+    def test_unknown_actions_are_rated_but_known_harmless_ones_are_not(self, d):
+        """Aksi yang belum dikenal kit (nama baru di Hermes) ikut dihitung; list/pause/resume/remove tidak."""
+        self.env.set("settings", cron_min_interval_minutes=20)      # 3 per jam
+        ctx = self.env.register("be-budi")
+        for action in ("list", "pause", "resume", "remove") * 3:
+            assert self.call(ctx, action, schedule=None, job_id="j1") == []
+        for _ in range(3):
+            assert self.call(ctx, "trigger", schedule=None, job_id="j1") == []
+        assert self.call(ctx, "edit", schedule=None, job_id="j1")[0]["action"] == "block"
+
+    def test_guard_error_blocks_cron_tools_only(self, d, monkeypatch):
+        """Galat di penjaga: tool cron ditolak (gagal-tertutup), tool lain tidak ikut terblokir."""
+        self.env.set("settings", cron_min_interval_minutes=20)
+        ctx = self.env.register("be-budi")
+        callback = ctx.hooks["pre_tool_call"][0]
+        # Tambal di globals callback itu sendiri: modul plugin bisa dimuat ulang oleh uji lain, sehingga entri
+        # sys.modules belum tentu modul yang dipakai callback ini.
+        hook_globals = getattr(callback, "__func__", callback).__globals__
+
+        def boom(*_a, **_k):
+            raise RuntimeError("rusak")
+        monkeypatch.setitem(hook_globals, "check_cron_call", boom)
+        got = self.call(ctx)
+        assert got and got[0]["action"] == "block" and "bermasalah" in got[0]["message"]
+        assert ctx.fire("pre_tool_call", tool_name="terminal", args={"command": "ls"}, task_id="t") == []
+
     def test_run_update_and_create_share_the_budget(self, d):
         self.env.set("settings", cron_min_interval_minutes=20)
         ctx = self.env.register("be-budi")

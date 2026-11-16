@@ -476,12 +476,15 @@ def test_same_or_older_or_missing_version_is_accepted(env):
     ul.open_ledger(ledger, readonly=True).close()
     _ledger_with_version(ledger, 0)
     ul.open_ledger(ledger, readonly=True).close()
+    assert ul.collect(ledger, _root, now=1_800_000_000.0) is not None      # penulis juga menerima, bukan hanya pembaca
 
 
 def test_garbage_version_value_is_treated_as_version_one(env):
     _root, ledger = env
     _ledger_with_version(ledger, "bukan-angka")
-    ul.open_ledger(ledger, readonly=True).close()
+    con = ul.open_ledger(ledger, readonly=True)
+    assert con.execute("SELECT count(*) FROM sqlite_master").fetchone()[0] > 0     # terbuka dan bisa dibaca
+    con.close()
 
 
 # ----------------------------------------------------------------------------- helper hasil pemecahan collect/main

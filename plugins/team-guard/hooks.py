@@ -9,7 +9,7 @@ from __future__ import annotations
 from typing import Any, Mapping, Optional
 
 from . import shared
-from .cronguard import CronRate, check_cron_call, check_cron_rate
+from .cronguard import CRON_TOOLS, MSG_CRON_GUARD_ERROR, CronRate, check_cron_call, check_cron_rate
 from .guard import check_tool_call
 from .redact import scrub_user_messages
 from .scale import is_rate_limit_error
@@ -116,9 +116,11 @@ class ProfileHooks:
                     found = check_cron_rate(tool_name, args, roster.settings.get("cron_min_interval_minutes"),
                                             shared.slot("cron-rate", CronRate), self.profile, self.rt.clock)
             except Exception as exc:
-                log_once("cron-guard", "penjaga jadwal cron gagal (%s: %s); panggilan diloloskan",
-                         type(exc).__name__, exc)
-                found = None
+                # Gagal-tertutup HANYA untuk tool cron (tool lain tidak boleh ikut terblokir oleh galat penjaga).
+                is_cron = str(tool_name or "") in CRON_TOOLS
+                log_once("cron-guard", "penjaga jadwal cron gagal (%s: %s); panggilan %s",
+                         type(exc).__name__, exc, "cron ditolak" if is_cron else "diloloskan")
+                found = MSG_CRON_GUARD_ERROR if is_cron else None
             if found:
                 return {"action": "block", "message": found}
         return None

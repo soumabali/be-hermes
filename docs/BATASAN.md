@@ -28,9 +28,9 @@
   fungsi bantu, klien HTTP buatan sendiri, thread lain, atau penulisan berkas lokal. Tool baru perlu ditinjau manusia.
 - Wizard `setup.sh`, gateway, Discord, dan Docker belum pernah dijalankan di server sungguhan; yang teruji adalah
   tiruan dan CI terhadap Hermes sungguhan (unit + integrasi).
-- Pembatas pembuatan cron (`cronguard`) menghitung aksi `create`, `update`, `run`. Nama aksi cronjob Hermes yang lain
-  tidak dikenal kit dan lolos tanpa dihitung; bila ada kesalahan di penjaga, panggilan dibiarkan lewat (gagal-terbuka).
-  Batasnya per profile, jadi pengguna channel bersama berbagi jatah.
+- Pembatas pembuatan cron (`cronguard`) menghitung semua aksi tool cron kecuali `list`, `status`, `pause`, `resume`,
+  `remove` (aksi yang tidak dikenal ikut dihitung). Bila penjaganya sendiri galat, panggilan tool cron ditolak
+  (gagal-tertutup) dan tool lain tetap jalan. Batasnya per profile, jadi pengguna channel bersama berbagi jatah.
 - Pemeriksaan kepemilikan kit pada `managed --install` hanya mencegah salah pasang; bukan perlindungan terhadap kit
   yang sudah dimodifikasi (kodenya sudah diimpor sebelum pemeriksaan).
 - Nilai `/env-set` diperiksa dengan pengurai `.env` milik kit sendiri; kecocokannya dengan pengurai dotenv Hermes

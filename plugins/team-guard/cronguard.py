@@ -196,6 +196,11 @@ def check_cron_call(tool_name: Any, args: Any, min_minutes: Any) -> Optional[str
 # satu jam per profile.
 RATE_WINDOW = 3600.0
 RATED_ACTIONS = frozenset({"create", "update", "run"})
+# Aksi yang pasti tidak membuat/memicu giliran LLM. Aksi LAIN (termasuk yang belum dikenal kit, mis. nama baru
+# di Hermes mendatang) ikut dihitung: lebih baik membatasi aksi tak dikenal daripada meloloskannya.
+UNRATED_ACTIONS = frozenset({"list", "status", "pause", "resume", "remove"})
+MSG_CRON_GUARD_ERROR = ("Penjaga jadwal cron tim sedang bermasalah, jadi perubahan jadwal ditolak dulu. "
+                        "Coba lagi nanti atau hubungi admin tim.")
 MSG_CRON_RATE = ("Terlalu banyak membuat/mengubah/menjalankan jadwal cron: batas tim {limit} kali per jam per "
                  "profile (rantai job sekali-jalan tetap memakai satu giliran LLM tiap kali). Coba lagi dalam "
                  "±{wait}, atau pakai satu jadwal berulang (mis. 'every {every}m'). Minta admin tim bila memang perlu.")
@@ -232,13 +237,14 @@ class CronRate:
 
 
 def is_rated_call(tool_name: Any, args: Any) -> bool:
-    """Panggilan tool cron yang membuat / mengubah / memicu job (bukan list/pause/resume/remove)."""
+    """Panggilan tool cron yang membuat / mengubah / memicu job (bukan list/pause/resume/remove); aksi yang
+    tidak dikenal ikut dihitung."""
     if str(tool_name or "") not in CRON_TOOLS or not isinstance(args, dict):
         return False
     action = args.get("action")
     action = action.strip().lower() if isinstance(action, str) else ""
     if action:
-        return action in RATED_ACTIONS
+        return action not in UNRATED_ACTIONS
     return isinstance(args.get("schedule"), str) and bool(args["schedule"].strip())     # bentuk lama tanpa `action`
 
 
