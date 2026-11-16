@@ -2115,17 +2115,19 @@ def test_contract_names_what_the_kit_really_calls():
     verdicts = {"gateway service is running": ("✓ User {}", "running"), "gateway service is stopped": ("✗ User {}", "stopped"),
                 "Gateway service is not installed": ("✗ {}", "not_installed"), "Gateway is not running": ("✗ {}", "stopped"),
                 "Restart pending": ("  ⏳ {}: systemd is waiting", "stopped")}
-    assert {needle for _rel, needle, _why in hc.SOURCE_CONTRACT[1:]} == set(verdicts)
+    assert {needle for rel, needle, _why in hc.SOURCE_CONTRACT
+            if rel == "hermes_cli/gateway.py" and "_SERVICE_BASE" not in needle} == set(verdicts)
+    assert ("hermes_cli/logs.py", '"gateway": "gateway.log"') in {(rel, needle) for rel, needle, _why in hc.SOURCE_CONTRACT}
     for needle, (shape, verdict) in verdicts.items():
         assert ks.parse_gateway_status(shape.format(needle)) == verdict, needle
 
 
 def contract_home(tmp_path, launcher=True, drop=None):
     home = tmp_path / "home"
-    source = home / ".hermes" / "hermes-agent" / "hermes_cli"
-    source.mkdir(parents=True)
-    text = "\n".join(needle for _rel, needle, _why in hc.SOURCE_CONTRACT if needle != drop)
-    (source / "gateway.py").write_text(text)
+    root = home / ".hermes" / "hermes-agent"
+    for rel in {rel for rel, _needle, _why in hc.SOURCE_CONTRACT}:
+        (root / rel).parent.mkdir(parents=True, exist_ok=True)
+        (root / rel).write_text("\n".join(needle for r, needle, _why in hc.SOURCE_CONTRACT if r == rel and needle != drop))
     if launcher:
         (home / ".local" / "bin").mkdir(parents=True)
         (home / ".local" / "bin" / "hermes").write_text("#!/bin/sh\n")

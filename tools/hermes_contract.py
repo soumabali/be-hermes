@@ -60,7 +60,6 @@ CLI_CONTRACT: Tuple[CliCheck, ...] = (
     CliCheck(("gateway", "restart"), (), "docs/OPERASI.md; pesan kit setelah `managed --install`"),
     CliCheck(("gateway", "run"), (), "wizard: --no-systemd (perintah manual yang dicetak)"),
     CliCheck(("logs",), ("-n",), "wizard: gateway gagal → `hermes logs gateway -n 40`"),
-    CliCheck(("logs", "list"), ("gateway",), "wizard: nama log `gateway` harus dikenal", help=False),
     CliCheck(("profile", "create"), ("--clone-from", "--no-alias"), "kit/hermes_cli.py: create()"),
     CliCheck(("profile", "delete"), ("--yes",), "kit/membership.py: remove-member --delete-profile"),
     CliCheck(("config", "set"), (), "kit/hermes_cli.py: config_set()"),
@@ -71,6 +70,9 @@ CLI_CONTRACT: Tuple[CliCheck, ...] = (
 # Teks di SUMBER Hermes yang diandalkan wizard dan tidak bisa dibuktikan lewat `--help`.
 # (berkas relatif terhadap checkout Hermes, teks, dipakai oleh)
 SOURCE_CONTRACT: Tuple[Tuple[str, str, str], ...] = (
+    # `hermes logs list` hanya menampilkan berkas log yang SUDAH ada (kosong pada instalasi baru), jadi nama log
+    # diperiksa di sumbernya.
+    ("hermes_cli/logs.py", '"gateway": "gateway.log"', "wizard: `hermes logs gateway -n 40` (nama log `gateway`)"),
     ("hermes_cli/gateway.py", '_SERVICE_BASE = "hermes-gateway"', f"wizard: Gateway.DEFAULT_UNIT = {ks.Gateway.DEFAULT_UNIT}"),
     ("hermes_cli/gateway.py", "gateway service is running", "wizard: parse_gateway_status → running"),
     ("hermes_cli/gateway.py", "gateway service is stopped", "wizard: parse_gateway_status → stopped"),
