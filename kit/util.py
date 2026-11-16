@@ -6,7 +6,7 @@ import re
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 import yaml
 import kit_paths
 from kit_base import TeamError

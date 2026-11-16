@@ -230,6 +230,23 @@ else
   warn "PERINGATAN: uji integrasi akan DILEWATI — $WHY"
 fi
 
+# Versi Hermes di server ini vs commit yang diuji CI untuk kit ini (berkas HERMES_REF). Hanya informasi: hasil uji
+# di bawah yang menentukan; tetapi versi yang berbeda berarti CI belum pernah menguji kombinasi ini.
+REF_NOTE=""
+if [ -f "$KIT/HERMES_REF" ]; then
+  REF="$(grep -v '^[[:space:]]*#' "$KIT/HERMES_REF" 2>/dev/null | awk 'NF {print $1; exit}' || true)"
+  HEAD=""
+  if [ -n "$SRC" ] && command -v git >/dev/null 2>&1; then HEAD="$(git -C "$SRC" rev-parse HEAD 2>/dev/null || true)"; fi
+  if [ -z "$REF" ] || [ -z "$HEAD" ]; then
+    REF_NOTE="Versi Hermes: commit terpasang tidak bisa ditentukan (HERMES_REF: ${REF:-kosong})."
+  elif [ "$HEAD" = "$REF" ]; then
+    REF_NOTE="Versi Hermes: commit $HEAD = HERMES_REF (kombinasi yang diuji CI)."
+  else
+    REF_NOTE="Versi Hermes: commit $HEAD BERBEDA dari HERMES_REF ($REF): kombinasi ini belum diuji CI."
+  fi
+  say "$REF_NOTE"
+fi
+
 [ "${#PYTEST_ARGS[@]}" -gt 0 ] || PYTEST_ARGS=(tests -q -rs)
 cd "$KIT"
 RC=0
@@ -245,6 +262,7 @@ fi
 
 say ""
 say "================ selftest: ringkasan ================"
+[ -z "$REF_NOTE" ] || say "$REF_NOTE"
 if [ "$RC" -ne 0 ]; then
   say "✗ GAGAL: pytest keluar dengan kode $RC (lihat keluaran di atas)."
   if [ -z "$WHY" ]; then say "  Uji integrasi: DIJALANKAN (python $PY, sumber ${SRC:-site-packages})."; else say "  Uji integrasi: DILEWATI — $WHY"; fi

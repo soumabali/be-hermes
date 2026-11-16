@@ -29,15 +29,15 @@ runner perintah tiruan, prompter tiruan, direktori sementara, dan server Discord
   Diuji terhadap endpoint LLM TIRUAN:
     6 llm             GET /models dan POST /chat/completions
   Hanya diuji terhadap RUNNER TIRUAN (perintahnya dirangkai dan dicatat, tidak pernah dieksekusi):
-    1 preflight       timedatectl
+    1 preflight       timedatectl (berhenti bila apt-get tidak ada)
     2 packages        apt-get, skrip get.docker.com
-    3 linux_user      adduser, usermod, loginctl enable-linger, docker run hello-world
+    3 linux_user      adduser, usermod (grup docker harus ada), loginctl enable-linger, docker run hello-world
     8 hermes_install  installer Hermes (--non-interactive --skip-setup --commit <HERMES_REF>), hermes --version,
                       git rev-parse HEAD di checkout Hermes, hermes doctor
     9 kit_install     chown/chmod (penyalinan berkasnya sendiri diuji sungguhan di tmp)
    10 write_config    hermes_team.py check (team.yaml yang dihasilkan diuji dengan load_team asli)
    11 provision       hermes_team.py apply / managed
-   12 extras          docker build, systemctl --user
+   12 extras          docker build, systemctl --user (timer pemakaian, laporan, sandbox-idle, gateway-watch)
    13 gateway         hermes gateway install/start, systemctl --user is-active/show, hermes gateway status, hermes logs
                       (tafsir keluaran status diuji dengan string yang disalin dari sumber Hermes hulu; BELUM dicoba pada
                       systemd/Hermes sungguhan)
@@ -2195,7 +2195,8 @@ KIT_TOP_GLOBS = ("*.py", "*.example.yaml", "LICENSE*")
 KIT_DENY = ("__pycache__", "*.pyc", "*.pyo", "*.bak", "*.bak-*", "*.orig", "*.swp", "*~", "*.pem", "*.key", "*.p12", "*.pfx",
             "id_rsa*", "id_dsa*", "id_ecdsa*", "id_ed25519*", "jawaban*", "answers*", "team.yaml", "members.yaml",
             "*.secret*", "*.token", "venv", "node_modules")
-KIT_QUIET_SKIP = {".git", ".github", ".gitignore", "__pycache__", ".pytest_cache", ".venv", "venv", "arsip-versi-lama"}
+KIT_QUIET_SKIP = {".git", ".github", ".gitignore", "__pycache__", ".pytest_cache", ".ruff_cache", ".venv", "venv",
+                  "arsip-versi-lama"}
 SYSTEM_DIRS = frozenset((
     "/", "/etc", "/usr", "/usr/local", "/opt", "/home", "/var", "/root", "/bin", "/sbin", "/lib", "/lib32", "/lib64",
     "/libx32", "/boot", "/dev", "/proc", "/sys", "/run", "/srv", "/tmp", "/mnt", "/media", "/snap", "/usr/bin",

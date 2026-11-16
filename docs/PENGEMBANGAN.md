@@ -85,9 +85,24 @@ Platform baru = modul baru + `REGISTRY.declare_group(nama, gate=...)`.
 
 ## Menambah pembatas di plugin
 
-Kelas dengan `check(ctx) -> Verdict | None` di `plugins/team-guard/limiters.py`, lalu satu baris di daftar
-`rt.limiters` (urutan = urutan pemeriksaan). Penolakan memakai `Dispatcher._refuse` (satu tabel pesan, satu
-`metrics.refuse`). Uji dengan simulasi (`tests/test_scale_sim.py`, jam tiruan).
+Tiga langkah, semuanya di `plugins/team-guard/`:
+
+1. **Kelas pembatas** di `limiters.py`: atribut `name` dan `async check(ctx) -> Verdict | None` (`None` = lolos).
+2. **Satu baris di `default_limiters()`** (`limiters.py`); urutan daftar = urutan pemeriksaan. `rt.limiters`
+   hanyalah hasil fungsi itu saat runtime dibuat — uji boleh menggantinya, kode produksi tidak menulis ke sana.
+3. **Daftarkan jenis penolakannya** bila `kind` di `Verdict(kind, reason, fmt=...)` belum ada: satu entri di
+   tabel `REFUSALS` (`refusals.py`) — `Refusal(kunci_jeda, templat_pesan, metrik)`; templat wajib memuat `{uid}`,
+   `metrik=None` berarti tidak dihitung. Itu SATU-SATUNYA tabel: pesan ke pengguna dan kunci `refused` di
+   `metrics.json` (`scale.refusal_kinds()`) sama-sama diturunkan darinya. Metrik baru = kunci baru di
+   `metrics.json → refused`; pembaca di kit (`teamctl/tools_usage.py`, `tools/metrics_export.py`) dan uji kontrak
+   `tests/test_contract.py` perlu ikut diperbarui.
+
+Penolakan selalu lewat `Dispatcher._refuse`. `kind` yang lupa didaftarkan TETAP menolak (pesan umum, metrik
+`other`, satu baris log) dan `TestRefusalRegistry::test_every_verdict_kind_produced_in_limiters_is_registered`
+menggagalkan build. `check` yang melempar galat dilewati sendiri-sendiri (gagal-terbuka per pembatas, log sekali,
+`limiter.<name>` di `capabilities.json`); pembatas berikutnya tetap diperiksa — jadi pembatas tidak boleh dipakai
+sebagai batas keamanan (itu tugas gerbang akses di `dispatch.py`, yang gagal-tertutup). Uji dengan simulasi
+(`tests/test_scale_sim.py`, jam tiruan) dan `TestLimiterPipeline` / `TestDispatchStageIsolation`.
 
 ## Menambah jenis profile
 
@@ -177,9 +192,22 @@ jenis wajib uji harus memanggil `kit.write_team(<jenis>={...})` setelah mendafta
 
 ## Menyentuh internal Hermes
 
-Hanya lewat `plugins/team-guard/upstream.py`. Tiap pemakaian internal mendaftarkan dirinya sebagai
-*capability*; bila API hilang, fitur itu mati dengan satu baris log dan `capabilities.json` mencatatnya
-(`kit_doctor.py` menampilkannya). Uji yang menyentuh Hermes asli dijaga `importorskip` dan berjalan di CI.
+Hanya lewat `plugins/team-guard/upstream.py`. Pendaftaran *capability* TIDAK otomatis; yang ada adalah dua
+langkah manual yang dijaga uji:
+
+1. satu entri di tabel `_PROBES` (kunci, modul tempat mencarinya, kelas pemilik, nama, untuk apa);
+2. `@uses("<kunci>", …)` di metode `HermesGateway` yang menyentuhnya.
+
+`TestUpstreamProbeCoverage` memindai AST `upstream.py` dan gagal bila sebuah metode `HermesGateway` mengimpor
+paket Hermes, membaca atribut objek Hermes (parameter `gateway` / `runner` / `adapter` / `event` / `config` /
+`source` dan turunannya), atau menyebut nama privat tanpa probe yang dideklarasikannya — juga bila ada probe
+tanpa pemakai atau parameter baru yang belum digolongkan. `TestUpstreamAdapterLayer` menjaga modul LAIN tidak
+menyentuh internal sama sekali. Bila API hilang, fitur itu mati dengan satu baris log dan `capabilities.json`
+mencatatnya (`kit_doctor.py` menampilkannya). Batasnya: probe hanya memeriksa bahwa NAMA itu ada (di objek yang
+sudah dimuat atau di teks sumber), bukan tanda tangan atau perilakunya; probe atribut data (`….config.profile_routes`,
+`….config.extra`) hanya mencari pemakaian nama itu di sumber. `capabilities.json` juga memuat entri kesehatan
+plugin yang bukan API Hermes (`budget.ledger`, `limiter.<nama>`, `dispatch.<tahap>`; `upstream.note_health`).
+Uji yang menyentuh Hermes asli dijaga `importorskip` dan berjalan di CI.
 
 ## Uji
 

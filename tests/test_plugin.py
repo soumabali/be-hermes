@@ -4484,8 +4484,10 @@ class TestRefusalRegistry(ScaleBase):
 
     def test_metric_keys_come_from_the_same_table(self, monkeypatch):
         """Satu sumber: `scale.REFUSAL_KINDS` / kunci `refused` diturunkan dari `refusals.REFUSALS`."""
-        refusals = S.sub(P, "refusals")
-        assert limiters.REFUSALS is refusals.REFUSALS and not hasattr(limiters, "REFUSAL_TEXT")
+        # (lewat __globals__, bukan sys.modules: berkas uji lain bisa memuat ulang paket plugin)
+        table = scale.refusal_metrics.__globals__["REFUSALS"]
+        assert limiters.REFUSALS is table is dispatch.refusal_for.__globals__["REFUSALS"]
+        assert not hasattr(limiters, "REFUSAL_TEXT")
         for name in ("limiters.py", "dispatch.py", "scale.py"):                # tidak ada tabel/daftar kedua
             text = (S.PLUGIN_DIR / name).read_text(encoding="utf-8")
             assert "Refusal(" not in text and '"user_concurrent"' not in text, name

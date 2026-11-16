@@ -1951,7 +1951,15 @@ hc = load_tool("hermes_contract")
 gw = load_tool("gateway_watch")
 TESTED_REF = ks.read_hermes_ref(KIT_DIR)
 OTHER_REF = "a" * 40
-CI_TEXT = (KIT_DIR / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+
+
+def ci_text():
+    """Isi ci.yml. Salinan kit di server (/opt/hermes-team) tidak membawa .github: uji yang butuh ini dilewati di sana
+    (tests/selftest.sh menjalankan seluruh folder tests dari salinan itu)."""
+    path = KIT_DIR / ".github" / "workflows" / "ci.yml"
+    if not path.is_file():
+        pytest.skip(".github/workflows/ci.yml tidak ada (salinan kit terpasang); uji ini hanya untuk repo")
+    return path.read_text(encoding="utf-8")
 
 
 def preinstalled(tmp_path, commit):
@@ -1969,10 +1977,11 @@ def test_hermes_ref_is_one_file_read_by_ci_and_the_wizard():
     assert ks.SHA_RE.match(TESTED_REF), "HERMES_REF harus berisi satu SHA 40 heksadesimal"
     lines = [ln for ln in (KIT_DIR / "HERMES_REF").read_text().splitlines() if ln.strip() and not ln.startswith("#")]
     assert lines == [TESTED_REF]
-    # ci.yml tidak lagi menyimpan salinan SHA: ia membaca berkasnya
-    assert not re.search(r"\b[0-9a-f]{40}\b", CI_TEXT) and "HERMES_REF" in CI_TEXT and "GITHUB_ENV" in CI_TEXT
     assert "HERMES_REF" in ks.KIT_TOP_FILES
     assert ks.read_hermes_ref("/tidak/ada", KIT_DIR) == TESTED_REF and ks.read_hermes_ref("/tidak/ada") == ""
+    # ci.yml tidak lagi menyimpan salinan SHA: ia membaca berkasnya
+    text = ci_text()
+    assert not re.search(r"\b[0-9a-f]{40}\b", text) and "HERMES_REF" in text and "GITHUB_ENV" in text
 
 
 def test_install_command_pins_only_a_full_sha():
@@ -2166,13 +2175,13 @@ def test_contract_tool_lists_itself_and_refuses_install_without_a_user():
 
 def ci_job(name):
     """Teks satu job di ci.yml (dari `  <name>:` sampai job berikutnya)."""
-    match = re.search(rf"^  {re.escape(name)}:\n(.*?)(?=^  [a-z][a-z0-9_-]*:\n|\Z)", CI_TEXT, re.S | re.M)
+    match = re.search(rf"^  {re.escape(name)}:\n(.*?)(?=^  [a-z][a-z0-9_-]*:\n|\Z)", ci_text(), re.S | re.M)
     assert match, f"job {name} tidak ada di ci.yml"
     return match.group(1)
 
 
 def test_ci_runs_the_real_installer_contract_as_a_required_job():
-    workflow = yaml.safe_load(CI_TEXT)
+    workflow = yaml.safe_load(ci_text())
     jobs = workflow["jobs"]
     assert {"unit", "lint", "integration", "installer-contract"} <= set(jobs)
     contract = ci_job("installer-contract")
@@ -2181,7 +2190,7 @@ def test_ci_runs_the_real_installer_contract_as_a_required_job():
     assert not any("continue-on-error" in step for step in jobs["installer-contract"]["steps"])
     assert "adduser --disabled-password" in contract                              # user non-root, seperti wizard
     assert {"3.10", "3.12", "3.13"} <= set(jobs["unit"]["strategy"]["matrix"]["python"])
-    assert "ruff check" in ci_job("lint") and "E9,F63,F7,F82,F401,F811,F841" in CI_TEXT
+    assert "ruff check" in ci_job("lint") and "E9,F63,F7,F82,F401,F811,F841" in ci_text()
     assert workflow["concurrency"]["cancel-in-progress"] is not None
     integration = ci_job("integration")
     assert "continue-on-error" in integration and "::warning" in integration      # drift `main`: tidak memblokir, tapi terlihat

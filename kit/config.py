@@ -7,7 +7,6 @@ lama (SCALE_DEFAULTS dst.) yang diturunkan dari skema supaya kode lain tetap bis
 from __future__ import annotations
 
 import contextlib
-import copy
 import os
 import re
 import threading

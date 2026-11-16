@@ -12,7 +12,8 @@ fi
 
 if ! command -v python3 >/dev/null 2>&1 || ! python3 -c 'import yaml' >/dev/null 2>&1; then
   if ! command -v apt-get >/dev/null 2>&1; then
-    echo "python3 / PyYAML belum ada dan apt-get tidak ditemukan. Pasang python3 dan PyYAML dulu, lalu ulangi." >&2
+    echo "python3 / PyYAML belum ada dan apt-get tidak ditemukan." >&2
+    echo "Wizard ini hanya mendukung Debian/Ubuntu ber-systemd (apt-get). Di OS lain: ikuti docs/INSTALL.md (instalasi manual)." >&2
     exit 1
   fi
   echo "Memasang python3 dan python3-yaml (apt-get) ..."
