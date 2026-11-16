@@ -888,14 +888,19 @@ def _load_removed_channels(path: Path) -> dict:
         data = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
         return {}
-    except (OSError, ValueError):
+    except OSError as exc:
+        # Tidak terbaca (izin, I/O) BUKAN berarti rusak: berkasnya mungkin sah. Menimpanya = membuang nisan lama.
+        raise TeamError(f"{path} tidak bisa dibaca ({exc}); nisan channel anggota lama ada di sana. Perbaiki "
+                        "izin/kepemilikannya (harus terbaca user yang menjalankan kit), lalu ulangi.")
+    except ValueError:
         _quarantine_removed_channels(path)
         return {}
     channels = data.get("channels") if isinstance(data, dict) else None
     if not isinstance(channels, dict):
         _quarantine_removed_channels(path)
         return {}
-    return {str(cid): entry for cid, entry in channels.items() if isinstance(entry, dict)}
+    # Entri berbentuk aneh tetap dipertahankan (pembaca di teamctl juga tetap melindungi channel-nya).
+    return {str(cid): (entry if isinstance(entry, dict) else {}) for cid, entry in channels.items()}
 
 
 def _write_removed_channels(path: Path, channels: dict) -> None:

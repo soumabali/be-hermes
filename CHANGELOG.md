@@ -7,6 +7,9 @@ Versi plugin (`plugins/team-guard/plugin.yaml`) dan `pyproject.toml` mengikutiny
 ## [Belum dirilis]
 
 ### Perbaikan hasil audit putaran kedua
+- Audit ulang kedua: `removed_channels.json` yang tidak terbaca (izin/I-O) kini galat jelas, bukan dikarantina; entri nisan
+  berbentuk aneh dipertahankan; `cron_exempt` hanya berlaku bila boolean `true` dan tidak pernah untuk profile anggota;
+  galat penjaga cron tidak lagi memblokir `list`; kit yang dipakai di tempat tetap terbaca user hermes (hanya kode kit).
 - Penjaga cron: aksi tool cron yang tidak dikenal ikut dihitung dalam jatah per jam; galat di penjaga kini menolak
   panggilan tool cron (gagal-tertutup) tanpa memblokir tool lain.
 - Hasil audit independen atas perbaikan: wizard tidak lagi melebarkan izin baca pada direktori kit yang dipakai di tempat

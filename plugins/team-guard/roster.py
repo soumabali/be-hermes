@@ -137,8 +137,10 @@ class Roster:
         """Profile ini boleh membuat cron job rapat? Kit menulis `cron_exempt: true` di entri channel jenisnya
         (PROFILE_KINDS); roster lama tanpa kunci itu: hanya jenis `admin`."""
         entry = self._profile_entry(profile)
+        if entry.get("kind") == "personal":            # profile anggota tidak pernah dikecualikan, apa pun isi roster
+            return False
         if "cron_exempt" in entry:
-            return bool(entry["cron_exempt"])
+            return entry["cron_exempt"] is True          # hanya boolean true ("false", 1, dst. = tidak)
         return entry.get("kind") == "admin"
 
     def channel_is_admin(self, entry: dict) -> bool:

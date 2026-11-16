@@ -9,13 +9,23 @@ from __future__ import annotations
 from typing import Any, Mapping, Optional
 
 from . import shared
-from .cronguard import CRON_TOOLS, MSG_CRON_GUARD_ERROR, CronRate, check_cron_call, check_cron_rate
+from .cronguard import CRON_TOOLS, MSG_CRON_GUARD_ERROR, CronRate, check_cron_call, check_cron_rate, is_rated_call
 from .guard import check_tool_call
 from .redact import scrub_user_messages
 from .scale import is_rate_limit_error
 from .secrets import SecretStore
 from .shared import log_once
 
+
+
+def _is_mutating_cron_call(tool_name: Any, args: Any) -> bool:
+    """Untuk jalur galat penjaga: tool cron yang bukan aksi baca/aman. Ragu = dianggap mengubah."""
+    if str(tool_name or "") not in CRON_TOOLS:
+        return False
+    try:
+        return is_rated_call(tool_name, args) or not isinstance(args, dict)
+    except Exception:
+        return True
 
 class ProfileHooks:
     def __init__(self, rt: Any, store: SecretStore, profile: str, kind: str):
@@ -109,20 +119,23 @@ class ProfileHooks:
                 return {"action": "block", "message": found}
         # Jadwal cron terlalu rapat (tiap job = percakapan LLM di luar antrean).
         # Profile `cron_exempt` di roster (admin) dikecualikan.
-        if not roster.profile_cron_exempt(self.profile):
-            try:
+        try:
+            exempt = roster.profile_cron_exempt(self.profile)
+            found = None
+            if not exempt:
                 found = check_cron_call(tool_name, args, roster.settings.get("cron_min_interval_minutes"))
                 if not found:         # laju: rantai job sekali-jalan & `run` (hanya yang lolos interval dihitung)
                     found = check_cron_rate(tool_name, args, roster.settings.get("cron_min_interval_minutes"),
                                             shared.slot("cron-rate", CronRate), self.profile, self.rt.clock)
-            except Exception as exc:
-                # Gagal-tertutup HANYA untuk tool cron (tool lain tidak boleh ikut terblokir oleh galat penjaga).
-                is_cron = str(tool_name or "") in CRON_TOOLS
-                log_once("cron-guard", "penjaga jadwal cron gagal (%s: %s); panggilan %s",
-                         type(exc).__name__, exc, "cron ditolak" if is_cron else "diloloskan")
-                found = MSG_CRON_GUARD_ERROR if is_cron else None
-            if found:
-                return {"action": "block", "message": found}
+        except Exception as exc:
+            # Gagal-tertutup HANYA untuk panggilan tool cron yang membuat/mengubah/memicu job; `list` dkk. dan
+            # tool lain tidak ikut terblokir oleh galat penjaga.
+            blocked = _is_mutating_cron_call(tool_name, args)
+            log_once("cron-guard", "penjaga jadwal cron gagal (%s: %s); panggilan %s",
+                     type(exc).__name__, exc, "cron ditolak" if blocked else "diloloskan")
+            found = MSG_CRON_GUARD_ERROR if blocked else None
+        if found:
+            return {"action": "block", "message": found}
         return None
 
     # ------------------------------------------------------------------ petunjuk

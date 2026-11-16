@@ -4125,6 +4125,29 @@ class TestCronRate(ScaleBase):
         assert got and got[0]["action"] == "block" and "bermasalah" in got[0]["message"]
         assert ctx.fire("pre_tool_call", tool_name="terminal", args={"command": "ls"}, task_id="t") == []
 
+    def test_guard_error_does_not_block_read_only_cron_actions(self, d, monkeypatch):
+        self.env.set("settings", cron_min_interval_minutes=20)
+        ctx = self.env.register("be-budi")
+        callback = ctx.hooks["pre_tool_call"][0]
+
+        def boom(*_a, **_k):
+            raise RuntimeError("rusak")
+        monkeypatch.setitem(getattr(callback, "__func__", callback).__globals__, "check_cron_call", boom)
+        assert self.call(ctx, "list", schedule=None) == []
+        assert self.call(ctx, "run", schedule=None, job_id="j1")[0]["action"] == "block"
+
+    @pytest.mark.parametrize("action", [7, ["run"], {"a": 1}])
+    def test_non_string_action_counts_as_unknown(self, action):
+        assert cronguard.is_rated_call("cronjob_manage", {"action": action}) is True
+
+    @pytest.mark.parametrize("value,kind,expected", [(True, "ops", True), ("false", "ops", False), (1, "ops", False),
+                                                     ("true", "ops", False), (True, "personal", False)])
+    def test_cron_exempt_needs_boolean_true_and_never_applies_to_personal(self, d, value, kind, expected):
+        roster_mod = S.sub(P, "roster")
+        data = {"schema": 1, "channels": {"1": {"profile": "p", "kind": kind, "cron_exempt": value}}}
+        roster = roster_mod.Roster(data) if hasattr(roster_mod, "Roster") else None
+        assert roster is not None and roster.profile_cron_exempt("p") is expected
+
     def test_run_update_and_create_share_the_budget(self, d):
         self.env.set("settings", cron_min_interval_minutes=20)
         ctx = self.env.register("be-budi")

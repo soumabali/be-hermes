@@ -242,6 +242,8 @@ def is_rated_call(tool_name: Any, args: Any) -> bool:
     if str(tool_name or "") not in CRON_TOOLS or not isinstance(args, dict):
         return False
     action = args.get("action")
+    if action is not None and not isinstance(action, str):
+        return True                                           # bentuk aneh = tidak dikenal = dihitung
     action = action.strip().lower() if isinstance(action, str) else ""
     if action:
         return action not in UNRATED_ACTIONS

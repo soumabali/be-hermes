@@ -10,8 +10,9 @@ daftarkan satu `ProfileKind` di `PROFILE_KINDS` — argumen `soul` (teks SOUL.md
 Selebihnya DITURUNKAN dari registri ini: blok `<kind>.{profile,channel_id,auto_skills}` dan baris
 `llm.<kind>_model` di skema (kit_config), rute gateway, alias model + `models:` di members.yaml, channel/kind di
 roster, check/describe/status, cek channel doctor, urutan provisioning, dan nama yang dicadangkan.
-Yang TIDAK generik (lihat docs/PENGEMBANGAN.md): `teamctl` set-model, berbagi skill ("shared"), channel rumah
-(admin), dan plugin team-guard (menafsirkan `kind` channel).
+`teamctl` (target set-model, channel tim, penjaga admin), berbagi skill, dan plugin team-guard (lewat kunci roster
+`role` / `cron_exempt`) juga mengikutinya. Yang TIDAK generik (lihat docs/PENGEMBANGAN.md): channel rumah
+(`DISCORD_HOME_CHANNEL` / `no_thread_channels`, memakai channel admin).
 `SYSTEM_KINDS`, `MODEL_TARGETS`, `RESERVED_NAMES` adalah TAMPILAN malas atas `PROFILE_KINDS` (selalu mutakhir).
 Hanya bergantung pada kit.constants dan kit.templates (tanpa siklus ke config/derive).
 """

@@ -11,7 +11,7 @@ yang tersisa. Centang hanya setelah perintahnya benar-benar dijalankan dan kelua
 | Uji unit + integrasi hijau terhadap Hermes sungguhan (versi terpin dan `main`) | CI `ci.yml`: unit Python 3.10/3.11/3.14, integrasi `KIT_REQUIRE_HERMES=1` |
 | Titik masuk jalan dari salinan lain / `python -I` | `tests/test_entrypoints.py` |
 | `sandbox_idle` memakai Docker dengan benar: hentikan yang diam, biarkan yang sibuk, tidak pernah `rm` | Dijalankan terhadap container berlabel sungguhan (Docker 29.9.2); lihat docstring `tools/sandbox_idle.py` |
-| POST/PATCH tidak diulang pada 5xx Discord | `tests/test_kit_units.py` (`test_post_is_not_retried_on_5xx`) |
+| POST tidak diulang pada 5xx Discord (PATCH memakai jalur kode yang sama, tanpa uji sendiri) | `tests/test_kit_units.py` (`test_post_is_not_retried_on_5xx`) |
 
 ## B. Menunggu server uji (butuh Discord, Hermes, systemd, Docker sungguhan)
 
@@ -47,7 +47,7 @@ perbaiki di kit, lalu ulang dari pemeriksaan yang gagal.
 
 ## C. Pekerjaan kode
 
-Selesai dan terbukti oleh uji lokal (2078 lulus) dan CI hijau (unit 3.10/3.11/3.14, integrasi pinned dan main):
+Selesai dan terbukti oleh uji lokal dan CI (unit 3.10/3.11/3.14 dan integrasi Hermes terpin wajib hijau; integrasi terhadap Hermes `main` bersifat informatif, boleh gagal tanpa menggagalkan CI):
 
 - Fungsi panjang di `teamctl/` dipecah (tidak ada yang ≥ 60 baris; `tools/list` identik, hash dipin uji) dan
   `usage_ledger.collect` / `main` dipecah.
@@ -62,7 +62,9 @@ Selesai dan terbukti oleh uji lokal (2078 lulus) dan CI hijau (unit 3.10/3.11/3.
 Masih manual saat menambah jenis profile: `DISCORD_HOME_CHANNEL` / `no_thread_channels` di `kit/derive.py::host_settings`,
 blok contoh di `team.example.yaml`, dan teks README/FITUR (lihat `docs/PENGEMBANGAN.md`).
 
-Belum ada pihak lain yang mengaudit perbaikan terbaru ini (audit di atas dilakukan sebelum perbaikan terakhir).
+Audit ulang independen kedua (atas refactor dan wiring) menyimpulkan: tanpa temuan tinggi, tanpa bypass penjaga admin,
+refactor tidak mengubah perilaku; temuan rendah/sedangnya (nisan tak terbaca, `cron_exempt` longgar, izin baca kit di
+tempat, tepi penjaga cron) sudah diperbaiki dengan uji. Perbaikan terakhir itu sendiri belum diaudit ulang.
 
 ## D. Cara menilai
 

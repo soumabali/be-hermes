@@ -2102,7 +2102,9 @@ class KitInstall(Step):
                                  "teamctl/, plugins/, skills/, systemd/, tools/, docker/, docs/, tests/, VERSION, *.example.yaml, "
                                  "dst.; bukan .env/jawaban/kunci) — hanya bila direktori tujuan kosong/belum ada atau instalasi "
                                  "kit sebelumnya"]
-        return lines + [f"chown -R root:root {ctx.kit_dir}", f"chmod -R a+rX,go-w {ctx.kit_dir}"]
+        chmod = (f"chmod -R go-w {ctx.kit_dir} + a+rX hanya pada kode kit (berkas lain tidak dibuka)" if same
+                 else f"chmod -R a+rX,go-w {ctx.kit_dir}")
+        return lines + [f"chown -R root:root {ctx.kit_dir}", chmod]
 
     @staticmethod
     def _wizard_dir(path: Path) -> bool:
@@ -2133,7 +2135,17 @@ class KitInstall(Step):
         ctx.run(["chown", "-R", "root:root", str(target)], what="chown kit")
         # Hanya salinan buatan wizard (allowlist) yang boleh dibuka bacanya; direktori yang dipakai di tempat
         # mungkin memuat .env / team.yaml / kunci milik operator, jadi cukup cabut tulis grup/lain.
-        ctx.run(["chmod", "-R", "a+rX,go-w" if target != dst else "go-w", str(target)], what="chmod kit")
+        if target != dst:
+            ctx.run(["chmod", "-R", "a+rX,go-w", str(target)], what="chmod kit")
+        else:
+            ctx.run(["chmod", "-R", "go-w", str(target)], what="chmod kit")
+            # Kode kit (daftar izin yang sama dengan salinan) harus terbaca user hermes walau clone dibuat dengan
+            # umask ketat; berkas lain di direktori itu tidak disentuh.
+            code = [target / d for d in KIT_DIRS if (target / d).is_dir()]
+            code += sorted({p for pat in (*KIT_TOP_FILES, *KIT_TOP_GLOBS) for p in target.glob(pat) if p.is_file()})
+            ctx.run(["chmod", "a+rx", str(target)], what="chmod kit")
+            if code:
+                ctx.run(["chmod", "-R", "a+rX", *map(str, code)], what="chmod kit")
         if target != dst:
             self.swap(ctx, target, dst)
 

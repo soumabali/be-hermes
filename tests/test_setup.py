@@ -1291,6 +1291,22 @@ def kit_ctx(tmp_path, dst, source=None, system=None):
     return ctx
 
 
+def test_kit_install_in_place_does_not_open_other_files_but_keeps_code_readable(tmp_path):
+    """Dipakai di tempat: tidak ada `chmod -R a+rX` atas seluruh direktori (bisa membuka .env operator); hanya kode kit."""
+    src = tmp_path / "kit-di-tempat"
+    (src / "kit").mkdir(parents=True)
+    (src / "hermes_team.py").write_text("# x\n")
+    (src / ".env").write_text("RAHASIA=1\n")
+    system = FakeSystem(tmp_path, with_user=True)
+    ks.KitInstall().run(kit_ctx(tmp_path, src, source=src, system=system))
+    chmods = [c for c in system.commands() if c.startswith("chmod")]
+    assert f"chmod -R go-w {src}" in chmods
+    assert not any(c.startswith("chmod -R a+rX,go-w") for c in chmods)
+    opened = [c for c in chmods if c.startswith("chmod -R a+rX ")]
+    assert opened and str(src / "kit") in opened[0] and str(src / "hermes_team.py") in opened[0]
+    assert ".env" not in opened[0]
+
+
 def test_kit_install_refuses_an_existing_directory_that_is_not_a_previous_install(tmp_path):
     dst = tmp_path / "usr-local"
     (dst / "bin").mkdir(parents=True)

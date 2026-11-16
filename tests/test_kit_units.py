@@ -3452,6 +3452,35 @@ class TestAuditFollowUps:
         assert "PERINGATAN" in capsys.readouterr().err
         assert "123456789012345678" in json.loads(path.read_text())["channels"]
 
+    def test_unreadable_tombstone_file_is_an_error_not_a_reset(self, kit, monkeypatch):
+        """Tidak terbaca (izin/I-O) ≠ rusak: berkas sah tidak boleh dikarantina lalu ditimpa."""
+        from kit import membership
+        team = kit.team()
+        path = membership.removed_channels_path(team)
+        membership.record_removed_channel(team, {"name": "budi", "channel_id": "111111111111111111"})
+        before = path.read_text()
+        from pathlib import Path
+        real = Path.read_text
+
+        def deny(self, *a, **k):
+            if self == path:
+                raise PermissionError(13, "Permission denied")
+            return real(self, *a, **k)
+        monkeypatch.setattr(Path, "read_text", deny)
+        with pytest.raises(ht.TeamError):
+            membership.record_removed_channel(team, {"name": "eka", "channel_id": "222222222222222222"})
+        monkeypatch.undo()
+        assert path.read_text() == before and not list(path.parent.glob(path.name + ".corrupt-*"))
+
+    def test_oddly_shaped_tombstone_entries_survive_a_rewrite(self, kit):
+        from kit import membership
+        team = kit.team()
+        path = membership.removed_channels_path(team)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"schema": 1, "channels": {"333333333333333333": "x"}}))
+        membership.record_removed_channel(team, {"name": "budi", "channel_id": "111111111111111111"})
+        assert set(json.loads(path.read_text())["channels"]) == {"333333333333333333", "111111111111111111"}
+
     def test_admin_channel_guard_follows_registry_role(self, kit, register_kind):
         from teamctl.discord_guard import Server
         register_kind(kit_profiles.ProfileKind(
