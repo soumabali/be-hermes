@@ -89,6 +89,14 @@ TOKEN_PATTERNS: list[tuple[str, re.Pattern]] = [
     ("api-key", re.compile(r"\bsk-(?:proj-|ant-[a-z0-9]+-)?[A-Za-z0-9_-]{20,}\b")),
     ("aws-key", re.compile(r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b")),
     ("google-key", re.compile(r"\bAIza[0-9A-Za-z_-]{35}\b")),
+    # Kunci bergaya Stripe: sk_live_/rk_live_/pk… TIDAK (publishable bukan rahasia); _test_ ikut (tetap kredensial).
+    ("stripe-key", re.compile(r"\b(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{16,}\b")),
+    # Token bot Discord: base64(ID bot = 17–20 DIGIT ASCII) . cap waktu (6–7) . HMAC (27+). Bagian pertama
+    # dicocokkan sebagai base64 dari digit saja (tiap 4 karakter: [MNO][DTjz][AEIMQUYcgk][w-z0-5]), jadi nama
+    # berkas/identifier bertitik biasa ("Modul.metode.atribut_panjang") tidak ikut tersamarkan.
+    ("discord-token", re.compile(
+        r"(?<![A-Za-z0-9_.-])(?:[MNO][DTjz][AEIMQUYcgk][w-z0-5]){5,6}(?:[MNO][DTjz][AEIMQUYcgk]|[MNO][AQgw])?"
+        r"\.[A-Za-z0-9_-]{6,7}\.[A-Za-z0-9_-]{27,}(?![A-Za-z0-9_-])")),
     ("jwt", re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b")),
 ]
 

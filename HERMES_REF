@@ -1,0 +1,6 @@
+# Commit hermes-agent (github.com/NousResearch/hermes-agent) yang diuji CI untuk versi kit ini.
+# SATU sumber: .github/workflows/ci.yml membacanya untuk uji integrasi dan job installer-contract, dan wizard
+# (kit_setup.py, langkah hermes_install) memasang commit ini lewat `install.sh --commit <SHA>` lalu memperingatkan bila
+# Hermes yang terpasang berbeda. Harus SHA 40 heksadesimal yang merupakan leluhur branch `main` (syarat installer).
+# Naikkan lewat PR setelah uji integrasi hijau; baru kemudian perbarui Hermes di server (docs/OPERASI.md).
+5d87ea2242c7e5a4ce76098b6113f04bf11348c6

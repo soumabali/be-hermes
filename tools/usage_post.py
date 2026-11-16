@@ -50,7 +50,6 @@ import os
 import re
 import sys
 import tempfile
-import time
 from datetime import date, datetime, time as dtime, timedelta
 from pathlib import Path
 from typing import Any, Callable, Optional

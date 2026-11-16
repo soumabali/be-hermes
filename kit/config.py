@@ -16,9 +16,10 @@ from typing import Any, Optional
 
 import kit_config
 from kit.constants import (ALIAS_RE, ALLOW_PLACEHOLDERS_ENV, DEFAULT_USER_COMMANDS, ENV_NAME_RE, GOAL_COMMANDS,
-                           MODEL_COMPRESSION_KEYS, NAME_RE, PLACEHOLDER_ID_RE, SANDBOX_CPU_RANGE,
+                           MODEL_COMPRESSION_KEYS, NAME_RE, PLACEHOLDER_ID_RE, PROVIDER_NAME_RE, SANDBOX_CPU_RANGE,
                            SANDBOX_MEMORY_MB_RANGE, SECRET_LIKE_KEYS)
-from kit.profiles import MODEL_TARGETS, SYSTEM_KINDS  # noqa: F401
+from kit.profiles import (MODEL_TARGETS, PROFILE_KINDS, SYSTEM_KINDS, active_model_targets,  # noqa: F401
+                          active_system_kinds)
 from kit.util import _read_yaml_file, atomic_write, dump_yaml, file_lock
 from kit_base import TeamError, _id
 from kit_config import _bool, _int, _number, _profile, _report_time  # noqa: F401  (nama lama tetap tersedia)
@@ -72,7 +73,7 @@ def _load_llm(raw: dict) -> dict:
         raise TeamError("llm: harus mapping")
     providers = {}
     for name, block in (llm.get("providers") or {}).items():
-        if not re.match(r"^[a-z0-9][a-z0-9_-]*$", str(name)) or not isinstance(block, dict):
+        if not PROVIDER_NAME_RE.match(str(name)) or not isinstance(block, dict):
             raise TeamError(f"llm.providers.{name}: nama huruf kecil dan isinya mapping")
         block = dict(block)
         leaked = _secret_like_keys(block)
@@ -166,7 +167,7 @@ def placeholder_ids(team: dict) -> list[str]:
     pairs: list[tuple[str, str]] = [
         ("guild_id", team["guild_id"]), ("roles.member", team["member_role"]), ("roles.admin", team["admin_role"]),
         ("roles.entry", team["entry_role"]), ("category_id", team["category_id"]),
-        *((f"{kind}.channel_id", team[kind]["channel_id"]) for kind in SYSTEM_KINDS),
+        *((f"{kind}.channel_id", team[kind]["channel_id"]) for kind in active_system_kinds(team)),
         ("usage.report_channel_id", team["usage"]["report_channel_id"])]
     pairs += [(f"admins[{i}]", a) for i, a in enumerate(team["admins"])]
     pairs += [(f"onboarding.trusted_actor_ids[{i}]", a)
@@ -229,8 +230,12 @@ def _model_overrides(team: dict, mraw: dict) -> dict:
     """`models:` di members.yaml → {shared|admin|lobby: alias} (kind yang boleh jadi target set-model)."""
     overrides = {}
     for key, alias in (mraw.get("models") or {}).items():
-        if key not in MODEL_TARGETS:
-            raise TeamError(f"members.yaml models.{key}: hanya {', '.join(MODEL_TARGETS)}")
+        targets = active_model_targets(team)
+        if key in MODEL_TARGETS and key not in targets:
+            raise TeamError(f"members.yaml models.{key}: jenis '{key}' tidak dipakai tim ini (blok `{key}` belum "
+                            f"diisi di team.yaml). Hapus baris itu, atau isi {key}.channel_id")
+        if key not in targets:
+            raise TeamError(f"members.yaml models.{key}: hanya {', '.join(targets)}")
         if team["llm"] and alias not in team["llm"]["models"]:
             raise TeamError(f"members.yaml models.{key}: '{alias}' tidak ada di llm.models")
         overrides[key] = str(alias)
@@ -286,13 +291,13 @@ def _load_member(m: Any, i: int, team: dict) -> dict:
 def _validate_unique(team: dict) -> None:
     seen_channels: dict = {}
     pairs = [(f"members.{m['name']}", m["channel_id"]) for m in team["members"]]
-    pairs += [(kind, team[kind]["channel_id"]) for kind in SYSTEM_KINDS]
+    pairs += [(kind, team[kind]["channel_id"]) for kind in active_system_kinds(team)]
     for label, ch in pairs:
         if ch in seen_channels:
             raise TeamError(f"channel {ch} dipakai dua kali ({seen_channels[ch]} dan {label})")
         seen_channels[ch] = label
     profiles = [m["profile"] for m in team["members"]]
-    profiles += [team[kind]["profile"] for kind in SYSTEM_KINDS] + [team["template"]]
+    profiles += [team[kind]["profile"] for kind in active_system_kinds(team)] + [team["template"]]
     dupes = sorted({p for p in profiles if profiles.count(p) > 1})
     if dupes:
         raise TeamError(f"nama profile bentrok: {dupes}")

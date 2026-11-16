@@ -68,15 +68,44 @@ class StateStore:
         self._lock = threading.RLock()
         self.data: dict[str, Any] = {}
         self.baseline_needed = False
+        self.unreadable = False       # berkas ada tetapi tidak terbaca saat dimuat (lihat load)
+        self.load_error = ""
         self.load()
 
     # ------------------------------------------------------------------ berkas
     def load(self) -> None:
+        """Baca onboarding.json. Berkas BELUM ADA = keadaan kosong yang sah. Berkas ADA tetapi tidak terbaca /
+        bukan JSON / bukan objek = `unreadable`: keadaan terakhir di memori (bila ada) dipertahankan, isi
+        berkas yang rusak disalin ke `<nama>.rusak` sebelum tertimpa penyimpanan berikutnya, dan satu baris
+        log ditulis. Tanda "ditahan" yang hilang karena ini tidak membuka akses: gerbang akses hanya melayani
+        non-admin yang terdaftar aktif di roster (dispatch.Dispatcher._access_gate), dan susulan onboarding
+        memverifikasi ulang pemberi role-nya."""
         with self._lock:
+            raw: Any = None
+            problem = ""
             try:
-                raw = json.loads(self.path.read_text(encoding="utf-8"))
-            except (OSError, ValueError):
-                raw = None
+                text = self.path.read_text(encoding="utf-8")
+            except FileNotFoundError:
+                text = None
+            except (OSError, ValueError) as exc:
+                text, problem = None, f"{type(exc).__name__}: {exc}"
+            if text is not None:
+                try:
+                    raw = json.loads(text)
+                    if not isinstance(raw, dict):
+                        raw, problem = None, "isi bukan objek JSON"
+                except (ValueError, RecursionError) as exc:
+                    raw, problem = None, f"bukan JSON ({exc})"
+            self.unreadable = bool(problem)
+            self.load_error = problem
+            if problem:
+                self._keep_broken_copy(text)
+                from .shared import log_once
+                log_once(f"state-unreadable-{self.path}", "onboarding.json tidak terbaca (%s): %s; tanda 'ditahan' "
+                         "yang tersimpan di sana tidak terbaca — non-admin yang belum ada di roster tetap tidak "
+                         "dilayani; salinan berkas rusak: %s.rusak", self.path, problem, self.path.name)
+                if self.data:                     # muat ulang di proses yang sama: keadaan terakhir tetap dipakai
+                    return
             self.baseline_needed = not (isinstance(raw, dict) and isinstance(raw.get("welcomed"), dict))
             self.data = raw if isinstance(raw, dict) else {}
             for key in self.SECTIONS:
@@ -84,6 +113,15 @@ class StateStore:
                     self.data[key] = {}
             self.data.setdefault("version", 1)
             self.data.setdefault("schema", ONBOARDING_SCHEMA)
+
+    def _keep_broken_copy(self, text: Optional[str]) -> None:
+        """Simpan isi berkas rusak di sampingnya (0600) supaya admin bisa memulihkan daftar `held`."""
+        try:
+            if text is None:
+                text = self.path.read_bytes().decode("utf-8", errors="replace")
+            atomic_write(self.path.with_name(self.path.name + ".rusak"), text, 0o600)
+        except (OSError, ValueError):
+            pass
 
     def save(self) -> None:
         with self._lock:

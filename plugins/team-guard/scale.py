@@ -14,10 +14,24 @@ from collections import deque
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional
 
+from .refusals import refusal_metrics
 from .shared import log, log_once
 
 METRICS_SCHEMA = 1            # versi kontrak metrics.json (docs/KONTRAK.md); pembaca mengabaikan kunci tak dikenal
-REFUSAL_KINDS = ("rate", "queue_full", "budget", "user_concurrent")
+
+
+def refusal_kinds() -> tuple[str, ...]:
+    """Kunci `refused` di metrics.json — DITURUNKAN dari tabel `refusals.REFUSALS` (satu sumber; dulu daftar
+    kedua yang dirawat tangan di sini)."""
+    return refusal_metrics()
+
+
+def __getattr__(name: str) -> Any:            # nama lama, kini tampilan atas tabel yang sama
+    if name == "REFUSAL_KINDS":
+        return refusal_kinds()
+    raise AttributeError(name)
+
+
 RATE_LIMIT_REASONS = ("rate_limit", "upstream_rate_limit")       # agent/error_classifier.py::FailoverReason
 
 MSG_THROTTLED = ("🐢 Endpoint LLM mengembalikan {hits} kali 429 dalam {window} detik. Batas sesi anggota "
@@ -194,13 +208,26 @@ class Metrics:
     def __init__(self, wait_window: float = 300.0):
         self.wait_window = wait_window
         self._lock = threading.Lock()
-        self.refused: dict[str, int] = {k: 0 for k in REFUSAL_KINDS}
+        self.refused: dict[str, int] = {k: 0 for k in refusal_kinds()}
+        self.limiter_errors: dict[str, int] = {}              # nama pembatas → berapa kali `check`-nya melempar
         self._waits: deque[tuple[float, float]] = deque(maxlen=2000)
         self._hits: deque[float] = deque(maxlen=4096)
 
     def refuse(self, kind: str) -> None:
         with self._lock:
             self.refused[kind] = self.refused.get(kind, 0) + 1
+
+    def limiter_error(self, name: str) -> None:
+        with self._lock:
+            self.limiter_errors[name] = self.limiter_errors.get(name, 0) + 1
+
+    def refused_snapshot(self) -> dict[str, int]:
+        """Semua jenis terdaftar (0 bila belum pernah) + jenis lain yang BENAR-BENAR terjadi (mis. `other`
+        untuk `kind` tak terdaftar, atau jenis yang didaftarkan setelah objek ini dibuat)."""
+        with self._lock:
+            out = {k: int(self.refused.get(k, 0)) for k in refusal_kinds()}
+            out.update({str(k): int(v) for k, v in self.refused.items() if k not in out and v})
+        return out
 
     def observe_wait(self, now: float, seconds: float) -> None:
         with self._lock:
@@ -306,7 +333,7 @@ def build_metrics(rt: Any, gateway: Any, probe: Any = None, wall: Callable[[], f
         "llm_inflight_peak_5m": rt.llm.peak(now),
         "queue_len": len(rt.queue),
         "queue_wait_p95_s": rt.metrics.wait_p95(now),
-        "refused": {k: int(rt.metrics.refused.get(k, 0)) for k in REFUSAL_KINDS},
+        "refused": rt.metrics.refused_snapshot(),
         "http_429_last_minute": rt.metrics.hits_last_minute(now),
         "effective_max_active": effective,
         "configured_max_active": configured,

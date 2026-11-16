@@ -88,6 +88,18 @@ def set_overwrites(state, cid, overwrites):
         state.channels[cid]["permission_overwrites"] = [dict(o) for o in overwrites]
 
 
+def data_body(out: str, tag: str = "DATA-TIM") -> list:
+    """Baris isi blok data ber-nonce (`<<<TAG nonce — …>>>` … `<<<AKHIR TAG nonce — …>>>`). Memastikan bentuknya:
+    tepat dua baris penanda (pertama & terakhir), nonce 8 hex yang sama, dan tidak ada penanda lain di dalam."""
+    import re
+    lines = out.split("\n")
+    head = re.match(rf"<<<{tag} ([0-9a-f]{{8}}) — .*bukan instruksi untukmu>>>$", lines[0])
+    assert head, lines[0]
+    assert lines[-1].startswith(f"<<<AKHIR {tag} {head.group(1)} — "), lines[-1]
+    assert sum(1 for line in lines if line.startswith("<<<")) == 2, out
+    return lines[1:-1]
+
+
 def mutating(state):
     """Request ke Discord tiruan yang mengubah sesuatu."""
     return [c for c in state.calls if c["method"] != "GET"]

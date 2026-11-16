@@ -6,9 +6,12 @@ kolektor kit dijalankan sebagai subprocess lepas paling sering tiap `COLLECT_EVE
 
 Gagal-terbuka: buku besar yang belum ada / tidak terbaca mematikan penegakan anggaran dengan SATU baris
 log — pesan anggota tetap dilayani. Itu disengaja: gangguan pencatatan tidak boleh menghentikan tim.
-Supaya tidak diam-diam: bila potret terakhir kolektor (`meta.last_collect`) lebih tua dari `STALE_AFTER`
-(atau buku besar tidak terbaca selama itu), admin dikabari sekali sehari dan metrics.json memuat
-`budget.stale: true`.
+Supaya tidak diam-diam:
+  - begitu anggaran dikonfigurasi tetapi buku besar tidak terbaca (dan tidak ada angka hari ini di cache): satu
+    baris log, `Budget.ledger_ok` = False, metrics.json `budget.stale: true` SEKETIKA, dan capabilities.json
+    memuat `budget.ledger` = {available: false, reason} (ditampilkan kit_doctor); pulih → dicatat lagi;
+  - bila potret terakhir kolektor (`meta.last_collect`) lebih tua dari `STALE_AFTER` (atau buku besar tidak
+    terbaca selama itu), admin dikabari sekali sehari dan metrics.json memuat `budget.stale: true`.
 
 Jatah tambahan per orang (`budget_overrides.json`) HANYA menaikkan batas orang itu; plafon tim tetap
 seperti di konfigurasi (batas keras).
@@ -143,20 +146,49 @@ class Budget:
         self._told: set[tuple[str, str, str]] = set()                           # (hari, jenis, uid)
         self._last_collect: Optional[float] = None      # meta.last_collect dari pembacaan terakhir yang berhasil
         self._since: Optional[float] = None             # pertama kali anggaran diperiksa (acuan bila belum ada potret)
+        # Kesehatan penegakan: None = belum pernah diperiksa / anggaran tidak dikonfigurasi; False = anggaran
+        # dikonfigurasi tetapi TIDAK ditegakkan (buku besar tidak terbaca / roster tanpa usage.ledger).
+        self.ledger_ok: Optional[bool] = None
+        self.ledger_error: str = ""
+        self.on_health: Optional[Callable[[bool, str], None]] = None    # diisi Runtime → capabilities.json
+
+    def _set_health(self, ok: bool, reason: str = "") -> None:
+        """Catat perubahan keadaan (satu baris log per perubahan) dan teruskan ke `on_health`. Dipanggil di
+        luar kunci; tidak pernah melempar."""
+        changed = self.ledger_ok is not ok or (not ok and reason != self.ledger_error)
+        was = self.ledger_ok
+        self.ledger_ok, self.ledger_error = ok, ("" if ok else reason)
+        if not changed:
+            return
+        if not ok:
+            log_once(f"budget-unenforced-{reason}", "anggaran token TIDAK ditegakkan: %s; pesan tetap dilayani "
+                     "tanpa batas token (tercatat sebagai `budget.ledger` di capabilities.json)", reason)
+        elif was is False:
+            import logging
+            from .shared import log
+            log.log(logging.INFO, "team-guard: buku besar pemakaian terbaca lagi; anggaran token ditegakkan kembali")
+        try:
+            if self.on_health is not None:
+                self.on_health(ok, "buku besar pemakaian terbaca" if ok else reason)
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------ sumber data
     def today(self, roster: Any) -> str:
         return day_of(self.wall(), resolve_tz(usage_config(roster)["timezone"]))
 
-    def usage(self, roster: Any, quiet: bool = False) -> Optional[dict[str, int]]:
-        """Pemakaian hari ini per user_key (cache 60 detik); None bila buku besar tidak tersedia."""
+    def usage(self, roster: Any, quiet: bool = False, track: Optional[bool] = None) -> Optional[dict[str, int]]:
+        """Pemakaian hari ini per user_key (cache 60 detik); None bila buku besar tidak tersedia.
+        `track` = catat kesehatan penegakan (`ledger_ok`); bawaan: ya bila tidak `quiet` (jalur `check`)."""
+        track = (not quiet) if track is None else track
         ledger = usage_config(roster)["ledger"]
         if not ledger:
-            if not quiet:
-                log_once("budget-no-ledger", "anggaran token nonaktif: roster.json tidak memuat usage.ledger "
-                         "(jalankan ulang `hermes_team.py apply`)")
+            if track:                             # satu baris log + capabilities.json (lihat _set_health)
+                self._set_health(False, "roster.json tidak memuat usage.ledger (jalankan ulang "
+                                        "`hermes_team.py apply`)")
             return None
         now, day = self.wall(), self.today(roster)
+        failure = ""
         with self._lock:
             cached = self._cache
             if cached is not None and cached[1] == day and cached[2] == ledger and 0 <= now - cached[0] < CACHE_TTL:
@@ -166,12 +198,13 @@ class Budget:
             except (OSError, sqlite3.Error, ValueError) as exc:
                 if cached is not None and cached[1] == day and cached[2] == ledger:
                     return cached[3]              # sedang ditulis kolektor: pakai angka terakhir hari ini
-                if not quiet:
-                    log_once("budget-ledger", "anggaran token nonaktif: buku besar %s tidak terbaca (%s: %s); "
-                             "pesan tetap dilayani", ledger, type(exc).__name__, exc)
-                return None
-            self._cache = (now, day, ledger, used)
-            return used
+                failure = f"buku besar {ledger} tidak terbaca ({type(exc).__name__}: {exc})"
+                used = None
+            else:
+                self._cache = (now, day, ledger, used)
+        if track:
+            self._set_health(not failure, failure)
+        return used
 
     def overrides(self, day: str) -> dict[str, int]:
         """uid → token tambahan dari `<state_dir>/budget_overrides.json` yang berlaku pada `day`."""
@@ -310,18 +343,26 @@ class Budget:
     def snapshot(self, roster: Any) -> dict:
         """Bagian `budget` di metrics.json."""
         try:
+            settings = roster.settings
+            wanted = _int(settings.get("daily_token_budget")) > 0 or _int(settings.get("team_daily_token_budget")) > 0
+        except Exception:
+            wanted = False
+        try:
             day = self.today(roster)
-            used = self.usage(roster, quiet=True) or {}
+            used = self.usage(roster, quiet=True, track=wanted) or {}
         except Exception:
             day, used = "", {}
         try:
             stale = self.staleness(roster)[0]
         except Exception:
             stale = False
-        # `stale: true` = potret kolektor terlalu tua → angka di atas BUKAN keadaan sekarang dan anggaran
-        # praktis tidak ditegakkan. `last_collect` = waktu potret terakhir (epoch) atau null.
-        return {"day": day, "used_by_user": dict(used), "team_used": sum(used.values()), "stale": bool(stale),
-                "last_collect": self._last_collect}
+        # `stale: true` = angka di atas BUKAN keadaan sekarang dan anggaran praktis tidak ditegakkan: potret
+        # kolektor terlalu tua, ATAU anggaran dikonfigurasi tetapi buku besar tidak terbaca saat ini
+        # (`ledger_ok` False — seketika, tanpa menunggu STALE_AFTER). `last_collect` = waktu potret terakhir
+        # (epoch) atau null.
+        unenforced = wanted and self.ledger_ok is False
+        return {"day": day, "used_by_user": dict(used), "team_used": sum(used.values()),
+                "stale": bool(stale or unenforced), "last_collect": self._last_collect}
 
 
 def _int(value: Any) -> int:

@@ -23,13 +23,18 @@ KIT_SKILLS = KIT_DIR / "skills"
 DEFAULT_TEAM_DIR = kit_paths.team_dir()     # nilai saat impor; pakai kit_paths.team_dir() untuk nilai terkini
 
 
-PROFILE_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")     # aturan nama profile Hermes
+# Semua regex validasi di kit memakai \Z, bukan $: `$` juga cocok SEBELUM baris baru penutup, jadi "nama\n"
+# lolos dan baris baru itu ikut ke argv `hermes`, nama folder, dan YAML.
+PROFILE_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}\Z")     # aturan nama profile Hermes
 
 
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,40}\Z")         # nama anggota
 
 
-ALIAS_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,79}$")
+ALIAS_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,79}\Z")
+
+
+PROVIDER_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*\Z")     # nama di llm.providers
 
 
 ENV_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]{1,63}\Z")
@@ -61,6 +66,10 @@ LOBBY_DISABLED_TOOLSETS = [
 ]
 
 
+# Toolset penjadwalan: cron job berjalan tanpa pesan, jadi tidak lewat rate limit maupun antrean.
+CRON_TOOLSET = "cronjob"
+
+
 # Toolset Discord bisa membaca channel lain yang terlihat bot — selalu matikan untuk pekerja.
 WORKER_DISABLED_TOOLSETS = ["discord", "discord_admin"]
 
@@ -68,6 +77,26 @@ WORKER_DISABLED_TOOLSETS = ["discord", "discord_admin"]
 # Browser lokal & computer use berjalan di HOST (bukan di sandbox Docker) dan berat untuk 20 orang;
 # mati kecuali team.yaml `allow_browser: true`.
 HOST_SIDE_TOOLSETS = ["browser", "computer_use"]
+
+
+# Profile PEKERJA (member, template, shared, admin) memakai daftar toolset yang DIIZINKAN, bukan daftar larangan:
+# Hermes mengaktifkan toolset baru secara otomatis, jadi apa pun yang dikenal kit (KNOWN_TOOLSETS) tetapi tidak
+# ada di daftar ini — dan bukan toolset bersyarat di bawah — ditulis ke `agent.disabled_toolsets` profile itu.
+# Toolset bersyarat: HOST_SIDE_TOOLSETS (hanya dengan `allow_browser: true`) dan CRON_TOOLSET (admin selalu;
+# anggota/bersama hanya dengan `scale.allow_member_cron: true`). Uji drift (tests/test_kit_units.py,
+# TestWorkerToolsetAllowlist; jalan di CI terhadap Hermes asli) gagal bila upstream punya toolset yang belum
+# digolongkan di salah satu daftar — toolset baru harus DIPUTUSKAN (izinkan atau matikan), tidak lolos diam-diam.
+WORKER_ALLOWED_TOOLSETS = [
+    "terminal", "file", "code_execution", "web", "search", "x_search", "vision", "video",
+    "image_gen", "video_gen", "tts", "skills", "memory", "session_search", "todo",
+    "delegation", "connections", "kanban",
+    "project", "bot_room", "desktop_ui", "onboarding", "catalog", "clarify", "context_engine",
+    "feishu_doc", "feishu_drive", "debugging", "safe", "coding",
+]
+
+
+# Semua toolset upstream yang dikenal kit (= daftar lobby, yang dijaga lengkap oleh uji integrasi).
+KNOWN_TOOLSETS = tuple(LOBBY_DISABLED_TOOLSETS)
 
 
 # Tugas auxiliary yang dialihkan ke model "murah" supaya beban & throttle di model utama turun.
@@ -111,8 +140,6 @@ REPORT_KINDS = ("daily", "weekly", "monthly")
 GOAL_COMMANDS = ("goal", "subgoal")
 
 
-# Toolset penjadwalan: cron job berjalan tanpa pesan, jadi tidak lewat rate limit maupun antrean.
-CRON_TOOLSET = "cronjob"
 
 
 # ID contoh dari team.example.yaml / members.example.yaml: satu digit, deretan nol, lalu 1–2 digit

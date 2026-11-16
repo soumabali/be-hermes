@@ -13,10 +13,13 @@ import yaml
 import kit_config
 from kit_contracts import ROSTER_SCHEMA
 from kit_base import KIT_VERSION, TeamError
-from kit.constants import AUX_TASKS, CRON_TOOLSET, DM_DECLINE_MESSAGE, HOST_SIDE_TOOLSETS, KIT_DIR, KIT_SKILLS, LOBBY_DISABLED_TOOLSETS, PLUGIN_NAME, PROFILE_SCOPED_KEYS, TEAMCTL, WORKER_DISABLED_TOOLSETS
+from kit.constants import (AUX_TASKS, CRON_TOOLSET, DM_DECLINE_MESSAGE, HOST_SIDE_TOOLSETS, KIT_DIR,  # noqa: F401
+                           KIT_SKILLS, KNOWN_TOOLSETS, LOBBY_DISABLED_TOOLSETS, PLUGIN_NAME, PROFILE_SCOPED_KEYS,
+                           TEAMCTL, WORKER_ALLOWED_TOOLSETS, WORKER_DISABLED_TOOLSETS)
 from kit.util import atomic_write, dump_yaml, managed_dir, now_iso
-from kit.profiles import (MODEL_TARGETS, PROFILE_KINDS, SYSTEM_KINDS, base_settings, kind_of,  # noqa: F401
-                          teamctl_server, worker_disabled_toolsets)
+from kit.profiles import (MODEL_TARGETS, PROFILE_KINDS, SYSTEM_KINDS, active_model_targets,  # noqa: F401
+                          active_system_kinds, base_settings, kind_configured, kind_of, teamctl_server,
+                          worker_allowed_toolsets, worker_disabled_toolsets)
 from kit.config import compression_limits
 
 
@@ -44,7 +47,7 @@ def build_routes(team: dict) -> list[dict]:
         if team["strict"]:
             route["user_id"] = m["user_id"]
         routes.append(route)
-    for kind in SYSTEM_KINDS:
+    for kind in active_system_kinds(team):
         block, spec = team[kind], PROFILE_KINDS[kind]
         if spec.admin_routes and team["admin_strict"]:
             # Channel khusus admin: satu rute per user_id admin (user lain jatuh ke lobby).
@@ -109,7 +112,7 @@ def host_memory_mb(path: Optional[Path] = None) -> Optional[int]:
 def sandbox_worst_case_mb(team: dict) -> int:
     """Plafon RAM bila SEMUA sandbox penuh sekaligus: anggota aktif + satu per jenis ber-channel (shared, admin)."""
     return (sum(sandbox_limits(team, m)[1] for m in active_members(team))
-            + len(SYSTEM_KINDS) * sandbox_limits(team)[1])
+            + len(active_system_kinds(team)) * sandbox_limits(team)[1])
 
 
 def sandbox_warnings(team: dict) -> list[str]:
@@ -126,7 +129,7 @@ def used_model_aliases(team: dict) -> list[str]:
     if not team["llm"]:
         return []
     aliases = [model_alias(team, "member", m) for m in active_members(team)]
-    aliases += [team["llm"]["default_model"]] + [model_alias(team, role) for role in MODEL_TARGETS]
+    aliases += [team["llm"]["default_model"]] + [model_alias(team, role) for role in active_model_targets(team)]
     return list(dict.fromkeys(aliases))
 
 
@@ -159,6 +162,17 @@ def fallback_warnings(team: dict) -> list[str]:
     return warnings
 
 
+def budget_warnings(team: dict) -> list[str]:
+    """Tanpa satu pun batas biaya: anggaran token per orang, anggaran token tim, dan batas panggilan LLM paralel
+    semuanya 0. Rate limit pesan tetap ada, tetapi satu pesan bisa memicu puluhan langkah tool."""
+    scale = team["scale"]
+    if any(int(scale.get(key) or 0) for key in ("daily_token_budget", "team_daily_token_budget", "max_llm_parallel")):
+        return []
+    return ["tidak ada batas biaya: scale.daily_token_budget, scale.team_daily_token_budget, dan "
+            "scale.max_llm_parallel semuanya 0 — pemakaian token tim tidak punya plafon. Isi minimal satu "
+            "(nilai awal yang disarankan ada di team.example.yaml → scale), lalu `apply`."]
+
+
 def plugin_settings(team: dict) -> list[tuple[str, object]]:
     return [(f"plugins.entries.{PLUGIN_NAME}.settings.state_dir", team["paths"]["state_dir"])]
 
@@ -166,7 +180,7 @@ def plugin_settings(team: dict) -> list[tuple[str, object]]:
 def gateway_channels(team: dict) -> tuple[list[str], list[str]]:
     """(allowed_channels, free_response_channels) untuk adapter Discord host."""
     personal = [m["channel_id"] for m in active_members(team)]
-    system = [(team[k]["channel_id"], PROFILE_KINDS[k]) for k in SYSTEM_KINDS]
+    system = [(team[k]["channel_id"], PROFILE_KINDS[k]) for k in active_system_kinds(team)]
     # Bot hanya hidup di channel terdaftar; thread ikut lewat parent channel-nya.
     # Channel pribadi & admin: tanpa @mention. #hermes-shared: wajib @mention → thread (`free_response` per jenis).
     return personal + [cid for cid, _ in system], personal + [cid for cid, spec in system if spec.free_response]
@@ -177,7 +191,7 @@ def host_settings(team: dict) -> list[tuple[str, object]]:
     allowed, free = gateway_channels(team)
     admin = team["admin"]["channel_id"]
     bindings = [{"id": team[k]["channel_id"], "skills": team[k]["auto_skills"]}
-                for k in SYSTEM_KINDS if team[k]["auto_skills"]]
+                for k in active_system_kinds(team) if team[k]["auto_skills"]]
     scale = team["scale"]
     settings: list[tuple[str, object]] = [
         ("gateway.multiplex_profiles", True),
@@ -347,6 +361,63 @@ def managed_install_command(team: dict) -> str:
     return shlex.join(cmd)
 
 
+# Pin sandbox di managed config: tanpa ini terminal/file/execute_code profile bisa berjalan di HOST.
+SANDBOX_PIN_KEYS = ("terminal.backend", "terminal.docker_mount_cwd_to_workspace", "terminal.docker_volumes",
+                    "terminal.docker_extra_args")
+
+
+def managed_sandbox_problem(path: Optional[Path] = None) -> str:
+    """Kenapa managed config TERPASANG belum menjamin sandbox Docker ("" = sudah): berkas tidak ada / tidak
+    terbaca, `terminal.backend` bukan docker, mount cwd tidak dipin false, atau docker_volumes /
+    docker_extra_args tidak dipin (nilainya tidak dinilai di sini — beda nilai dilaporkan `managed --diff`)."""
+    path = Path(path) if path else managed_dir() / "config.yaml"
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return f"{path} belum ada"
+    except (OSError, yaml.YAMLError) as exc:
+        return f"{path} tidak terbaca ({type(exc).__name__})"
+    backend = _get_nested(data, "terminal.backend")
+    if backend != "docker":
+        return f"{path} tidak mem-pin terminal.backend: docker (sekarang: {backend!r})"
+    if _get_nested(data, "terminal.docker_mount_cwd_to_workspace") is not False:
+        return f"{path} tidak mem-pin terminal.docker_mount_cwd_to_workspace: false"
+    unpinned = [k for k in SANDBOX_PIN_KEYS[2:] if _get_nested(data, k) is None]
+    if unpinned:
+        return f"{path} tidak mem-pin {', '.join(unpinned)}"
+    return ""
+
+
+def unmanaged_allowed(team: dict) -> bool:
+    return bool((team.get("sandbox") or {}).get("allow_unmanaged"))
+
+
+def managed_required_message(team: dict, problem: str, what: str = "apply") -> str:
+    return (f"{what} ditolak: {problem}. Sandbox Docker hanya dipaksakan lewat managed config; tanpa itu "
+            "terminal anggota bisa berjalan langsung di HOST. Pasang dulu, persis:\n"
+            f"  {managed_install_command(team)}\n"
+            "lalu ulangi perintah ini. (Sengaja tanpa managed config? `sandbox.allow_unmanaged: true` di "
+            "team.yaml — anggota bisa mendapat shell host.)")
+
+
+def require_managed_sandbox(team: dict, what: str = "apply") -> None:
+    """TeamError berisi perintah sudo persisnya bila managed config terpasang belum mem-pin sandbox Docker
+    (kecuali `sandbox.allow_unmanaged: true`). Dipanggil SEBELUM anggota mulai dilayani: apply, onboarding,
+    add-member, set-active on."""
+    problem = "" if unmanaged_allowed(team) else managed_sandbox_problem()
+    if problem:
+        raise TeamError(managed_required_message(team, problem, what))
+
+
+def unmanaged_warnings(team: dict) -> list[str]:
+    if not unmanaged_allowed(team):
+        return []
+    problem = managed_sandbox_problem()
+    state = f"dan SAAT INI {problem}" if problem else "saat ini managed config terpasang dan mem-pin sandbox"
+    return ["sandbox.allow_unmanaged: true — pemeriksaan managed config DIMATIKAN (" + state + "). Tanpa pin "
+            "itu terminal anggota bisa berjalan di HOST. Hapus setelan ini begitu /etc/hermes/config.yaml terpasang."]
+
+
 def managed_diff_lines(diff: dict) -> list[str]:
     path = diff["path"]
     if diff["missing_file"]:
@@ -448,7 +519,7 @@ def roster_data(team: dict, hermes_root: Path, hermes_bin: str) -> dict:
     # Anggota nonaktif: hanya untuk mengenali channel lamanya (tidak dirutekan, tidak dilayani).
     inactive = {m["user_id"]: {"name": m["name"], "channel_id": m["channel_id"]}
                 for m in team["members"] if not m.get("active", True)}
-    for kind in SYSTEM_KINDS:
+    for kind in active_system_kinds(team):
         spec = PROFILE_KINDS[kind]
         entry = {"profile": team[kind]["profile"], "kind": kind}
         if spec.role != "member":            # kunci opsional: hanya ditulis bila berbeda dari bawaan plugin

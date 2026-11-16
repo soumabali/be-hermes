@@ -14,12 +14,21 @@ Yang TIDAK terkonfirmasi (dianggap konservatif):
   - rentang melingkar (`59-58`, `50-10`, detik `59-0`) dihitung melingkar seperti croniter versi baru;
   - nama bulan/hari (JAN, MON) hanya sah di kolom bulan/hari, yang tidak memengaruhi jarak terpendek.
 
-Kebijakan untuk jadwal yang tidak bisa dihitung:
+  - satuan detik ("30s", "every 90s") dan makro "@hourly" / "@daily" / … : TIDAK terkonfirmasi diterima
+    Hermes; tetap diurai di sini (detik = pecahan menit; makro = jaraknya) supaya tidak bergantung pada
+    Hermes menolaknya.
+
+Kebijakan untuk jadwal yang tidak bisa dihitung (hanya saat `cron_min_interval_minutes` > 0): gagal-TERTUTUP.
+Spasi dinormalkan dulu (tab / baris baru / spasi ganda → satu spasi), lalu:
   - string yang BERBENTUK ekspresi cron (≥5 kolom karakter cron — syarat yang sama dengan
     parse_schedule Hermes sebelum menyerahkannya ke croniter) tetapi jarak terpendeknya tidak bisa
-    dihitung → DITOLAK dengan pesan jelas (gagal-tertutup: bentuk cron eksotis tidak boleh jadi celah);
-  - teks bebas yang memang bukan cron → diloloskan dengan satu baris log (Hermes sendiri yang menolaknya
-    bila tidak sah).
+    dihitung → DITOLAK (`MSG_CRON_UNKNOWN`);
+  - "@reboot" → DITOLAK (`MSG_CRON_REBOOT`);
+  - bentuk lain yang tidak dipahami (teks bebas, "every\u200b1m", "@aneh", jadwal bukan teks) → DITOLAK
+    dengan daftar bentuk yang diterima (`MSG_CRON_UNPARSED`). Dulu bentuk ini diloloskan dengan harapan Hermes
+    menolaknya; penjaga tidak lagi bergantung pada itu. Akibatnya bentuk yang sah bagi Hermes tetapi tidak ada
+    di daftar di atas ikut ditolak sampai ditambahkan di sini.
+Bentuk sekali-jalan yang dikenal ("in 30m", timestamp ISO) tetap lolos pemeriksaan interval.
 """
 from __future__ import annotations
 
@@ -32,8 +41,12 @@ from typing import Any, Callable, Optional
 from .shared import log_once
 
 CRON_TOOLS = {"cronjob_manage", "cronjob"}
-_DURATION = re.compile(r"^(\d*)\s*(m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days)$")
-_UNIT_MINUTES = {"m": 1, "h": 60, "d": 1440}
+_DURATION = re.compile(r"^(\d*)\s*(s|sec|secs|second|seconds|m|min|mins|minute|minutes|h|hr|hrs|hour|hours|"
+                       r"d|day|days)$")
+_UNIT_MINUTES = {"s": 1 / 60, "m": 1, "h": 60, "d": 1440}
+# Makro bergaya cron → jarak terpendek antar eksekusi (menit). "@monthly" memakai bulan terpendek (28 hari).
+_MACROS = {"@hourly": 60.0, "@daily": 1440.0, "@midnight": 1440.0, "@weekly": 10080.0, "@monthly": 40320.0,
+           "@yearly": 525600.0, "@annually": 525600.0}
 _CRON_FIELD = re.compile(r"^[A-Za-z\d\*\-,/]+$")
 _DAY_WORDS = {
     "day", "daily", "everyday", "weekday", "weekdays", "weekend", "weekends",
@@ -44,6 +57,12 @@ _DAY_WORDS = {
 MSG_CRON_UNKNOWN = ("Jadwal cron '{schedule}' tidak bisa diperiksa penjaga interval tim (bentuk ekspresi cron "
                     "ini tidak dikenali), jadi ditolak. Pakai bentuk 5 kolom biasa (mis. '*/{limit} * * * *' atau "
                     "'0 9 * * *') atau interval (mis. 'every {limit}m'); batas tim paling rapat tiap {limit} menit.")
+MSG_CRON_UNPARSED = ("Jadwal cron '{schedule}' tidak dipahami penjaga interval tim, jadi ditolak (batas tim: paling "
+                     "rapat tiap {limit} menit). Pakai salah satu bentuk ini: interval ('every {limit}m', "
+                     "'every 2h'), harian/mingguan ('every monday 9am', 'weekdays at 9am'), ekspresi cron 5 kolom "
+                     "('0 9 * * *'), atau sekali jalan ('in 30m', '2026-06-01T09:00').")
+MSG_CRON_REBOOT = ("Jadwal cron '@reboot' tidak diizinkan penjaga interval tim (jalan tiap gateway start, jaraknya "
+                   "tidak bisa dijamin). Pakai interval (mis. 'every {limit}m') atau ekspresi cron 5 kolom.")
 MSG_CRON = ("Jadwal cron '{schedule}' berjalan tiap ±{every}; batas tim paling rapat tiap {limit} menit. "
             "Pakai jadwal yang lebih jarang (mis. 'every {limit}m'), atau minta admin tim bila memang perlu.")
 
@@ -53,6 +72,11 @@ def _duration_minutes(text: str) -> Optional[float]:
     if not match:
         return None
     return float((int(match.group(1)) if match.group(1) else 1) * _UNIT_MINUTES[match.group(2)[0]])
+
+
+def normalize(schedule: str) -> str:
+    """Semua jenis spasi (tab, baris baru, NBSP, spasi ganda) → satu spasi; tanpa spasi di tepi."""
+    return " ".join(schedule.split())
 
 
 def _field_values(field: str, low: int, high: int) -> Optional[set[int]]:
@@ -101,7 +125,7 @@ def looks_like_cron(schedule: Any) -> bool:
     bukan frasa hari, ≥5 kolom dan lima kolom pertama hanya berisi karakter cron."""
     if not isinstance(schedule, str):
         return False
-    text = schedule.strip()
+    text = normalize(schedule)
     if text.lower().startswith("every ") or _is_day_phrase(text.lower(), False):
         return False
     parts = text.split()
@@ -140,8 +164,10 @@ def schedule_interval_minutes(schedule: Any) -> Optional[float]:
     (pemanggil membedakan "berbentuk cron" dari teks bebas lewat `looks_like_cron`)."""
     if not isinstance(schedule, str) or not schedule.strip():
         return None
-    text = schedule.strip()
+    text = normalize(schedule)
     lower = text.lower()
+    if lower in _MACROS:
+        return _MACROS[lower]
     is_every = lower.startswith("every ")
     rest = lower[6:].strip() if is_every else lower
     # Urutan sama dengan Hermes: frasa hari dulu ("every monday 9am", "weekdays at 9am"), lalu "every X",
@@ -175,18 +201,24 @@ def check_cron_call(tool_name: Any, args: Any, min_minutes: Any) -> Optional[str
     if limit <= 0 or str(tool_name or "") not in CRON_TOOLS or not isinstance(args, dict):
         return None
     schedule = args.get("schedule")
-    if not isinstance(schedule, str) or not schedule.strip():
+    if schedule is None or (isinstance(schedule, str) and not schedule.strip()):
         return None                                           # list / pause / run / update tanpa jadwal baru
+    if not isinstance(schedule, str):                         # bentuk aneh (angka, daftar, objek): tidak dipahami
+        return MSG_CRON_UNPARSED.format(schedule=str(schedule)[:80], limit=limit)
+    shown = normalize(schedule)[:80]
     interval = schedule_interval_minutes(schedule)
     if interval is None and looks_like_cron(schedule):
         return MSG_CRON_UNKNOWN.format(schedule=schedule.strip()[:80], limit=limit)
     if interval is None:
-        log_once("cron-unparsed", "jadwal cron tidak bisa diurai penjaga interval (contoh: %r); diloloskan",
+        if normalize(schedule).lower() == "@reboot":
+            return MSG_CRON_REBOOT.format(limit=limit)
+        # Gagal-tertutup: tidak lagi diloloskan dengan harapan Hermes yang menolaknya.
+        log_once("cron-unparsed", "jadwal cron tidak bisa diurai penjaga interval (contoh: %r); ditolak",
                  schedule[:80])
-        return None
+        return MSG_CRON_UNPARSED.format(schedule=shown, limit=limit)
     if interval >= limit:
         return None
-    return MSG_CRON.format(schedule=schedule.strip()[:80], every=_human(interval), limit=limit)
+    return MSG_CRON.format(schedule=shown, every=_human(interval), limit=limit)
 
 
 # ----------------------------------------------------------------------------- laju pembuatan / perubahan

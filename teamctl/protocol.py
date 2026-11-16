@@ -268,10 +268,12 @@ class ProtocolMixin:
             text = self.call_tool(name, args)
             self.reply(mid, {"content": [{"type": "text", "text": text}], "isError": False})
         except (ToolError, ht.TeamError) as exc:
-            self.reply(mid, {"content": [{"type": "text", "text": f"Gagal: {exc}"}], "isError": True})
+            # Teks galat sering mengulang masukan/teks buatan anggota (nama skill, path berkas, jawaban Discord):
+            # dijadikan SATU baris tanpa karakter kontrol dan dibatasi, supaya tidak bisa menyusun "pesan sistem".
+            self.reply(mid, {"content": [{"type": "text", "text": f"Gagal: {_clean(exc, 1500)}"}], "isError": True})
         except Exception as exc:  # pragma: no cover - jaga-jaga
             traceback.print_exc(file=sys.stderr)
-            self.reply(mid, {"content": [{"type": "text", "text": f"Gagal (internal): {type(exc).__name__}: {exc}"}],
+            self.reply(mid, {"content": [{"type": "text", "text": f"Gagal (internal): {type(exc).__name__}: {_clean(exc, 600)}"}],
                              "isError": True})
         finally:
             self.local.call = None

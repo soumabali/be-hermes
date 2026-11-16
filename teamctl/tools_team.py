@@ -8,10 +8,11 @@ import shutil
 from typing import Union
 
 import hermes_team as ht
-from kit.profiles import MODEL_TARGETS
+from kit import skills as kit_skills
+from kit.profiles import MODEL_TARGETS, PROFILE_KINDS
 
-from .confirm import Plan, PlanFn, Planner, _clean, _q
-from .discord_guard import TYPE_NAMES, VIEW, Server
+from .confirm import Plan, PlanFn, Planner, _clean, _clean_message, _name, _q
+from .discord_guard import TYPE_NAMES, VIEW, Server, _untrusted_block
 from .errors import ToolError
 from .registry import tool
 
@@ -31,7 +32,8 @@ def team_status(ctl, args: dict) -> str:
     registry = ht.shared_skill_registry(team)["skills"]
     if registry:
         text += "\n\nSkill yang dibagikan: " + ", ".join(
-            f"{k} (dari {v.get('origin_member')}, {v.get('scope')})" for k, v in sorted(registry.items()))
+            f"{_q(k, 80)} (dari {_clean((v or {}).get('origin_member'), 41)}, {_clean((v or {}).get('scope'), 20)})"
+            for k, v in sorted(registry.items()))
     metrics, note = ctl._read_metrics(team)
     fresh = metrics is not None and not note.startswith("DATA BASI")
     text += "\n\n" + "\n".join(ctl._load_section(team, metrics, note))
@@ -39,7 +41,8 @@ def team_status(ctl, args: dict) -> str:
     warnings = ht.fallback_warnings(team)
     if warnings:
         text += "\n\nPeringatan konfigurasi:\n" + "\n".join(f"- {w}" for w in warnings)
-    return text
+    # Nama tampilan anggota (berasal dari nick Discord) dan nama skill kiriman ada di dalam teks ini → data berlabel.
+    return _untrusted_block(f"status tim {_q(team['team_name'], 80)}", text)
 
 
 @tool(
@@ -67,6 +70,13 @@ def list_models(ctl, args: dict) -> str:
 def _kind_choices(names: list) -> str:
     """'a, b, atau c' (satu nama: 'a'); dipakai pesan target set_model yang diturunkan dari PROFILE_KINDS."""
     return names[0] if len(names) < 2 else ", ".join(names[:-1]) + ", atau " + names[-1]
+
+
+def _model_target_kinds(team: dict) -> list:
+    """Jenis yang sah jadi target set_model DI TIM INI: MODEL_TARGETS tanpa jenis ber-channel yang bloknya tidak ada
+    di team.yaml (jenis opsional yang tidak dipakai) — jenis tanpa channel (lobby) selalu ikut."""
+    return [k for k in MODEL_TARGETS
+            if not PROFILE_KINDS[k].needs_channel or (team.get(k) or {}).get("profile")]
 
 
 def _check_add_member_args(team: dict, name: str, user_id: str, model: str, channel_id: str) -> None:
@@ -150,10 +160,11 @@ def add_member(ctl, args: dict) -> PlanFn:
             result = ht.add_member(team, hermes, name=name, user_id=user_id, display_name=display, model=model,
                                    channel_id=channel_id, create_channel=not channel_id)
             added = result["member"]
-            lines = [f"Anggota {added['display_name']} ditambahkan: profile {added['profile']}, "
+            shown = _q(added['display_name'], 64)
+            lines = [f"Anggota {shown} ditambahkan: profile {added['profile']}, "
                      f"channel <#{added['channel_id']}>, model {effective}."]
-            lines += [f"- {note}" for note in result["notes"]]
-            lines.append(ctl._activation_note(team, result) + f" {added['display_name']} bisa langsung chat di "
+            lines += [f"- {_clean(note, 400)}" for note in result["notes"]]
+            lines.append(ctl._activation_note(team, result) + f" {shown} bisa langsung chat di "
                          "channelnya dan menyimpan secret dengan /env-set.")
             return "\n".join(lines) + ctl._tail(hermes)
 
@@ -188,9 +199,13 @@ def set_model(ctl, args: dict) -> PlanFn:
         if alias not in team["llm"]["models"]:
             raise ToolError(f"model {_q(alias, 60)} tidak ada; pilihan: {', '.join(team['llm']['models'])}")
         names = {m["name"] for m in team["members"]}
-        if target not in names | {"all", "semua", "all-members"} | set(MODEL_TARGETS):
+        kinds = _model_target_kinds(team)
+        if target in set(MODEL_TARGETS) - set(kinds) and target not in names:
+            raise ToolError(f"target {target} tidak dipakai tim ini (blok `{target}` tidak ada di team.yaml); pakai "
+                            "nama anggota, all, " + _kind_choices(kinds))
+        if target not in names | {"all", "semua", "all-members"} | set(kinds):
             raise ToolError(f"target {_q(target, 60)} tidak dikenal; pakai nama anggota, all, "
-                            + _kind_choices(list(MODEL_TARGETS)))
+                            + _kind_choices(kinds))
         spec = team["llm"]["models"][alias]
         scope = (f"SEMUA anggota ({len(names)} orang)" if target in ("all", "semua", "all-members") else target)
         preview = (f"Ganti model {scope} → {alias} ({_clean(spec['provider'], 60)} / {_clean(spec['model'], 80)}). "
@@ -245,8 +260,8 @@ def set_member_active(ctl, args: dict) -> PlanFn:
         def run() -> str:
             hermes = ctl.hermes()
             result = ht.set_member_active(team, hermes, name, active)
-            notes = "".join(f"\n- {n}" for n in result.get("notes", []))
-            return (f"{member['display_name']} sekarang {'aktif' if active else 'nonaktif'}. "
+            notes = "".join(f"\n- {_clean(n, 400)}" for n in result.get("notes", []))
+            return (f"{_q(member['display_name'], 64)} sekarang {'aktif' if active else 'nonaktif'}. "
                     + ctl._activation_note(team, result) + notes + ctl._tail(hermes))
 
         return Plan(team, preview, run, member=name, active=active, channel=member["channel_id"])
@@ -273,7 +288,46 @@ def list_member_skills(ctl, args: dict) -> str:
     skills = ht.list_skills(ctl.hermes(), member["profile"])
     if not skills:
         return f"{member['name']} belum punya skill."
-    return "\n".join(f"- {s['path']}{' (kiriman)' if s['shared'] else ''}: {s['description']}" for s in skills)
+    # Nama folder, path, dan deskripsi skill DITULIS ANGGOTA (SKILL.md di profilenya): satu baris per skill, tanpa
+    # karakter kontrol/newline, dikutip, lalu diapit penanda data ber-nonce — sama seperti isi pesan Discord.
+    lines = [f"- {_q(s['path'], 160)}{' (kiriman)' if s['shared'] else ''}: {_q(s['description'], 200)}"
+             for s in skills[:MAX_LISTED_SKILLS]]
+    if len(skills) > MAX_LISTED_SKILLS:
+        lines.append(f"(+{len(skills) - MAX_LISTED_SKILLS} skill lain tidak ditampilkan)")
+    return _untrusted_block(f"{len(skills)} skill di profile anggota {member['name']}; path dan deskripsi ditulis "
+                            "anggota itu", lines)
+
+
+MAX_LISTED_SKILLS = 200
+SKILL_EXCERPT_CHARS = 600      # cuplikan SKILL.md di ringkasan konfirmasi share_skill
+SKILL_PREVIEW_FILES = 12       # nama berkas yang disebut satu per satu di ringkasan itu
+
+
+def _skill_excerpt(skill_dir) -> str:
+    """Cuplikan SKILL.md (salinan staging) untuk ringkasan konfirmasi: dibersihkan dari karakter kontrol/tak
+    terlihat, dibatasi SKILL_EXCERPT_CHARS, tiap baris berawalan "| " supaya tidak bisa menyamar sebagai bagian
+    ringkasan. Yang dibaca adalah salinan staging — sama dengan yang dipindai dan dipasang."""
+    try:
+        with open(skill_dir / "SKILL.md", "rb") as fh:
+            raw = fh.read(16384)
+        size = (skill_dir / "SKILL.md").stat().st_size
+    except OSError as exc:
+        raise ToolError(f"SKILL.md skill ini tidak bisa dibaca ({type(exc).__name__}); tidak dibagikan")
+    text = _clean_message(raw.decode("utf-8", "replace"))
+    cut = len(text) > SKILL_EXCERPT_CHARS or size > len(raw)
+    shown = text[:SKILL_EXCERPT_CHARS].rstrip()
+    body = "\n".join("    | " + line for line in shown.split("\n")) if shown else "    | (kosong)"
+    head = (f"Cuplikan SKILL.md — ISI BUATAN ANGGOTA, BELUM TEPERCAYA (akan dibaca AI penerima sebagai petunjuk); "
+            f"{len(shown)} karakter pertama dari berkas {size} byte:")
+    tail = ("\n    […dipotong — sisa SKILL.md dan berkas lain TIDAK ditampilkan di sini; periksa dulu kalau ragu]"
+            if cut else "\n    [akhir SKILL.md]")
+    return head + "\n" + body + tail
+
+
+def _skill_files_note(files: list) -> str:
+    names = [f"{_q(f['path'], 80)} ({f['bytes']} B)" for f in files[:SKILL_PREVIEW_FILES]]
+    more = f", +{len(files) - SKILL_PREVIEW_FILES} berkas lain" if len(files) > SKILL_PREVIEW_FILES else ""
+    return f"Berkas ({len(files)}): " + ", ".join(names) + more
 
 
 @tool(
@@ -320,21 +374,29 @@ def share_skill(ctl, args: dict) -> PlanFn:
         staged, report = box["staged"], box["report"]
         skill_dir = staged[1]
         if report["problems"]:
-            raise ToolError("skill tidak aman untuk dibagikan: " + " | ".join(report["problems"]))
+            # Nama berkas dan temuan pemindai memuat teks buatan anggota → dibersihkan sebelum sampai ke AI admin.
+            raise ToolError("skill tidak aman untuk dibagikan: " + " | ".join(_clean(p, 300) for p in report["problems"]))
         kb = max(1, report["bytes"] // 1024)
         verdict = report["guard"].get("verdict", "unknown")
-        who = "semua anggota + channel bersama" if any(t.lower() in ("all", "semua") for t in targets) \
-            else ", ".join(_q(t, 41) for t in targets)
+        # Tujuan di-resolve SEKARANG (sebelum konfirmasi) dengan aturan yang sama dengan pemasangan: admin melihat
+        # daftar penerima yang sebenarnya, dan tujuan yang salah ditolak sebelum tombol muncul.
+        profiles, scope_all = kit_skills._share_targets(team, owner, targets)
+        dest = ", ".join(f"{_name(name, 41)} [{_clean(profile, 60)}]" for name, profile in profiles[:40]) \
+            + (f", +{len(profiles) - 40} lainnya" if len(profiles) > 40 else "")
+        who = (f"SEMUA anggota aktif + channel bersama — {len(profiles)} profile: {dest}" if scope_all
+               else f"{len(profiles)} profile: {dest}")
         preview = (f"Bagikan skill {_q(skill_dir.name, 80)} milik {_q(owner['display_name'], 64)} ({owner_name}) ke "
                    f"{who}. {len(report['files'])} file, {kb} KB, pemindai Hermes: {_clean(verdict, 40)}."
                    + (" Kiriman lama bernama sama akan ditimpa." if overwrite else "")
-                   + (" PERHATIAN: dibagikan walau pemindai Hermes tidak memberi hasil." if allow_unscanned and verdict in ("unknown", "") else ""))
+                   + (" PERHATIAN: dibagikan walau pemindai Hermes tidak memberi hasil." if allow_unscanned and verdict in ("unknown", "") else "")
+                   + "\n" + _skill_files_note(report["files"])
+                   + "\n" + _skill_excerpt(skill_dir))
 
         def run() -> str:
             result = ht.share_skill(team, hermes, skill, owner_name, targets, overwrite,
                                     staged=staged, scan=report, allow_unscanned=allow_unscanned)
-            lines = [f"Skill '{result['skill']}' dari {result['from']} ({result['scope']}):"]
-            lines += [f"- {name}: {status}" for name, status in sorted(result["results"].items())]
+            lines = [f"Skill {_q(result['skill'], 80)} dari {_clean(result['from'], 41)} ({_clean(result['scope'], 20)}):"]
+            lines += [f"- {_clean(name, 41)}: {_clean(status, 200)}" for name, status in sorted(result["results"].items())]
             lines.append("Penerima melihatnya di sesi baru (atau setelah /reload-skills), di kategori shared/.")
             return "\n".join(lines) + ctl._tail(hermes)
 
@@ -376,8 +438,8 @@ def unshare_skill(ctl, args: dict) -> PlanFn:
         def run() -> str:
             hermes = ctl.hermes()
             result = ht.unshare_skill(team, hermes, skill, targets)
-            done = ", ".join(sorted(result["results"])) or "tidak ada penerima"
-            return f"Skill '{skill}' ditarik dari: {done}." + ctl._tail(hermes)
+            done = ", ".join(_clean(n, 41) for n in sorted(result["results"])) or "tidak ada penerima"
+            return f"Skill {_q(skill, 80)} ditarik dari: {done}." + ctl._tail(hermes)
 
         return Plan(team, preview, run, skill=skill, targets=targets)
 
@@ -424,8 +486,9 @@ def onboarding_status(ctl, args: dict) -> str:
             entry = sum(1 for x in members if team["entry_role"] in (x.get("roles") or []))
             lines.append(f"User ber-role entry (belum onboarding): {entry}")
     except ht.TeamError as exc:
-        lines.append(f"(server Discord tidak bisa dicek: {exc})")
-    return "\n".join(lines)
+        lines.append(f"(server Discord tidak bisa dicek: {_clean(exc, 200)})")
+    # Username/nick Discord dan alasan penahanan (ditulis plugin dari data Discord) ada di sini → data berlabel.
+    return _untrusted_block("kondisi onboarding", lines)
 
 
 def _onboard_what(ctl, team: dict, label: str, existing, user: dict, uid: str, name: str, model: str) -> str:
@@ -449,7 +512,7 @@ def _grant_member_role(srv, team: dict, uid: str) -> str:
         srv.api.add_role(team["guild_id"], uid, team["member_role"], reason=srv.reason("onboarding oleh admin"))
         return "role @backend diberikan"
     except ht.TeamError as exc:
-        return f"role @backend belum diberikan ({exc}); berikan manual"
+        return f"role @backend belum diberikan ({_clean(exc, 200)}); berikan manual"
 
 
 @tool(
@@ -508,8 +571,8 @@ def onboard_member(ctl, args: dict) -> PlanFn:
             m = result["member"]
             status = {"created": "dibuat", "reactivated": "diaktifkan lagi", "exists": "sudah ada"}.get(
                 result["status"], result["status"])
-            lines = [f"Anggota {m['display_name']} {status}: profile {m['profile']}, channel <#{m['channel_id']}>."]
-            lines += [f"- {note}" for note in notes]
+            lines = [f"Anggota {_q(m['display_name'], 64)} {status}: profile {m['profile']}, channel <#{m['channel_id']}>."]
+            lines += [f"- {_clean(note, 400)}" for note in notes]
             lines.append(ctl._activation_note(team, result))
             return "\n".join(lines) + ctl._tail(hermes)
 

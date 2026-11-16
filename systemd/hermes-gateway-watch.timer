@@ -1,0 +1,12 @@
+# Lihat cara pasang dan batasannya di hermes-gateway-watch.service.
+[Unit]
+Description=Hermes team kit: periksa gateway tiap 5 menit
+
+[Timer]
+OnCalendar=*:1/5
+# Dua menit setelah boot, supaya gateway sempat menyala dulu.
+OnBootSec=2min
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target

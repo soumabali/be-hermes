@@ -2194,7 +2194,7 @@ class TestSandboxPerMember:
 
     def test_keys_still_pinned_by_an_old_managed_file_are_skipped_with_a_warning(self, kit, capsys):
         (kit.managed_dir / "config.yaml").write_text(yaml.safe_dump({
-            "terminal": {"backend": "docker", "container_memory": 2048, "container_cpu": 1},
+            "terminal": {**kit.MANAGED_PINS["terminal"], "container_memory": 2048, "container_cpu": 1},
             "compression": {"threshold_tokens": 64000, "idle_compact_after_seconds": 3600}}))
         hermes = kit.hermes()
         result = ht.cmd_apply(kit.team(), hermes)
@@ -2520,6 +2520,7 @@ class TestManagedDiffAndInstall:                                                
     def test_diff_reports_missing_changed_extra_and_moved(self, kit):
         team = kit.team()
         target = kit.managed_dir / "config.yaml"
+        kit.drop_managed()
         assert ht.managed_diff(team)["missing_file"] is True
         target.write_text(ht.managed_yaml(team))
         diff = ht.managed_diff(team)
@@ -2539,6 +2540,7 @@ class TestManagedDiffAndInstall:                                                
         assert ht.managed_diff(team)["unreadable"]
 
     def test_cli_diff_exit_codes_and_output(self, kit, capsys):
+        kit.drop_managed()
         with pytest.raises(SystemExit) as exit_info:
             ht.main(cli(kit, "managed", "--diff"))
         out = capsys.readouterr().out
@@ -2553,6 +2555,7 @@ class TestManagedDiffAndInstall:                                                
 
     def test_install_requires_root_and_prints_exact_sudo_command(self, kit, monkeypatch, capsys):
         team = kit.team()
+        kit.drop_managed()
         with pytest.raises(ht.TeamError) as err:
             ht.install_managed(team, euid=1000)
         text = str(err.value)
@@ -3342,6 +3345,7 @@ class TestManagedInstallKitTrust:
         assert "sudo" in str(err.value) and "managed --install" in str(err.value)
 
     def test_cli_refuses_then_flag_allows(self, kit, monkeypatch, capsys, patch_kit):
+        kit.drop_managed()
         monkeypatch.setattr(ht.os, "geteuid", lambda: 0)
         patch_kit("_kit_stat", _fake_stat(1000))
         with pytest.raises(SystemExit) as exit_info:
@@ -3515,3 +3519,441 @@ class TestAuditFollowUps:
         kit.write_team(oncall={"profile": "team-oncall", "channel_id": OPS_CH}, llm=llm)
         srv = Server(kit.team(), object())
         assert srv.admin_labels == {"channel admin tim", "channel oncall tim"}
+
+
+# =========================================================================== audit 4: jenis ber-channel OPSIONAL
+def _optional_ops(**kw):
+    return kit_profiles.ProfileKind(
+        "ops", ht.SOUL_SHARED, kit_profiles._shared_settings, needs_channel=True, reserved=True, model_target=True,
+        optional=True, note="ops, @mention", channel_label="channel ops", model_label="ops", **kw)
+
+
+class TestOptionalProfileKind:
+    """`ProfileKind.optional`: mendaftarkan jenis ber-channel baru TIDAK boleh merusak team.yaml yang sudah ada.
+    Tanpa blok `<kind>` jenis itu tidak diprovisi; dengan blok, ia bekerja seperti jenis lain."""
+
+    def test_builtin_kinds_stay_required(self, kit):
+        assert not kit_profiles.SHARED.optional and not kit_profiles.ADMIN.optional
+        kit.write_team(shared=None)
+        with pytest.raises(ht.TeamError, match=r"shared\.channel_id"):
+            kit.team()
+
+    def test_non_optional_kind_still_breaks_an_existing_team_yaml(self, kit, register_kind):
+        """Perilaku yang didokumentasikan (docs/PENGEMBANGAN.md): tanpa optional=True semua tim wajib migrasi."""
+        register_kind(kit_profiles.ProfileKind("ops", ht.SOUL_SHARED, kit_profiles._shared_settings, needs_channel=True))
+        with pytest.raises(ht.TeamError, match=r"ops\.channel_id"):
+            kit.team()
+
+    def test_registering_does_not_change_validation_or_output_of_an_existing_team(self, kit, register_kind, capsys):
+        """Fixture `register_kind` TIDAK menulis ulang team.yaml: berkas yang sama, hasil yang sama."""
+        before = kit.team()
+        ht.cmd_apply(kit.team(), kit.hermes())
+        roster_before = {k: v for k, v in kit.roster().items() if k != "generated"}
+        host_before = kit.config("default")
+        register_kind(_optional_ops())
+        assert "ops" in kit_profiles.SYSTEM_KINDS and "ops.channel_id" in kit_config.FIELD_BY_PATH
+        team = kit.team()
+        assert team["warnings"] == before["warnings"] == []
+        assert team["ops"] == {"profile": "", "channel_id": "", "auto_skills": []}
+        assert kit_profiles.active_system_kinds(team) == ("shared", "admin")
+        assert kit_profiles.active_model_targets(team) == ("shared", "admin", "lobby")
+        for derived in (ht.build_routes, ht.gateway_channels, ht.host_settings, ht.managed_config,
+                        ht.used_model_aliases, ht.sandbox_worst_case_mb, ht.placeholder_ids):
+            assert derived(team) == derived(before), derived.__name__
+        kit.clear_log()
+        hermes = kit.hermes()
+        result = ht.cmd_apply(kit.team(), hermes)
+        assert result["failures"] == [] and result["created"] == [] and kit.creates() == []
+        assert kit.config_sets() == []                                            # tidak ada yang berubah
+        assert {k: v for k, v in kit.roster().items() if k != "generated"} == roster_before
+        assert kit.config("default") == host_before and not kit.home("team-ops").exists()
+        assert all(c["kind"] != "ops" for c in kit.roster()["channels"].values())
+        for command in ("check", "status", "host-yaml"):
+            ht.main(cli(kit, command))
+        out = capsys.readouterr().out
+        assert "Konfigurasi valid." in out and "team-ops" not in out and "ops, @mention" not in out
+
+    @pytest.mark.parametrize("block", [None, {}, False], ids=["null", "mapping-kosong", "false"])
+    def test_empty_block_means_not_configured(self, kit, register_kind, block):
+        register_kind(_optional_ops())
+        raw = yaml.safe_load(kit.team_file.read_text())
+        raw["ops"] = block
+        kit.team_file.write_text(yaml.safe_dump(raw))
+        assert kit_profiles.active_system_kinds(kit.team()) == ("shared", "admin")
+
+    def test_half_filled_block_is_an_error_naming_the_key(self, kit, register_kind):
+        register_kind(_optional_ops())
+        kit.write_team(ops={"profile": "team-ops"})
+        with pytest.raises(ht.TeamError, match=r"ops\.channel_id"):
+            kit.team()
+
+    def test_unconfigured_kind_is_not_a_model_or_key_target(self, kit, register_kind):
+        register_kind(_optional_ops())
+        with pytest.raises(ht.TeamError, match="tidak dipakai tim ini"):
+            ht.set_model(kit.team(), kit.hermes(), "ops", "td-normal")
+        assert "models" not in yaml.safe_load(kit.members_file.read_text())
+        with pytest.raises(ht.TeamError, match="tidak dipakai tim ini"):
+            ht._llm_key_target(kit.team(), "ops")
+        kit.write_members([BE1, BUDI], models={"ops": "td-simple"})
+        with pytest.raises(ht.TeamError, match=r"models\.ops.*tidak dipakai tim ini"):
+            kit.team()
+
+    def test_unconfigured_kind_does_not_block_member_names_channels_or_doctor(self, kit, register_kind, discord):
+        import kit_doctor
+        register_kind(_optional_ops())
+        team = kit.team()
+        assert ht._channel_conflict(team, "", BE1["discord_user_id"]) == ""       # channel_id "" bukan bentrokan
+        assert "" not in ht._taken_names(team, kit.hermes())
+        assert [key for key, _cid, _private in kit_doctor._team_channel_targets(team)] == \
+            ["shared.channel_id", "admin.channel_id"]
+        ht.cmd_apply(kit.team(), kit.hermes())
+        rep = kit_doctor.Report()
+        kit_doctor.check_local(kit.team(), kit.root, rep, ht)
+        assert not [i for i in rep.items if i["level"] == kit_doctor.ERROR and i["area"] in ("profile", "rute")]
+        rep = kit_doctor.Report()
+        kit_doctor.check_docker(kit.team(), kit.root, rep, run=lambda cmd: (0, ""))   # team["ops"]["profile"] == ""
+        assert not [i for i in rep.items if i["level"] == kit_doctor.ERROR]
+
+    def test_configured_optional_kind_works_end_to_end(self, kit, register_kind, capsys):
+        register_kind(_optional_ops())
+        llm = {**__import__("conftest").LLM, "ops_model": "td-normal"}
+        kit.write_team(ops={"profile": "team-ops", "channel_id": OPS_CH, "auto_skills": ["runbook"]}, llm=llm)
+        team = kit.team()
+        assert kit_profiles.active_system_kinds(team) == ("shared", "admin", "ops")
+        assert kit_profiles.active_model_targets(team) == ("shared", "admin", "lobby", "ops")
+        ht.main(cli(kit, "check"))
+        out = capsys.readouterr().out
+        assert OPS_CH in out and "team-ops" in out and "Konfigurasi valid." in out
+        ht.cmd_apply(kit.team(), kit.hermes())
+        assert kit.home("team-ops").is_dir() and kit.config("team-ops")["model"]["default"] == "td-normal"
+        routes = routes_for(kit, "team-ops")
+        assert routes and routes[0]["chat_id"] == OPS_CH
+        roster = kit.roster()
+        assert roster["channels"][OPS_CH] == {"profile": "team-ops", "kind": "ops"}
+        assert OPS_CH in roster["gateway"]["allowed_channels"]
+        bindings = kit.config("default")["platforms"]["discord"]["extra"]["channel_skill_bindings"]
+        assert {"id": OPS_CH, "skills": ["runbook"]} in bindings
+        assert ht.set_model(kit.team(), kit.hermes(), "ops", "td-simple")["profiles"] == ["team-ops"]
+        assert kit.config("team-ops")["model"]["default"] == "td-simple"
+        assert ht._llm_key_target(kit.team(), "ops")[0] == "team-ops"
+        with pytest.raises(ht.TeamError, match="dipakai dua kali"):
+            kit.write_team(ops={"profile": "team-ops", "channel_id": BE1_CH}, llm=llm)
+            kit.team()
+
+    def test_removing_the_block_later_unroutes_the_kind(self, kit, register_kind):
+        register_kind(_optional_ops())
+        kit.write_team(ops={"profile": "team-ops", "channel_id": OPS_CH})
+        ht.cmd_apply(kit.team(), kit.hermes())
+        assert routes_for(kit, "team-ops")
+        kit.write_team()                                                          # blok ops dihapus lagi
+        ht.cmd_apply(kit.team(), kit.hermes())
+        assert routes_for(kit, "team-ops") == [] and OPS_CH not in kit.roster()["channels"]
+
+    def test_schema_table_marks_the_block_as_optional(self, register_kind):
+        register_kind(_optional_ops())
+        row = next(line for line in kit_config.markdown_table().splitlines() if line.startswith("| `ops.channel_id`"))
+        assert "wajib" not in row and "opsional" in row
+        shared = next(line for line in kit_config.markdown_table().splitlines() if line.startswith("| `shared.channel_id`"))
+        assert "`wajib`" in shared
+
+
+# =========================================================================== audit 4: sandbox gagal-tertutup
+class TestManagedSandboxGate:
+    """`terminal.backend: docker` + pin tanpa-mount-host hanya ada di managed config. `apply` dan onboarding tidak
+    boleh menerbitkan rute sebelum berkas itu terpasang (instalasi manual yang melewatkan `managed --install`)."""
+
+    def test_problem_detection(self, kit):
+        assert ht.managed_sandbox_problem() == ""
+        kit.drop_managed()
+        assert "belum ada" in ht.managed_sandbox_problem()
+        kit.pin_managed(backend="local")
+        assert "terminal.backend: docker" in ht.managed_sandbox_problem()
+        kit.pin_managed(backend=None)
+        assert "terminal.backend: docker" in ht.managed_sandbox_problem()
+        kit.pin_managed(docker_mount_cwd_to_workspace=True)
+        assert "docker_mount_cwd_to_workspace" in ht.managed_sandbox_problem()
+        kit.pin_managed(docker_volumes=None)
+        assert "terminal.docker_volumes" in ht.managed_sandbox_problem()
+        kit.pin_managed(docker_extra_args=None)
+        assert "terminal.docker_extra_args" in ht.managed_sandbox_problem()
+        (kit.managed_dir / "config.yaml").write_text(": bukan yaml [")
+        assert "tidak terbaca" in ht.managed_sandbox_problem()
+        (kit.managed_dir / "config.yaml").write_text(ht.managed_yaml(kit.team()))   # berkas asli kit lolos
+        assert ht.managed_sandbox_problem() == ""
+
+    def test_documented_order_apply_managed_apply_still_works(self, kit, capsys):
+        """apply PERTAMA (managed belum ada): profile dibuat, rute/roster BELUM. Setelah managed --install: ditulis."""
+        kit.drop_managed()
+        ht.main(cli(kit, "apply"))                                              # exit 0: wizard & INSTALL.md lanjut
+        out = capsys.readouterr().out
+        install = ht.managed_install_command(kit.team())
+        assert "BELUM SELESAI" in out and install in out and "DILEWATI" in out
+        assert install.startswith("sudo ") and "managed --install" in install and f"-c {kit.team_file}" in install
+        for profile in ("be-template", "be-be1", "be-budi", "team-shared", "team-admin"):
+            assert kit.home(profile).is_dir()
+        host = kit.config("default")
+        assert "gateway" not in host and "discord" not in host and not (kit.state / "roster.json").exists()
+        ht.main(cli(kit, "apply", "--dry-run"))                                 # dry-run pun tidak menolak
+        assert "BELUM SELESAI" in capsys.readouterr().out
+        ht.install_managed(kit.team(), euid=0, allow_user_owned_kit=True)       # = sudo … managed --install
+        ht.main(cli(kit, "apply"))
+        out = capsys.readouterr().out
+        assert "BELUM SELESAI" not in out
+        assert routes_for(kit, "be-be1") and routes_for(kit, "team-shared") and kit.roster()["users"]
+
+    def test_bootstrap_result_carries_managed_pending(self, kit):
+        kit.drop_managed()
+        result = ht.cmd_apply(kit.team(), kit.hermes(), sandbox="bootstrap")
+        assert "belum ada" in result["managed_pending"] and result["restart_needed"] is False
+        assert "be-be1" in result["created"] and result["live_changed"] == []
+
+    def test_default_cmd_apply_refuses_with_exact_command(self, kit):
+        """Pemanggil selain CLI `apply` (teamctl, onboarding) memakai mode bawaan: menolak, tidak ada yang dibuat."""
+        kit.drop_managed()
+        with pytest.raises(ht.TeamError) as err:
+            ht.cmd_apply(kit.team(), kit.hermes())
+        assert ht.managed_install_command(kit.team()) in str(err.value) and "HOST" in str(err.value)
+        assert kit.creates() == [] and kit.config_sets() == []
+
+    def test_apply_refuses_once_the_host_already_serves_routes(self, kit, capsys):
+        ht.cmd_apply(kit.team(), kit.hermes())
+        assert routes_for(kit, "be-be1")
+        kit.pin_managed(backend="local")                                         # managed diubah / dihapus kemudian
+        kit.clear_log()
+        with pytest.raises(SystemExit) as exit_info:
+            ht.main(cli(kit, "apply"))
+        text = str(exit_info.value.code)
+        assert "ditolak" in text and ht.managed_install_command(kit.team()) in text
+        assert kit.config_sets() == []
+        kit.drop_managed()
+        with pytest.raises(SystemExit) as exit_info:
+            ht.main(cli(kit, "apply", "--host-only"))
+        assert "ditolak" in str(exit_info.value.code)
+
+    def test_host_only_is_refused_even_on_a_fresh_install(self, kit):
+        kit.drop_managed()
+        with pytest.raises(SystemExit) as exit_info:
+            ht.main(cli(kit, "apply", "--host-only"))
+        assert "managed --install" in str(exit_info.value.code) and "gateway" not in kit.config("default")
+
+    def test_onboarding_add_member_and_reactivation_refuse_before_touching_anything(self, kit, discord):
+        ht.cmd_apply(kit.team(), kit.hermes())
+        ht.set_member_active(kit.team(), kit.hermes(), "budi", False)
+        kit.drop_managed()
+        kit.clear_log()
+        posts = len(discord.calls)
+        install = ht.managed_install_command(kit.team())
+        calls = [
+            lambda: ht.onboard_member(kit.team(), kit.hermes(), user_id=DODI, username="dodi"),
+            lambda: ht.add_member(kit.team(), kit.hermes(), name="citra", user_id=CITRA),
+            lambda: ht.onboard_batch(kit.team(), kit.hermes(), [{"user_id": EKA, "username": "eka"}]),
+            lambda: ht.set_member_active(kit.team(), kit.hermes(), "budi", True),
+            lambda: ht.onboard_member(kit.team(), kit.hermes(), user_id=BUDI["discord_user_id"]),   # reaktivasi
+        ]
+        for call in calls:
+            with pytest.raises(ht.TeamError) as err:
+                call()
+            assert install in str(err.value)
+        assert len(discord.calls) == posts and channel_posts(discord) == []       # tidak ada channel dibuat
+        assert kit.creates() == [] and kit.config_sets() == []
+        assert [m["name"] for m in kit.members_yaml()] == ["be1", "budi"]
+        assert kit.members_yaml()[1].get("active") is False
+
+    def test_onboard_events_reports_the_refusal_to_the_plugin(self, kit, discord, capsys):
+        kit.drop_managed()
+        with pytest.raises(SystemExit) as exit_info:
+            ht.main(cli(kit, "onboard", "--user-id", DODI, "--username", "dodi", "--events"))
+        event = json.loads(capsys.readouterr().out.splitlines()[-1])
+        assert exit_info.value.code == 1 and event["event"] == "error"
+        assert "managed --install" in event["message"] and "sudo" in event["message"]
+
+    def test_existing_active_member_onboard_stays_idempotent(self, kit, discord):
+        """Onboarding ulang anggota yang sudah lengkap tidak melayani siapa pun yang baru → tidak ditolak
+        (rekonsiliasi berkala plugin tidak boleh membanjiri admin dengan error)."""
+        ht.cmd_apply(kit.team(), kit.hermes())
+        discord.add_channel(BE1["channel_id"], "hermes-be1")
+        kit.drop_managed()
+        result = ht.onboard_member(kit.team(), kit.hermes(), user_id=BE1["discord_user_id"])
+        assert result["status"] == "exists"
+
+    def test_operations_that_only_reduce_access_are_never_blocked(self, kit, discord):
+        ht.cmd_apply(kit.team(), kit.hermes())
+        kit.drop_managed()
+        assert ht.offboard_member(kit.team(), kit.hermes(), user_id=BE1["discord_user_id"])["status"] == "deactivated"
+        assert routes_for(kit, "be-be1") == []
+        ht.set_member_active(kit.team(), kit.hermes(), "budi", False)
+        assert routes_for(kit, "be-budi") == []
+        result = ht.remove_member(kit.team(), kit.hermes(), "budi")
+        assert [m["name"] for m in kit.members_yaml()] == ["be1"] and result["done"]
+
+    def test_escape_hatch_in_team_yaml_is_loud(self, kit, discord, capsys):
+        kit.drop_managed()
+        kit.write_team(sandbox={"allow_unmanaged": True})
+        assert kit.team()["sandbox"]["allow_unmanaged"] is True
+        ht.main(cli(kit, "apply"))
+        out = capsys.readouterr().out
+        assert "BELUM SELESAI" not in out and routes_for(kit, "be-be1")
+        assert "sandbox.allow_unmanaged: true" in out and "HOST" in out and "belum ada" in out
+        assert ht.onboard_member(kit.team(), kit.hermes(), user_id=DODI, username="dodi")["status"] == "created"
+        ht.main(cli(kit, "check"))
+        assert "sandbox.allow_unmanaged: true" in capsys.readouterr().out
+        kit.write_team()
+        assert kit.team()["sandbox"]["allow_unmanaged"] is False and ht.unmanaged_warnings(kit.team()) == []
+
+    def test_gate_modes_are_validated(self, kit):
+        with pytest.raises(ValueError):
+            ht.cmd_apply(kit.team(), kit.hermes(), sandbox="mungkin")
+
+
+# =========================================================================== audit 4: toolset pekerja = allowlist
+def _legacy_worker_disabled(team, role):
+    """Salinan PERSIS rumus lama (daftar larangan) — pembanding sebelum/sesudah."""
+    kind = kit_profiles.PROFILE_KINDS.get(role)
+    disabled = ["discord", "discord_admin"] + ([] if team.get("allow_browser") else ["browser", "computer_use"])
+    if not (kind and kind.cron_exempt) and not team["scale"].get("allow_member_cron"):
+        disabled = disabled + ["cronjob"]
+    return disabled
+
+
+class TestWorkerToolsetAllowlist:
+    WORKERS = ("member", "template", "shared", "admin")
+
+    def test_every_known_toolset_is_classified_exactly_once(self):
+        from kit import constants
+        allowed, known = constants.WORKER_ALLOWED_TOOLSETS, constants.KNOWN_TOOLSETS
+        conditional = [*constants.HOST_SIDE_TOOLSETS, constants.CRON_TOOLSET]
+        buckets = [*allowed, *constants.WORKER_DISABLED_TOOLSETS, *conditional]
+        assert len(buckets) == len(set(buckets)), "toolset ada di dua daftar"
+        assert set(buckets) == set(known) == set(ht.LOBBY_DISABLED_TOOLSETS)
+        for role in self.WORKERS:
+            assert kit_profiles.PROFILE_KINDS[role].allowed_toolsets == tuple(allowed)
+        assert kit_profiles.PROFILE_KINDS["lobby"].allowed_toolsets == ()
+
+    @pytest.mark.parametrize("browser", [False, True])
+    @pytest.mark.parametrize("cron", [False, True])
+    def test_effective_behaviour_for_known_toolsets_is_unchanged(self, kit, browser, cron):
+        """Sebelum/sesudah: untuk SEMUA toolset yang dikenal, daftar yang dimatikan identik (isi dan urutan)."""
+        kit.write_team(allow_browser=browser, scale={"allow_member_cron": cron})
+        team = kit.team()
+        for role in self.WORKERS:
+            new = ht.worker_disabled_toolsets(team, role)
+            assert new == _legacy_worker_disabled(team, role), role
+            allowed = kit_profiles.worker_allowed_toolsets(team, role)
+            assert set(allowed).isdisjoint(new) and set(allowed) | set(new) == set(ht.LOBBY_DISABLED_TOOLSETS)
+            member = team["members"][0] if role == "member" else None
+            assert dict(ht.profile_settings(team, role, member))["agent.disabled_toolsets"] == new
+
+    def test_toolset_not_on_the_allowlist_is_disabled_without_being_named_in_a_denylist(self, kit, monkeypatch):
+        """Inti allowlist: toolset yang dikenal tetapi tidak diizinkan → mati, tanpa perlu didaftarkan di larangan."""
+        from kit import constants
+        monkeypatch.setattr(kit_profiles, "KNOWN_TOOLSETS", (*constants.KNOWN_TOOLSETS, "toolset_baru"))
+        team = kit.team()
+        for role in self.WORKERS:
+            assert ht.worker_disabled_toolsets(team, role)[-1] == "toolset_baru"
+        import dataclasses
+        narrow = dataclasses.replace(kit_profiles.SHARED, allowed_toolsets=("web", "search"))
+        monkeypatch.setitem(kit_profiles.PROFILE_KINDS, "shared", narrow)
+        disabled = ht.worker_disabled_toolsets(team, "shared")
+        assert "terminal" in disabled and "web" not in disabled and "search" not in disabled
+        assert kit_profiles.worker_allowed_toolsets(team, "shared") == ["web", "search"]
+
+    def test_discord_toolsets_can_never_be_allowed(self, kit, monkeypatch):
+        import dataclasses
+        monkeypatch.setitem(kit_profiles.PROFILE_KINDS, "shared",
+                            dataclasses.replace(kit_profiles.SHARED, allowed_toolsets=("web", "discord")))
+        assert "discord" in ht.worker_disabled_toolsets(kit.team(), "shared")
+
+    def test_every_upstream_toolset_is_decided_for_workers(self):
+        """Integrasi (Hermes asli; dilewati lokal, wajib di CI lewat KIT_REQUIRE_HERMES=1): toolset baru di hulu
+        harus DIPUTUSKAN untuk pekerja — diizinkan (WORKER_ALLOWED_TOOLSETS), bersyarat, atau selalu mati."""
+        from kit import constants
+        toolsets = pytest.importorskip("toolsets", reason="Hermes tidak terpasang")
+        upstream = {n for n in toolsets.TOOLSETS if not n.startswith("hermes-")}
+        decided = {*constants.WORKER_ALLOWED_TOOLSETS, *constants.WORKER_DISABLED_TOOLSETS,
+                   *constants.HOST_SIDE_TOOLSETS, constants.CRON_TOOLSET}
+        undecided = sorted(upstream - decided)
+        assert not undecided, ("toolset baru di Hermes belum diputuskan untuk profile pekerja: " + ", ".join(undecided)
+                               + " — periksa fungsinya, lalu masukkan ke WORKER_ALLOWED_TOOLSETS (diizinkan) atau "
+                               "biarkan hanya di LOBBY_DISABLED_TOOLSETS/KNOWN_TOOLSETS (mati untuk pekerja).")
+        unknown = sorted(upstream - set(constants.KNOWN_TOOLSETS))
+        assert not unknown, f"toolset hulu belum ada di KNOWN_TOOLSETS (tidak akan dimatikan di mana pun): {unknown}"
+        ghosts = sorted(set(constants.WORKER_ALLOWED_TOOLSETS) - set(toolsets.TOOLSETS))
+        assert not ghosts, f"toolset di WORKER_ALLOWED_TOOLSETS tidak dikenal lagi oleh Hermes: {ghosts}"
+
+
+# =========================================================================== audit 4: regex validasi \Z
+class TestValidationRegexesRejectTrailingNewline:
+    @pytest.mark.parametrize("value", ["be-andi\n", "be-andi\r\n", "be-andi\n\n"])
+    def test_profile_regex(self, value):
+        from kit.constants import PROFILE_RE
+        assert PROFILE_RE.match("be-andi") and not PROFILE_RE.match(value)
+        with pytest.raises(ht.TeamError, match="tidak valid"):
+            ht._profile(value, "template_profile")
+
+    def test_alias_and_provider_name_regex(self):
+        from kit.constants import ALIAS_RE, PROVIDER_NAME_RE
+        assert ALIAS_RE.match("td-normal") and not ALIAS_RE.match("td-normal\n")
+        assert PROVIDER_NAME_RE.match("td") and not PROVIDER_NAME_RE.match("td\n")
+
+    def test_load_team_rejects_newline_in_profile_alias_and_provider_names(self, kit):
+        llm = __import__("conftest").LLM
+        kit.write_team(template_profile="be-template\n")
+        with pytest.raises(ht.TeamError, match="template_profile"):
+            kit.team()
+        kit.write_team(shared={"profile": "team-shared\n"})
+        with pytest.raises(ht.TeamError, match=r"shared\.profile"):
+            kit.team()
+        models = {**llm["models"], "td-baru\n": {"provider": "custom:td", "model": "x"}}
+        kit.write_team(llm={**llm, "models": models})
+        with pytest.raises(ht.TeamError, match="alias tidak valid"):
+            kit.team()
+        kit.write_team(llm={**llm, "providers": {"td": llm["providers"]["td"],
+                                                 "lain\n": {"api": "https://x.example/v1"}}})
+        with pytest.raises(ht.TeamError, match=r"llm\.providers\.lain"):
+            kit.team()
+        kit.write_team()
+        assert kit.team()["template"] == "be-template"
+
+    def test_no_dollar_anchored_validation_regex_left_in_kit_core(self):
+        """Regex validasi di kit/ dan kit_*.py inti memakai \\Z / fullmatch (kit_setup.py dimiliki wizard)."""
+        files = [*sorted((ht.KIT_DIR / "kit").glob("*.py")),
+                 *(ht.KIT_DIR / n for n in ("kit_base.py", "kit_config.py", "kit_contracts.py", "kit_doctor.py",
+                                            "kit_paths.py", "kit_discord.py", "hermes_team.py"))]
+        pattern = re.compile(r"""re\.(?:compile|match)\(\s*r?(["'])\^[^\n]*?\$\1""")
+        hits = [f"{path.name}:{i}" for path in files
+                for i, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1) if pattern.search(line)]
+        assert hits == []
+
+
+# =========================================================================== audit 4: tanpa batas biaya
+class TestNoCostCeilingWarning:
+    def test_defaults_stay_zero_and_warn(self, kit, capsys):
+        team = kit.team()
+        scale = team["scale"]
+        assert (scale["daily_token_budget"], scale["team_daily_token_budget"], scale["max_llm_parallel"]) == (0, 0, 0)
+        warning = ht.budget_warnings(team)
+        assert len(warning) == 1 and "tidak ada batas biaya" in warning[0]
+        for key in ("daily_token_budget", "team_daily_token_budget", "max_llm_parallel"):
+            assert f"scale.{key}" in warning[0]
+        ht.main(cli(kit, "check"))
+        out = capsys.readouterr().out
+        assert "tidak ada batas biaya" in out and "Konfigurasi valid." in out          # peringatan, bukan error
+        ht.main(cli(kit, "apply"))
+        assert "tidak ada batas biaya" in capsys.readouterr().out
+
+    @pytest.mark.parametrize("key", ["daily_token_budget", "team_daily_token_budget", "max_llm_parallel"])
+    def test_any_single_limit_silences_it(self, kit, capsys, key):
+        kit.write_team(scale={key: 5})
+        assert ht.budget_warnings(kit.team()) == []
+        ht.main(cli(kit, "check"))
+        assert "tidak ada batas biaya" not in capsys.readouterr().out
+
+    def test_example_file_warns_and_carries_recommended_values(self, tmp_path, capsys):
+        (tmp_path / "members.yaml").write_text("members: []\n")
+        team = ht.load_team(ht.KIT_DIR / "team.example.yaml", tmp_path / "members.yaml")
+        assert ht.budget_warnings(team)
+        text = (ht.KIT_DIR / "team.example.yaml").read_text(encoding="utf-8")
+        for key in ("max_llm_parallel", "daily_token_budget", "team_daily_token_budget"):
+            match = re.search(rf"^\s*#\s+{key}:\s*([0-9]+)\b", text, re.MULTILINE)
+            assert match and int(match.group(1)) > 0, key
+        assert "tidak ada batas biaya" in text

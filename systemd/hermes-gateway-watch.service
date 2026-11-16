@@ -1,0 +1,27 @@
+# Pemantau gateway (tools/gateway_watch.py): memeriksa `systemctl --user is-active hermes-gateway*.service` dan, bila
+# gateway mati, mengirim satu pesan ke webhook (Discord atau URL lain yang menerima JSON {"content": "..."}).
+# Pesan dikirim saat gateway BERUBAH jadi mati, diulang tiap 60 menit selama masih mati, dan sekali lagi saat pulih.
+#
+# URL webhook adalah RAHASIA dan TIDAK ditulis di unit ini: taruh di ~/.hermes-team/gateway-watch.env (0600):
+#   HERMES_WATCH_WEBHOOK_URL=https://discord.com/api/webhooks/<id>/<token>
+# Tanpa berkas/URL itu unit tetap jalan dan hanya mencatat ke journal (kode keluar 1 saat gateway mati).
+#
+# BATAS: unit ini berjalan di server yang sama dengan gateway. Bila servernya mati, jaringannya putus, atau
+# systemd --user milik hermes tidak hidup (linger mati), TIDAK ADA pesan. Untuk itu butuh pemantau dari luar server.
+# BELUM pernah dijalankan terhadap systemd/Discord sungguhan (hanya uji unit dengan runner dan HTTP tiruan).
+#
+# Unit USER milik user hermes:
+#   mkdir -p ~/.config/systemd/user && cp /opt/hermes-team/systemd/hermes-gateway-watch.* ~/.config/systemd/user/
+#   systemctl --user daemon-reload && systemctl --user enable --now hermes-gateway-watch.timer
+#   python3 /opt/hermes-team/tools/gateway_watch.py --test     # kirim pesan uji ke webhook
+#   journalctl --user -u hermes-gateway-watch.service          # riwayat pemeriksaan
+[Unit]
+Description=Hermes team kit: periksa gateway hidup, kabari webhook bila mati
+
+[Service]
+Type=oneshot
+EnvironmentFile=-%h/.hermes-team/gateway-watch.env
+ExecStart=/usr/bin/python3 /opt/hermes-team/tools/gateway_watch.py
+# 1 = gateway mati (sudah dilaporkan): bukan kegagalan unit pemantau itu sendiri.
+SuccessExitStatus=1
+Nice=10

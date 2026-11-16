@@ -13,7 +13,7 @@ from .ratelimit import AdmissionQueue, RateLimiter, TurnTracker
 from .roster import MAX_SUPPORTED_ROSTER_SCHEMA, Roster, RosterCache
 from .scale import AdaptiveThrottle, LlmTracker, Metrics
 from .state import StateStore, now_iso
-from .upstream import HermesGateway
+from .upstream import HermesGateway, note_health
 
 MSG_ROSTER_SCHEMA = ("⚠️ roster.json ditulis kit dengan skema {schema}, sedangkan plugin team-guard ini hanya "
                      "memahami sampai skema {supported}. Plugin tetap berjalan sebisanya (kunci yang tidak dikenal "
@@ -36,6 +36,7 @@ class Runtime:
         self.throttle = AdaptiveThrottle(lambda: self.clock())
         self.metrics = Metrics()
         self.budget = Budget(self.state_dir)
+        self.budget.on_health = lambda ok, reason: self.note_health("budget.ledger", ok, reason)
         self.wall: Any = time.time               # jam dinding (kabar harian; diganti jam tiruan di uji)
         self.started = time.monotonic()          # dipakai aturan "jangan restart berulang"
         self.host: Any = None                    # HostBridge, diisi saat adapter Discord tersambung
@@ -45,6 +46,15 @@ class Runtime:
 
     def roster(self, force: bool = False) -> Roster:
         return self.roster_cache.get(force)
+
+    def note_health(self, key: str, ok: bool, reason: str = "") -> None:
+        """Kesehatan satu bagian plugin → capabilities.json (`budget.ledger`, `limiter.<nama>`,
+        `dispatch.<tahap>`); berkas ditulis ulang hanya bila isinya berubah. Tidak pernah melempar."""
+        try:
+            if note_health(key, ok, reason):
+                self.upstream.write_capabilities(self.state_dir, self.wall)
+        except Exception as exc:
+            shared.log_once("note-health", "catatan kesehatan plugin gagal ditulis (%s: %s)", type(exc).__name__, exc)
 
     def schema_notice(self, roster: Roster) -> str:
         """Teks kabar admin bila roster bersekema lebih baru dari yang dipahami plugin — dan hanya SEKALI per

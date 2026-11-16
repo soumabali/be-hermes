@@ -236,6 +236,23 @@ class Kit:
     def team(self) -> dict:
         return ht.load_team(self.team_file)
 
+    # ---- managed config (/etc/hermes tiruan; `managed_dir` diisi fixture `kit`)
+    MANAGED_PINS = {"terminal": {"backend": "docker", "docker_mount_cwd_to_workspace": False,
+                                 "docker_volumes": [], "docker_extra_args": []}}
+
+    def pin_managed(self, **terminal) -> Path:
+        """Tulis managed config minimal yang mem-pin sandbox Docker; `terminal` menimpa/menambah key-nya
+        (nilai None = buang key itu)."""
+        pins = {**self.MANAGED_PINS["terminal"], **terminal}
+        path = self.managed_dir / "config.yaml"
+        path.write_text(yaml.safe_dump({"terminal": {k: v for k, v in pins.items() if v is not None}}),
+                        encoding="utf-8")
+        return path
+
+    def drop_managed(self) -> None:
+        """Server yang BELUM memasang managed config (instalasi manual sebelum `managed --install`)."""
+        (self.managed_dir / "config.yaml").unlink(missing_ok=True)
+
     # ---- hermes tiruan
     def hermes(self, dry_run: bool = False) -> "ht.Hermes":
         return ht.Hermes(str(self.bin), self.root, dry_run=dry_run, quiet=True)
@@ -314,6 +331,9 @@ def kit(tmp_path, monkeypatch):
     managed.mkdir()
     monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed))
     k.managed_dir = managed
+    # Keadaan server yang SUDAH dipasang benar: managed config mem-pin sandbox Docker (tanpa itu apply /
+    # onboarding menolak, lihat kit.provision.sandbox_gate). Uji "managed belum ada" memanggil k.drop_managed().
+    k.pin_managed()
     for name in ("DISCORD_BOT_TOKEN", "PYTHONPATH", "HERMES_TEAM_DEBUG", "FAKE_HERMES_FAIL_KEYS",
                  "FAKE_HERMES_FAIL_CREATE", "FAKE_HERMES_FAIL_DELETE", "HERMES_TEAM_ALLOW_PLACEHOLDERS"):
         monkeypatch.delenv(name, raising=False)

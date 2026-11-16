@@ -32,7 +32,8 @@ runner perintah tiruan, prompter tiruan, direktori sementara, dan server Discord
     1 preflight       timedatectl
     2 packages        apt-get, skrip get.docker.com
     3 linux_user      adduser, usermod, loginctl enable-linger, docker run hello-world
-    8 hermes_install  installer Hermes (--non-interactive), hermes --version, hermes doctor
+    8 hermes_install  installer Hermes (--non-interactive --skip-setup --commit <HERMES_REF>), hermes --version,
+                      git rev-parse HEAD di checkout Hermes, hermes doctor
     9 kit_install     chown/chmod (penyalinan berkasnya sendiri diuji sungguhan di tmp)
    10 write_config    hermes_team.py check (team.yaml yang dihasilkan diuji dengan load_team asli)
    11 provision       hermes_team.py apply / managed
@@ -42,6 +43,11 @@ runner perintah tiruan, prompter tiruan, direktori sementara, dan server Discord
                       systemd/Hermes sungguhan)
    14 verify          kit_doctor.py --discord, tests/selftest.sh
   Tidak diuji sama sekali: runuser + `env -i` di sistem sungguhan, perilaku systemd/linger, apt.
+  Kontrak installer + CLI Hermes hulu (flag installer, lokasi launcher, subperintah yang dipakai wizard dan kit)
+  diperiksa terhadap Hermes ASLI hanya di CI, job `installer-contract` (tools/hermes_contract.py) — bukan di sini.
+
+Versi Hermes: berkas HERMES_REF di akar kit memuat commit hermes-agent yang diuji CI. Wizard memasang commit itu
+(installer hulu: `--commit SHA`), mencatat commit yang benar-benar terpasang di state, dan memperingatkan bila berbeda.
 
 Hanya stdlib + PyYAML; mengimpor kit_base/kit_discord, tidak mengimpor hermes_team.
 """
@@ -87,6 +93,13 @@ HERMES_INSTALL_URL = "https://hermes-agent.nousresearch.com/install.sh"
 DISCORD_PROBE_URL = "https://discord.com/api/v10/gateway"
 PORTAL_URL = "https://discord.com/developers/applications"
 RESUME_HINT = "sudo bash setup.sh"
+# Commit hermes-agent yang diuji CI: SATU sumber, berkas HERMES_REF di akar kit (.github/workflows/ci.yml membacanya).
+HERMES_REF_FILE = "HERMES_REF"
+SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+# Flag installer hulu yang dipakai wizard (scripts/install.sh hermes-agent; dibaca pada commit HERMES_REF dan `main`,
+# November 2026): --non-interactive, --skip-setup, --commit SHA (SHA harus leluhur branch `main`). Diperiksa terhadap
+# installer asli oleh CI job `installer-contract`.
+HERMES_INSTALL_FLAGS = ("--non-interactive", "--skip-setup")
 CURL_SECURE = ["--proto", "=https", "--tlsv1.2"]       # unduhan skrip yang dijalankan root: hanya HTTPS, TLS >= 1.2
 # Wizard TIDAK membaca TEAMCTL_DISCORD_API: env milik root tidak boleh bisa membelokkan token bot ke host lain.
 DISCORD_API_BASE = "https://discord.com/api/v10"
@@ -108,6 +121,46 @@ MODERATION_PERMISSIONS = ("moderate_members", "kick_members")
 FLAG_MEMBERS = (1 << 14) | (1 << 15)      # GATEWAY_GUILD_MEMBERS | GATEWAY_GUILD_MEMBERS_LIMITED
 FLAG_CONTENT = (1 << 18) | (1 << 19)      # GATEWAY_MESSAGE_CONTENT | GATEWAY_MESSAGE_CONTENT_LIMITED
 USAGE_ADMIN_ALLOW = PERM["VIEW_CHANNEL"] | PERM["READ_MESSAGE_HISTORY"]
+
+
+def read_hermes_ref(*dirs: Any) -> str:
+    """Ref hermes-agent yang diuji CI: baris pertama yang bukan komentar di berkas HERMES_REF pada direktori pertama
+    yang memilikinya. "" bila tidak ada/tidak terbaca."""
+    for base in dirs:
+        try:
+            lines = (Path(base) / HERMES_REF_FILE).read_text(encoding="utf-8").splitlines()
+        except (OSError, UnicodeDecodeError):
+            continue
+        for line in lines:
+            line = line.strip()
+            if line and not line.startswith("#"):
+                return line.split()[0]
+    return ""
+
+
+def hermes_install_command(ref: str = "") -> str:
+    """Perintah installer Hermes PERSIS seperti yang dijalankan wizard (sebagai user Hermes, lewat `bash -c`).
+    `ref` berupa SHA 40 heksadesimal → dipin dengan `--commit`; selain itu installer memakai kanal bawaannya
+    (rilis stable terbaru). Dipakai juga oleh tools/hermes_contract.py (CI job installer-contract)."""
+    flags = list(HERMES_INSTALL_FLAGS)
+    if SHA_RE.match(ref or ""):
+        flags += ["--commit", ref]
+    return (f"set -o pipefail; curl --proto '=https' --tlsv1.2 -fsSL {HERMES_INSTALL_URL} | "
+            "bash -s -- " + " ".join(flags))
+
+
+def hermes_launcher_candidates(home: Any) -> List[Path]:
+    """Tempat launcher `hermes` menurut installer hulu: ~/.local/bin/hermes, atau di dalam checkout-nya."""
+    home = Path(home)
+    return [home / ".local" / "bin" / "hermes", home / ".hermes" / "hermes-agent" / ".hermes" / "bin" / "hermes"]
+
+
+def hermes_ref_status(installed: str, tested: str) -> str:
+    """"match" · "mismatch" · "unknown" (salah satunya bukan SHA sehingga tidak bisa dibandingkan)."""
+    installed, tested = (installed or "").strip().lower(), (tested or "").strip().lower()
+    if not SHA_RE.match(installed) or not re.match(r"^[0-9a-f]{7,40}$", tested):
+        return "unknown"
+    return "match" if installed.startswith(tested) else "mismatch"
 
 
 def invite_permissions(moderation: bool = False) -> int:
@@ -217,6 +270,14 @@ class HostSystem:
         import grp
         return {g.gr_name for g in grp.getgrall() if name in g.gr_mem}
 
+    def group_exists(self, name: str) -> bool:
+        import grp
+        try:
+            grp.getgrnam(name)
+        except KeyError:
+            return False
+        return True
+
     def chown(self, path: Path, user: str, group: str) -> None:
         shutil.chown(str(path), user=user, group=group)
 
@@ -317,7 +378,8 @@ STATE_STR_KEYS = (
     "linux_user", "kit_dir", "guild_id", "guild_name", "bot_id", "app_id", "app_name", "invite_url", "role_entry_id",
     "role_member_id", "role_admin_id", "role_entry_name", "role_member_name", "role_admin_name", "category_id",
     "category_name", "shared_channel_id", "shared_channel_name", "admin_channel_id", "admin_channel_name",
-    "usage_channel_id", "usage_channel_name", "sandbox_image")
+    "usage_channel_id", "usage_channel_name", "sandbox_image", "hermes_version", "hermes_commit", "hermes_ref_tested",
+    "hermes_ref_status")
 
 
 def validate_state_shape(raw: Any) -> List[str]:
@@ -468,7 +530,8 @@ def acquire_lock(path: Path):
 # --------------------------------------------------------------------------- jawaban & prompt
 SECRET_KEY_RE = re.compile(r"(token|secret|password|passwd|passphrase|credential|api[_\-]?key|private[_\-]?key|"
                            r"llm[_\-]?key|bearer|authorization)", re.I)
-SECRET_KEY_ALLOWED = {"llm_key_env"}       # NAMA variabel env, bukan nilainya
+# Kunci yang namanya memuat "key"/"token" tetapi BUKAN rahasia: nama variabel env, dan anggaran token LLM (angka).
+SECRET_KEY_ALLOWED = {"llm_key_env", "daily_token_budget", "team_daily_token_budget"}
 ANSWER_KEYS = {
     "install_docker", "moderation", "guild_id", "invite_wait_seconds", "on_missing_intents",
     "on_missing_permissions", "on_role_hierarchy", "role_entry", "role_member", "role_admin", "category_name",
@@ -477,6 +540,9 @@ ANSWER_KEYS = {
     "usage_channel", "report_daily", "report_weekly", "report_monthly", "install_hermes",
     "overwrite_team_yaml", "build_sandbox", "sandbox_tag", "usage_timer", "report_timer", "run_selftest",
     "adopt_existing_roles", "adopt_existing_channels", "admin_allow_bot", "allow_http_llm",
+    # v3.1.x: versi Hermes, skala, timer tambahan. Berkas jawaban lama (tanpa kunci ini) tetap sah: bawaan dipakai.
+    "hermes_pin", "hermes_repin", "daily_token_budget", "team_daily_token_budget", "max_llm_parallel",
+    "sandbox_idle_timer", "gateway_watch_timer",
 }
 TRUE_WORDS = {"y", "ya", "yes", "true", "1", "iya", "on"}
 FALSE_WORDS = {"t", "tidak", "n", "no", "false", "0", "off"}
@@ -731,7 +797,7 @@ class Context:
                  kit_dir: Path = Path("/opt/hermes-team"), source_dir: Optional[Path] = None,
                  etc_dir: Path = Path("/etc/hermes"), linger_dir: Path = Path("/var/lib/systemd/linger"),
                  dry_run: bool = False, out: Callable[[str], None] = print,
-                 discord_base: str = DISCORD_API_BASE, no_systemd: bool = False):
+                 discord_base: str = DISCORD_API_BASE, no_systemd: bool = False, read_only: bool = False):
         self.sys, self.state, self.prompt = system, state, prompter
         self.user_name = user
         self.kit_dir = Path(kit_dir)
@@ -739,6 +805,7 @@ class Context:
         self.etc_dir, self.linger_dir = Path(etc_dir), Path(linger_dir)
         self.discord_base, self.no_systemd = str(discord_base or DISCORD_API_BASE).rstrip("/"), bool(no_systemd)
         self.dry_run = dry_run
+        self.read_only = bool(read_only or dry_run)      # --list / --dry-run: check() tidak boleh menjalankan perintah
         self._out = out
         self.secrets: List[str] = []
         self.warnings: List[str] = []
@@ -811,9 +878,12 @@ class Context:
 
     def hermes_bin(self) -> Path:
         """Launcher Hermes: ~/.local/bin/hermes, atau yang dibuat installer di dalam checkout-nya."""
-        home = self._home()
-        candidates = [home / ".local" / "bin" / "hermes", home / ".hermes" / "hermes-agent" / ".hermes" / "bin" / "hermes"]
+        candidates = hermes_launcher_candidates(self._home())
         return next((p for p in candidates if p.exists()), candidates[0])
+
+    def tested_hermes_ref(self) -> str:
+        """Ref Hermes yang diuji CI untuk kit INI (berkas HERMES_REF di sumber wizard, atau di kit terpasang)."""
+        return read_hermes_ref(self.source_dir, self.kit_dir)
 
     # ---- berkas
     # Direktori ~hermes dimiliki user tanpa hak istimewa, sedangkan wizard berjalan sebagai root: semua baca/tulis di
@@ -1022,7 +1092,8 @@ class Step:
     explain = ""
 
     def check(self, ctx: Context) -> bool:
-        """Sudah selesai? Tidak boleh menjalankan perintah atau menyentuh jaringan (dipakai --list/--dry-run)."""
+        """Sudah selesai? Tidak boleh menyentuh jaringan, dan saat `ctx.read_only` (--list/--dry-run) tidak boleh
+        menjalankan perintah apa pun. Di luar itu boleh memeriksa keadaan nyata (lihat Gateway.check)."""
         return ctx.state.done(self.name)
 
     def plan(self, ctx: Context) -> List[str]:
@@ -1037,7 +1108,7 @@ class Preflight(Step):
     explain = "Memeriksa OS, arsitektur, RAM, disk, jaringan, dan jam. Tidak mengubah apa pun."
 
     def plan(self, ctx):
-        return ["baca /etc/os-release, RAM, dan ruang disk",
+        return ["baca /etc/os-release, RAM, dan ruang disk; berhenti bila apt-get tidak ada (hanya Debian/Ubuntu didukung)",
                 f"coba hubungi {DISCORD_PROBE_URL} dan {HERMES_INSTALL_URL}",
                 "pastikan systemd berjalan (/run/systemd/system) — kecuali --no-systemd",
                 "jalankan: timedatectl show -p NTPSynchronized --value"]
@@ -1046,10 +1117,17 @@ class Preflight(Step):
         rel = ctx.sys.os_release()
         family = f"{rel.get('ID', '')} {rel.get('ID_LIKE', '')}".lower()
         label = rel.get("PRETTY_NAME") or rel.get("ID") or "tidak dikenal"
+        if not ctx.sys.which("apt-get"):
+            raise StepError(f"OS '{label}' tidak didukung wizard ini: apt-get tidak ditemukan",
+                            cause="wizard memasang paket dengan apt-get dan hanya ditulis untuk Debian/Ubuntu ber-systemd "
+                                  "(Ubuntu 22.04+ / Debian 12+); di OS lain ia akan gagal di langkah packages/linux_user, "
+                                  "setelah sebagian server diubah",
+                            fix="pakai server Debian/Ubuntu; atau pasang dengan tangan mengikuti docs/INSTALL.md "
+                                "(\"Instalasi manual\"), menyesuaikan perintah paketnya dengan OS-mu")
         if "debian" in family or "ubuntu" in family:
             ctx.say(f"  ✓ OS: {label}")
         else:
-            ctx.warn(f"OS '{label}' bukan Debian/Ubuntu; wizard memakai apt-get dan adduser, mungkin gagal")
+            ctx.warn(f"OS '{label}' bukan Debian/Ubuntu walau punya apt-get; wizard belum pernah dicoba di sini, mungkin gagal")
         machine = ctx.sys.machine()
         if machine in ("x86_64", "amd64", "aarch64", "arm64"):
             ctx.say(f"  ✓ Arsitektur: {machine}")
@@ -1176,6 +1254,17 @@ class LinuxUser(Step):
             else:
                 ctx.run(["useradd", "--create-home", "--shell", "/bin/bash", u], what="pembuatan user")
         if "docker" not in ctx.sys.user_groups(u):
+            if not ctx.sys.group_exists("docker"):
+                raise StepError("grup Linux `docker` tidak ada, padahal perintah `docker` terpasang",
+                                cause="Docker yang terpasang bukan Docker Engine dari paket resmi: biasanya Docker rootless, "
+                                      "Docker dari snap, atau Podman yang menyamar sebagai `docker`. Kit butuh daemon Docker "
+                                      f"sistem yang bisa dipakai user {u} lewat grup `docker`",
+                                fix="periksa: `docker info | grep -iE 'rootless|Docker Root Dir'` dan `snap list docker`. "
+                                    "Docker snap: `sudo snap remove docker`, lalu pasang Docker Engine resmi "
+                                    "(https://docs.docker.com/engine/install/ atau skrip get.docker.com). Docker rootless milik "
+                                    "user lain tidak bisa dipakai: pasang Docker Engine sistem. Bila daemon sistem memang ada "
+                                    "tetapi grupnya hilang: `sudo groupadd docker && sudo systemctl restart docker`. "
+                                    f"Setelah itu: {RESUME_HINT}")
             ctx.run(["usermod", "-aG", "docker", u], what="menambah user ke grup docker",
                     fix="grup `docker` dibuat saat Docker dipasang; ulangi langkah packages bila grupnya belum ada")
         if not self._linger(ctx):
@@ -1907,6 +1996,20 @@ def valid_report_time(value: str) -> Optional[str]:
     return "tulis jam HH:MM (24 jam), mis. 08:00; '-' untuk mematikan"
 
 
+def valid_count(value: str) -> Optional[str]:
+    return None if re.match(r"^\d{1,12}$", value) else "tulis bilangan bulat ≥ 0 tanpa titik/koma (0 = tanpa batas)"
+
+
+# Titik awal yang disarankan untuk tiga pembatas yang bawaannya 0 (= tanpa batas) di team.example.yaml. Ini BUKAN hasil
+# pengukuran: anggaran per orang mengikuti contoh di team.example.yaml, anggaran tim = 10× itu, dan LLM paralel =
+# max_concurrent_sessions (8) + admin_reserved_slots (2). Ukur endpoint-mu dengan tools/probe_llm.py lalu sesuaikan.
+SCALE_RECOMMENDED = (
+    ("daily_token_budget", "Anggaran token per orang per hari (0 = tanpa batas)", 3_000_000),
+    ("team_daily_token_budget", "Anggaran token seluruh tim per hari (0 = tanpa batas)", 30_000_000),
+    ("max_llm_parallel", "Panggilan LLM paralel seluruh tim, termasuk cron & subagent (0 = tanpa batas)", 10),
+)
+
+
 def valid_timezone(value: str) -> Optional[str]:
     if value == "":
         return None
@@ -1932,12 +2035,17 @@ class Options(Step):
 
     def plan(self, ctx):
         return ["tanya nama tim, zona waktu, thread per pesan, laporan pemakaian terjadwal",
+                "tanya tiga pembatas skala (anggaran token per orang/tim, LLM paralel); Enter = nilai yang disarankan",
                 "bila laporan dipilih: cari/buat #hermes-usage privat (hermes-admin hanya-baca + bot)"]
 
     def run(self, ctx):
         ctx.prompt.ask("team_name", "Nama tim", "Backend")
         ctx.prompt.ask("timezone", "Zona waktu batas hari laporan pemakaian", ctx.sys.system_timezone() or "", valid_timezone)
         ctx.prompt.confirm("threads_personal", "Tiap pesan baru di channel pribadi membuka thread/sesi baru?", True)
+        ctx.say("  Pembatas skala (team.yaml → scale). Nilai dalam kurung adalah titik awal yang disarankan, bukan hasil ukur;")
+        ctx.say("  Enter = pakai. Anggaran token baru ditegakkan bila pemotret pemakaian terpasang (langkah extras).")
+        for key, question, recommended in SCALE_RECOMMENDED:
+            ctx.prompt.ask(key, question, str(recommended), valid_count)
         if not ctx.prompt.confirm("usage_reports", "Kirim laporan pemakaian token terjadwal ke channel khusus (tanpa LLM)?", True):
             ctx.data.pop("usage_channel_id", None)
             return
@@ -1961,15 +2069,31 @@ class Options(Step):
         ctx.say(f"  ✓ #{name}: {ch['id']}" + (" (baru dibuat)" if created else " (sudah ada, izin diselaraskan)"))
 
 
+def detect_hermes_commit(ctx: "Context", info: UserInfo) -> str:
+    """Commit hermes-agent yang terpasang ("" = tidak bisa ditentukan): `git rev-parse HEAD` di checkout installer
+    (~/.hermes/hermes-agent), lalu `pinnedCommit` di .hermes-bootstrap-complete yang ditulis installer."""
+    source = Path(info.home) / ".hermes" / "hermes-agent"
+    res = ctx.run(["git", "-C", str(source), "rev-parse", "HEAD"], as_user=True, check=False, timeout=60)
+    head = (res.out.strip().splitlines() or [""])[0].strip().lower()
+    if res.ok and SHA_RE.match(head):
+        return head
+    try:
+        receipt = json.loads(ctx.read_text(source / ".hermes-bootstrap-complete"))
+    except (OSError, ValueError, StepError):
+        return ""
+    commit = str(receipt.get("pinnedCommit") or "").strip().lower() if isinstance(receipt, dict) else ""
+    return commit if SHA_RE.match(commit) else ""
+
+
 class HermesInstall(Step):
     name, title = "hermes_install", "Memasang Hermes"
     explain = ("Memasang Hermes untuk user Hermes dengan installer resminya dalam mode non-interaktif (tanpa `hermes setup` "
-               "dan tanpa memasang gateway), lalu memastikan token bot ada di ~/.hermes/.env. Gateway sengaja BELUM "
-               "dijalankan: konfigurasi tim harus diterapkan dulu. Jangan jalankan `hermes gateway setup` sendiri.")
+               "dan tanpa memasang gateway), pada commit yang diuji CI untuk kit ini (berkas HERMES_REF), lalu memastikan "
+               "token bot ada di ~/.hermes/.env. Gateway sengaja BELUM dijalankan: konfigurasi tim harus diterapkan dulu. "
+               "Jangan jalankan `hermes gateway setup` sendiri.")
 
-    def command(self):
-        return (f"set -o pipefail; curl --proto '=https' --tlsv1.2 -fsSL {HERMES_INSTALL_URL} | "
-                "bash -s -- --non-interactive --skip-setup")
+    def command(self, ref: str = ""):
+        return hermes_install_command(ref)
 
     def check(self, ctx):
         return (ctx.home() is not None and ctx.hermes_bin().exists()
@@ -1977,27 +2101,79 @@ class HermesInstall(Step):
 
     def plan(self, ctx):
         lines = []
+        tested = ctx.tested_hermes_ref()
+        pin = tested if ctx.state.answers.get("hermes_pin") is not False else ""
         if ctx.home() is None or not ctx.hermes_bin().exists():
-            lines.append(f"(setelah persetujuan) sebagai {ctx.user_name}: bash -c '{self.command()}'")
+            lines.append(f"(setelah persetujuan) sebagai {ctx.user_name}: bash -c '{self.command(pin)}'")
         return lines + [f"pastikan DISCORD_BOT_TOKEN di ~{ctx.user_name}/.hermes/.env (0600), ditulis langsung ke berkas",
-                        f"sebagai {ctx.user_name}: hermes --version; hermes doctor"]
+                        f"sebagai {ctx.user_name}: hermes --version; git -C ~/.hermes/hermes-agent rev-parse HEAD → "
+                        f"bandingkan dengan HERMES_REF ({tested[:12] or 'tidak ada'}); hermes doctor"]
+
+    def pin_ref(self, ctx, tested: str) -> str:
+        """Commit yang dipin ke installer ("" = tidak dipin: kanal bawaan installer, rilis stable terbaru)."""
+        if not SHA_RE.match(tested):
+            ctx.warn(f"berkas {HERMES_REF_FILE} tidak ada atau bukan SHA commit; Hermes dipasang dari kanal bawaan installer "
+                     "(rilis stable terbaru), yang BELUM TENTU versi yang diuji CI untuk kit ini")
+            return ""
+        if ctx.prompt.confirm("hermes_pin", f"Pasang Hermes pada commit yang diuji CI untuk kit ini ({tested[:12]})? "
+                              "Tidak = rilis stable terbaru dari hulu (belum diuji dengan kit ini)", True):
+            return tested
+        ctx.warn("atas permintaanmu (hermes_pin: false) Hermes dipasang dari rilis stable terbaru, BUKAN commit yang diuji "
+                 "CI untuk kit ini")
+        return ""
+
+    def install(self, ctx, info, command: str, fix: str, what: str = "installer Hermes") -> None:
+        ctx.run(["bash", "-c", command], as_user=True, stream=True, what=what,
+                fix=fix + f". Log installer: {info.home}/.hermes/logs/install.log. Bila installer menolak `--commit` "
+                          "(\"unknown option\" / \"is not on branch\"): installer hulu berubah — pasang tanpa pin dengan "
+                          "`hermes_pin: false`, lalu jalankan selftest di langkah verify")
+
+    def record_version(self, ctx, info, tested: str, version_line: str, announce: bool = True) -> str:
+        installed = detect_hermes_commit(ctx, info)
+        status = hermes_ref_status(installed, tested)
+        ctx.data.update({"hermes_version": version_line[:200], "hermes_commit": installed, "hermes_ref_tested": tested,
+                         "hermes_ref_status": status})
+        ctx.save()
+        if not announce:
+            return status
+        if status == "match":
+            ctx.say(f"  ✓ Hermes terpasang pada commit yang diuji CI untuk kit ini ({installed[:12]})")
+        elif status == "mismatch":
+            ctx.warn(f"Hermes terpasang pada commit {installed[:12]}, BUKAN commit yang diuji CI untuk kit v{KIT_VERSION} "
+                     f"({tested[:12]}). Kecocokan kit dengan versi ini belum terbukti: jalankan selftest di langkah verify "
+                     f"(bawaan: ya). Menyamakan versi: {RESUME_HINT} --only hermes_install lalu setujui pin ulang "
+                     "(`hermes_repin: true`)")
+        else:
+            ctx.warn("commit Hermes yang terpasang tidak bisa ditentukan atau tidak bisa dibandingkan dengan "
+                     f"{HERMES_REF_FILE} ({tested[:12] or 'tidak ada'}); kecocokan kit dengan versi ini belum terbukti: "
+                     "jalankan selftest di langkah verify (bawaan: ya)")
+        return status
 
     def run(self, ctx):
         info = ctx.user()
+        tested = ctx.tested_hermes_ref()
+        fix = (f"pasang manual: sudo -iu {info.name}, lalu `curl --proto '=https' --tlsv1.2 -fsSL {HERMES_INSTALL_URL} | bash "
+               f"-s -- {' '.join(HERMES_INSTALL_FLAGS)}`; setelah `hermes --version` jalan, ulangi: {RESUME_HINT}")
         if not ctx.hermes_bin().exists():
+            command = self.command(self.pin_ref(ctx, tested))
             ctx.say(f"  Hermes belum terpasang untuk user {info.name}. Perintah installer resmi (dijalankan sebagai {info.name}):")
-            ctx.say(f"    {self.command()}")
-            fix = (f"pasang manual: sudo -iu {info.name}, lalu `curl --proto '=https' --tlsv1.2 -fsSL {HERMES_INSTALL_URL} | bash`; "
-                   f"setelah `hermes --version` jalan, ulangi: {RESUME_HINT}")
+            ctx.say(f"    {command}")
             if not ctx.prompt.confirm("install_hermes", "Unduh dan jalankan installer itu sekarang? (beberapa menit)", None):
                 raise StepError("Hermes belum terpasang", fix=fix)
-            ctx.run(["bash", "-c", self.command()], as_user=True, stream=True, what="installer Hermes",
-                    fix=fix + f". Log installer: {info.home}/.hermes/logs/install.log")
+            self.install(ctx, info, command, fix)
             if not ctx.hermes_bin().exists():
                 raise StepError(f"installer selesai tetapi {ctx.hermes_bin()} tidak ada",
                                 cause="installer menaruh launcher di tempat lain, atau gagal diam-diam", fix=fix)
         version = ctx.run(["hermes", "--version"], as_user=True, what="hermes --version")
-        ctx.say("  ✓ " + (version.out.strip().splitlines() or ["hermes terpasang"])[0])
+        version_line = (version.out.strip().splitlines() or ["hermes terpasang"])[0]
+        ctx.say("  ✓ " + version_line)
+        status = self.record_version(ctx, info, tested, version_line, announce=False)
+        if status == "mismatch" and SHA_RE.match(tested):
+            ctx.say(f"  ! Hermes terpasang pada commit {ctx.data['hermes_commit'][:12]}; yang diuji CI untuk kit ini: {tested[:12]}")
+            if ctx.prompt.confirm("hermes_repin", "Jalankan ulang installer untuk memindahkan Hermes ke commit yang diuji? "
+                                  "Gateway yang sedang jalan perlu di-restart sesudahnya", False):
+                self.install(ctx, info, self.command(tested), fix, what="installer Hermes (pin ulang)")
+        self.record_version(ctx, info, tested, version_line)
         token = ctx.bot_token()
         ctx.make_dir(Path(info.home) / ".hermes", 0o700, info.name, info.name)
         ctx.set_env_value(ctx.hermes_env, "DISCORD_BOT_TOKEN", token, 0o600, info.name, info.name)
@@ -2012,7 +2188,7 @@ class HermesInstall(Step):
 # Daftar IZIN untuk salinan kit (bukan copytree + daftar tolak): berkas lain di folder sumber — `.env` lokal, berkas
 # jawaban, team.yaml, kunci SSH — tidak ikut tersalin, apalagi dibuat terbaca semua orang oleh `chmod a+rX`.
 KIT_DIRS = ("kit", "teamctl", "plugins", "skills", "systemd", "tools", "docker", "docs", "tests")
-KIT_TOP_FILES = ("VERSION", "requirements-dev.txt", "pyproject.toml", "CHANGELOG.md", "README.md", "setup.sh",
+KIT_TOP_FILES = ("VERSION", HERMES_REF_FILE, "requirements-dev.txt", "pyproject.toml", "CHANGELOG.md", "README.md", "setup.sh",
                  "team.example.yaml", "members.example.yaml")
 KIT_TOP_GLOBS = ("*.py", "*.example.yaml", "LICENSE*")
 # Dilapisi lagi di dalam direktori yang diizinkan: dotfile apa pun, cache, cadangan, kunci/kredensial, berkas jawaban.
@@ -2220,6 +2396,13 @@ def build_team_config(example: dict, data: Dict[str, Any], answers: Dict[str, An
                         for kind in ("daily", "weekly", "monthly")}
     team["usage"] = usage
     team["server_admin"] = dict(team.get("server_admin") or {}, allow_moderation=bool(answers.get("moderation")))
+    # Pembatas skala: hanya yang DIJAWAB yang ditulis. State/berkas jawaban lama (tanpa kunci ini) → nilai contoh tetap.
+    scale = dict(team.get("scale") or {})
+    for key, _question, _recommended in SCALE_RECOMMENDED:
+        if answers.get(key) not in (None, ""):
+            scale[key] = int(answers[key])
+    if scale:
+        team["scale"] = scale
     if data.get("sandbox_image"):
         team["sandbox"] = dict(team.get("sandbox") or {}, image=str(data["sandbox_image"]))
     return team
@@ -2388,15 +2571,27 @@ def set_sandbox_image(text: str, image: str) -> Optional[str]:
 
 
 class Extras(Step):
-    name, title = "extras", "Tambahan opsional: image sandbox dan timer pemakaian"
-    explain = "Tiga hal opsional; masing-masing ditanyakan. Semua bisa dipasang nanti (docs/INSTALL.md Langkah 8 dan docs/PEMAKAIAN.md)."
+    name, title = "extras", "Tambahan opsional: image sandbox, timer pemakaian, pemantau"
+    explain = ("Beberapa hal opsional; masing-masing ditanyakan. Semua bisa dipasang nanti (docs/INSTALL.md Langkah 8, "
+               "docs/PEMAKAIAN.md, docs/OPERASI.md).")
     UNITS = {"collect": ("hermes-usage-collect.service", "hermes-usage-collect.timer"),
-             "report": ("hermes-usage-report.service", "hermes-usage-report.timer")}
+             "report": ("hermes-usage-report.service", "hermes-usage-report.timer"),
+             "idle": ("hermes-sandbox-idle.service", "hermes-sandbox-idle.timer"),
+             "watch": ("hermes-gateway-watch.service", "hermes-gateway-watch.timer")}
+    WATCH_ENV = "gateway-watch.env"      # di ~/.hermes-team; berisi URL webhook (rahasia) → diisi operator, bukan wizard
+    WATCH_ENV_TEMPLATE = (
+        "# Pemantau gateway (tools/gateway_watch.py, unit hermes-gateway-watch). Berkas ini RAHASIA (0600): URL webhook\n"
+        "# Discord memuat token. Isi satu baris lalu simpan; tanpa URL, pemantau hanya mencatat ke journal.\n"
+        "#   Discord: Edit Channel → Integrations → Webhooks → New Webhook → Copy Webhook URL\n"
+        "#HERMES_WATCH_WEBHOOK_URL=https://discord.com/api/webhooks/<id>/<token>\n")
 
     def plan(self, ctx):
         return [f"(opsional) docker build -t hermes-team-sandbox:<tag> {ctx.kit_dir}/docker/sandbox, set sandbox.image, provisioning ulang",
                 f"(opsional) pasang timer hermes-usage-collect sebagai unit user {ctx.user_name}",
                 "(opsional, bila laporan terjadwal dipilih) pasang timer hermes-usage-report",
+                "(opsional, bawaan ya) pasang timer hermes-sandbox-idle — HANYA MELAPOR, tidak menghentikan container",
+                f"(opsional, bawaan tidak) pasang timer hermes-gateway-watch + templat ~{ctx.user_name}/.hermes-team/"
+                f"{self.WATCH_ENV} (URL webhook diisi operator)",
                 "hanya disebutkan, tidak dijalankan: hermes egress install && hermes egress setup && hermes egress start"]
 
     def run(self, ctx):
@@ -2432,6 +2627,13 @@ class Extras(Step):
             if ctx.data.get("usage_channel_id") and ctx.state.answers.get("usage_reports"):
                 if ctx.prompt.confirm("report_timer", "Pasang timer laporan pemakaian terjadwal?", True):
                     self.install_timer(ctx, info, "report")
+            if ctx.prompt.confirm("sandbox_idle_timer", "Pasang pelapor sandbox menganggur (timer tiap 30 menit; HANYA "
+                                  "melapor ke journal, tidak menghentikan container)?", True):
+                self.install_timer(ctx, info, "idle")
+                ctx.say(f"    laporan: sudo -iu {info.name} journalctl --user -u hermes-sandbox-idle.service")
+            if ctx.prompt.confirm("gateway_watch_timer", "Pasang pemantau gateway (timer tiap 5 menit; mengirim pesan ke "
+                                  "webhook bila gateway mati)? URL webhook kamu isi sendiri sesudahnya", False):
+                self.install_watch(ctx, info)
         ctx.say("  · Pembatasan internet sandbox (proxy egress Hermes) TIDAK dipasang wizard. Bila perlu, sebagai "
                 f"{info.name}:\n      hermes egress install && hermes egress setup && hermes egress start")
 
@@ -2448,6 +2650,18 @@ class Extras(Step):
         ctx.run(["systemctl", "--user", "daemon-reload"], as_user=True, what="systemctl --user daemon-reload", fix=fix)
         ctx.run(["systemctl", "--user", "enable", "--now", timer], as_user=True, what=f"mengaktifkan {timer}", fix=fix)
         ctx.say(f"  ✓ {timer} aktif")
+
+    def install_watch(self, ctx, info) -> None:
+        env_file = ctx.team_dir / self.WATCH_ENV
+        ctx.make_dir(ctx.team_dir, 0o700, info.name, info.name)
+        try:
+            ctx.read_text(env_file)
+        except FileNotFoundError:
+            ctx.write_file(env_file, self.WATCH_ENV_TEMPLATE, 0o600, info.name, info.name)
+        self.install_timer(ctx, info, "watch")
+        ctx.say(f"    Supaya ada pesan saat gateway mati: isi HERMES_WATCH_WEBHOOK_URL di {env_file} (0600), lalu uji dengan")
+        ctx.say(f"      sudo -iu {info.name} python3 {ctx.kit_dir}/tools/gateway_watch.py --test")
+        ctx.say("    Pemantau ini berjalan di server yang sama: bila servernya sendiri mati, tidak ada pesan (docs/OPERASI.md).")
 
 
 GATEWAY_LOG_HINTS = (
@@ -2524,6 +2738,25 @@ class Gateway(Step):
                 f"sebagai {u}: hermes gateway start",
                 f"sebagai {u}: systemctl --user is-active {self.DEFAULT_UNIT} sampai active (maks {GATEWAY_WAIT} dtk), "
                 f"lalu periksa lagi setelah {GATEWAY_STABLE_WAIT} dtk (gagal → hermes logs gateway -n 40)"]
+
+    def check(self, ctx):
+        """Selesai = tercatat di state DAN unitnya masih aktif. Tanpa pemeriksaan kedua, putaran ulang wizard melaporkan
+        langkah ini beres dari state saja walau gateway sudah mati. Saat --list/--dry-run (dan --no-systemd) hanya
+        state yang dibaca: di sana tidak boleh ada perintah yang dijalankan."""
+        if not ctx.state.done(self.name):
+            return False
+        if ctx.read_only or ctx.no_systemd:
+            return True
+        info = ctx.sys.user(ctx.user_name)
+        if info is None:
+            return False
+        unit = self.unit_name(ctx, info)
+        state, _text, verdict = self.probe(ctx, unit)
+        if verdict == "running":
+            return True
+        ctx.say(f"  ! langkah ini tercatat selesai, tetapi {unit} TIDAK aktif sekarang (status '{state or verdict}'); "
+                "gateway dijalankan ulang dan diperiksa lagi")
+        return False
 
     def unit_name(self, ctx, info) -> str:
         """Nama unit yang benar-benar dipasang `hermes gateway install` (bare `hermes-gateway`, atau berakhiran profil/hash)."""
@@ -2695,8 +2928,14 @@ class Verify(Step):
             ctx.say("  ✓ kit_doctor: tidak ada masalah ber-level error")
         else:
             ctx.warn(f"kit_doctor menemukan masalah (kode {doctor.rc}); ikuti saran '→' di atas, lalu: {RESUME_HINT} --only verify")
+        ref_status = str(ctx.data.get("hermes_ref_status") or "unknown")
+        if ref_status != "match":
+            ctx.say("  ! Hermes di server ini " + ("BUKAN commit yang diuji CI untuk kit ini" if ref_status == "mismatch"
+                                                   else "tidak bisa dipastikan sama dengan commit yang diuji CI")
+                    + ": uji di bawah adalah satu-satunya bukti kecocokan di server ini.")
+        # Bawaan YA: ini satu-satunya pemeriksaan kecocokan kit ↔ Hermes yang berjalan di server itu sendiri.
         if ctx.prompt.confirm("run_selftest", "Jalankan uji kit terhadap Hermes di server ini (HOME sementara + Discord tiruan, "
-                              "beberapa menit; butuh pytest di Python milik Hermes)?", False):
+                              "beberapa menit; membuat venv sementara untuk pytest)?", True):
             python, source = find_hermes_python(ctx.hermes_bin(), Path(info.home))
             extra = {}
             if python:
@@ -2742,6 +2981,10 @@ class Verify(Step):
                 ctx.say(f"    {label:<15}: #{d.get(f'{key}_channel_name', '?')} ({d[f'{key}_channel_id']})")
         ctx.say(f"    Admin tim      : {', '.join(d.get('admins') or []) or '?'}")
         ctx.say(f"    Endpoint LLM   : {a.get('llm_base_url', '?')} (key: variabel {a.get('llm_key_env', '?')}, nilainya tidak ditampilkan)")
+        ref_note = {"match": "sama dengan yang diuji CI", "mismatch": "BEDA dari yang diuji CI"}.get(
+            str(d.get("hermes_ref_status")), "tidak bisa dibandingkan dengan yang diuji CI")
+        ctx.say(f"    Hermes         : {d.get('hermes_version') or '?'} · commit {str(d.get('hermes_commit') or '?')[:12]} — {ref_note} "
+                f"({str(d.get('hermes_ref_tested') or '?')[:12]})")
         if d.get("sandbox_image"):
             ctx.say(f"    Image sandbox  : {d['sandbox_image']}")
         ctx.say("    Berkas")
@@ -2945,7 +3188,7 @@ def _run(args, system, state, answers, out, input_fn, getpass_fn, environ, overr
         state.data["no_systemd"] = True
     prompter = Prompter(answers, state.answers, args.non_interactive, args.yes, out, input_fn, getpass_fn, environ)
     ctx = Context(system, state, prompter, user=user, kit_dir=Path(kit_dir), dry_run=args.dry_run, out=out,
-                  no_systemd=bool(state.data.get("no_systemd")), **overrides)
+                  no_systemd=bool(state.data.get("no_systemd")), read_only=read_only, **overrides)
     prompter.out = ctx.say
     for name in (ENV_BOT_TOKEN, ENV_LLM_KEY):
         ctx.add_secret(str(prompter.environ.get(name) or "").strip())

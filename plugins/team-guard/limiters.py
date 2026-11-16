@@ -5,8 +5,11 @@ Urutan bawaan (TIDAK boleh berubah; dijaga uji simulasi): anggaran token → rat
 menahan orang lain, jadi tidak bisa dipecah menjadi dua pemeriksaan berurutan tanpa mengubah keadilan antrean).
 
 Menambah pembatas = satu kelas dengan `name` dan `async check(ctx) -> Verdict | None` + satu baris di
-`default_limiters()`. `None` = lolos. Penolakan selalu lewat SATU jalur (`Dispatcher._refuse`): satu tabel pesan
-(`REFUSAL_TEXT`), satu `metrics.refuse(verdict.metric)`, dan `reason` hook `pre_gateway_dispatch`.
+`default_limiters()` + (bila `kind` penolakannya baru) satu entri di tabel `refusals.REFUSALS` (atau
+`register_refusal()`). `None` = lolos. Penolakan selalu lewat SATU jalur (`Dispatcher._refuse`): satu tabel
+(`refusals.REFUSALS`: pesan + metrik; diekspor ulang dari modul ini),
+satu `metrics.refuse(...)`, dan `reason` hook `pre_gateway_dispatch`. `kind` yang lupa didaftarkan tetap menolak
+(pesan umum, metrik `other`) dan uji `TestRefusalRegistry` menggagalkan build.
 Pembatas boleh mengirim pemberitahuan sampingan (peringatan 80%, kabar admin) lewat `ctx.say` / `ctx.notify_admin`.
 
 Murni Python; jam & tidur disuntikkan lewat `ctx` supaya bisa diuji tanpa menunggu.
@@ -17,45 +20,26 @@ import asyncio
 from typing import Any, Awaitable, Callable, Optional, Protocol
 
 from .ratelimit import wait_for_slot
+from .refusals import (MSG_BUDGET_OVER, MSG_BUDGET_TEAM_OVER, MSG_QUEUE_CANCELLED, MSG_QUEUE_FULL, MSG_RATE,  # noqa: F401
+                       MSG_REFUSED_GENERIC, MSG_USER_LIMIT_FULL, OTHER_METRIC, REFUSALS, Refusal, refusal_for,
+                       refusal_metrics, register_refusal)
 from .scale import as_int, effective_max_active
 
 REFUSE_WAIT = 45.0          # tunggu rate limit lebih lama dari ini → ditolak sopan
 RESERVE_GRACE = 60.0        # reservasi pesan biasa hidup sampai queue_max_wait + ini (atau gilirannya mulai)
 
-MSG_RATE = ("⏳ <@{uid}> kamu mengirim pesan terlalu cepat. Coba lagi dalam ±{wait} detik "
-            "(batas: {rate} pesan/menit).")
 MSG_QUEUE = "⏳ <@{uid}> semua slot Hermes sedang terpakai. Kamu di antrean nomor {pos}; pesanmu diproses otomatis."
-MSG_QUEUE_FULL = ("😔 <@{uid}> Hermes masih penuh setelah {wait} detik menunggu, jadi pesanmu tidak diproses. "
-                  "Coba kirim lagi sebentar lagi.")
 MSG_QUEUE_BEHIND = ("⏳ <@{uid}> pesanmu yang sebelumnya masih di antrean; pesan ini menyusul setelahnya dan "
                     "diproses otomatis.")
-MSG_QUEUE_CANCELLED = ("♻️ <@{uid}> Hermes sedang dimuat ulang, jadi pesanmu yang menunggu di antrean tidak "
-                       "diproses. Kirim ulang sebentar lagi.")
 MSG_USER_LIMIT = ("⏳ <@{uid}> kamu sudah punya {limit} sesi Hermes yang berjalan (batas per orang). Pesan ini "
                   "diproses otomatis setelah salah satunya selesai.")
-MSG_USER_LIMIT_FULL = ("😔 <@{uid}> sesimu yang lain masih berjalan setelah {wait} detik menunggu, jadi pesan ini "
-                       "tidak diproses. Tunggu sampai selesai (atau `/stop` di thread-nya), lalu kirim lagi.")
 MSG_BUDGET_WARN = ("📊 <@{uid}> pemakaian token-mu hari ini sudah {pct}% dari jatah harian "
                    "({used} dari {limit} token). Setelah 100% pesan baru ditolak sampai tengah malam.")
-MSG_BUDGET_OVER = ("🚫 <@{uid}> jatah token harianmu sudah habis ({used} dari {limit} token), jadi pesan ini "
-                   "tidak diproses. Jatah kembali penuh setelah tengah malam; admin tim bisa menambah kuota.")
-MSG_BUDGET_TEAM_OVER = ("🚫 <@{uid}> jatah token harian TIM sudah habis ({used} dari {limit} token), jadi pesan ini "
-                        "tidak diproses. Jatah kembali penuh setelah tengah malam.")
 ADMIN_BUDGET_OVER = ("📊 Jatah token harian <@{uid}> habis ({used} dari {limit} token). Pesan barunya ditolak "
                      "sampai tengah malam. Tambah kuota lewat teamctl bila perlu.")
 ADMIN_BUDGET_TEAM_WARN = "📊 Pemakaian token tim hari ini sudah {pct}% dari anggaran ({used} dari {limit} token)."
 ADMIN_BUDGET_TEAM_OVER = ("📊 Anggaran token harian tim habis ({used} dari {limit} token). Pesan anggota ditolak "
                           "sampai tengah malam.")
-
-# Satu tabel pesan penolakan: verdict.kind → (kunci jeda pemberitahuan, templat). Templat selalu dapat `uid`.
-REFUSAL_TEXT: dict[str, tuple[str, str]] = {
-    "budget_over": ("budget", MSG_BUDGET_OVER),
-    "budget_team_over": ("budget", MSG_BUDGET_TEAM_OVER),
-    "rate": ("rate", MSG_RATE),
-    "user_limit_full": ("user-limit-full", MSG_USER_LIMIT_FULL),
-    "queue_full": ("queue-full", MSG_QUEUE_FULL),
-    "queue_cancelled": ("queue-cancelled", MSG_QUEUE_CANCELLED),
-}
 
 
 def _n(value: Any) -> str:
@@ -67,9 +51,10 @@ def _n(value: Any) -> str:
 
 
 class Verdict:
-    """Penolakan dari satu pembatas. `kind` = kunci `REFUSAL_TEXT`; `metric` = jenis untuk
-    `metrics.refuse()` (None = tidak dihitung, mis. antrean dibatalkan); `reason` = teks untuk hook;
-    `followup` = coroutine opsional yang dijalankan SETELAH pesan ke pengguna (mis. kabar admin)."""
+    """Penolakan dari satu pembatas. `kind` = kunci `REFUSALS` (pesan + metrik diambil dari tabel itu);
+    `reason` = teks untuk hook; `fmt` = isian templat; `followup` = coroutine opsional yang dijalankan
+    SETELAH pesan ke pengguna (mis. kabar admin). `metric` hanya dipakai bila `kind` TIDAK terdaftar di
+    tabel (cadangan); untuk jenis terdaftar tabel yang menentukan."""
     __slots__ = ("kind", "reason", "metric", "fmt", "followup")
 
     def __init__(self, kind: str, reason: str, metric: Optional[str] = None, fmt: Optional[dict] = None,
@@ -175,14 +160,14 @@ class BudgetLimiter:
             if verdict.first:
                 async def follow() -> None:
                     await ctx.notify_admin(ADMIN_BUDGET_OVER.format(uid=uid, **fmt))
-            return Verdict("budget_over", "anggaran token habis", "budget", fmt, follow)
+            return Verdict("budget_over", "anggaran token habis", fmt=fmt, followup=follow)
         elif verdict.state == "team_over":
             fmt = {"used": _n(verdict.team_used), "limit": _n(verdict.team_limit)}
             follow = None
             if verdict.first:
                 async def follow() -> None:
                     await ctx.notify_admin(ADMIN_BUDGET_TEAM_OVER.format(**fmt))
-            return Verdict("budget_team_over", "anggaran token habis", "budget", fmt, follow)
+            return Verdict("budget_team_over", "anggaran token habis", fmt=fmt, followup=follow)
         return None
 
 
@@ -196,8 +181,8 @@ class RateLimitLimiter:
         wait, ok = ctx.rt.limiter.reserve(ctx.uid, settings.get("rate_per_minute", 0), settings.get("burst", 1),
                                           ctx.clock(), REFUSE_WAIT)
         if not ok:
-            return Verdict("rate", "rate limit", "rate",
-                           {"wait": int(wait + 0.999), "rate": settings.get("rate_per_minute")})
+            return Verdict("rate", "rate limit",
+                           fmt={"wait": int(wait + 0.999), "rate": settings.get("rate_per_minute")})
         if wait > 0:
             await ctx.sleep(wait)
         return None
@@ -294,10 +279,10 @@ class AdmissionLimiter:
                 metrics.observe_wait(now, now - ticket.t0)
                 return None
             if ticket.cancelled:
-                return Verdict("queue_cancelled", "antrean dibatalkan", None)
+                return Verdict("queue_cancelled", "antrean dibatalkan")
             if blocked(uid):
-                return Verdict("user_limit_full", "batas sesi per orang", "user_concurrent", {"wait": int(max_wait)})
-            return Verdict("queue_full", "antrean penuh", "queue_full", {"wait": int(max_wait)})
+                return Verdict("user_limit_full", "batas sesi per orang", fmt={"wait": int(max_wait)})
+            return Verdict("queue_full", "antrean penuh", fmt={"wait": int(max_wait)})
         except asyncio.CancelledError:
             # Gateway berhenti saat pesan ini masih menunggu: kabari pemiliknya sebisanya, lalu teruskan
             # pembatalan apa adanya.
@@ -311,5 +296,5 @@ class AdmissionLimiter:
 
 
 def default_limiters() -> list:
-    """Urutan penegakan. Menambah pembatas = satu baris di sini."""
+    """Urutan penegakan. Menambah pembatas = satu baris di sini (+ entri `REFUSALS` bila `kind`-nya baru)."""
     return [BudgetLimiter(), RateLimitLimiter(), AdmissionLimiter()]

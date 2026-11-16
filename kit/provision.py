@@ -6,11 +6,12 @@ import os
 from pathlib import Path
 from typing import Callable, Iterable, Optional
 from kit_base import TeamError
-from kit.profiles import PROFILE_KINDS, SYSTEM_KINDS
+from kit.profiles import PROFILE_KINDS, SYSTEM_KINDS, active_system_kinds  # noqa: F401
 from kit.templates import SOUL_LOBBY, SOUL_MEMBER, SOUL_TEAM_SKILLS_NOTE
 from kit.util import atomic_write
 from kit.config import _lock_depth, reload_team, team_lock
-from kit.derive import active_members, host_settings, profile_settings, roster_data
+from kit.derive import (_get_nested, active_members, host_settings, managed_required_message,
+                        managed_sandbox_problem, profile_settings, roster_data, unmanaged_allowed)
 from kit.hermes_cli import Hermes
 from kit.skills import SHARED_CATEGORY, _copy_shared_skill, shared_skill_registry
 
@@ -142,14 +143,46 @@ def restart_needed(hermes: Hermes, created: list[str], *, live_reload: bool = Fa
     return bool(hard)
 
 
+SANDBOX_GATES = ("require", "bootstrap", "off")
+
+
+def sandbox_gate(team: dict, hermes: Hermes, mode: str = "require", *, host_only: bool = False) -> str:
+    """Penjaga sandbox sebelum rute gateway ditulis. Kembalikan "" (lanjut) atau alasan untuk MELEWATI langkah
+    host (mode "bootstrap"); TeamError = ditolak.
+
+    Sandbox Docker (`terminal.backend: docker`, tanpa mount host) hanya dipin di managed config. Rute yang
+    terbit sebelum berkas itu terpasang = anggota dilayani dengan terminal di HOST. Mode:
+      "require"    (bawaan: onboarding, add-member, set-active on, apply dari pemanggil lain) → TeamError.
+      "bootstrap"  (CLI `apply`) → instalasi baru yang BELUM punya rute di host boleh memprovisi profile, tetapi
+                   langkah host (rute, channel, roster) dilewati sampai managed terpasang — urutan terdokumentasi
+                   apply → managed --install → apply tetap jalan. Host yang sudah punya rute → TeamError.
+      "off"        operasi yang hanya MENGURANGI akses (offboard, set-active off, remove-member).
+    `sandbox.allow_unmanaged: true` di team.yaml mematikan penjaga ini (diperingatkan keras)."""
+    if mode not in SANDBOX_GATES:
+        raise ValueError(mode)
+    if mode == "off" or unmanaged_allowed(team):
+        return ""
+    problem = managed_sandbox_problem()
+    if not problem:
+        return ""
+    serving = bool(_get_nested(hermes.read_config("default"), "gateway.profile_routes"))
+    if mode == "bootstrap" and not host_only and not serving:
+        return problem
+    raise TeamError(managed_required_message(team, problem))
+
+
 def cmd_apply(team: dict, hermes: Hermes, *, only: Optional[list[str]] = None, host_only: bool = False,
               force_soul: bool = False, sync_shared: Iterable[str] = (),
-              on_member_error: Optional[Callable[[dict, Exception], None]] = None) -> dict:
-    """Idempoten. Kembalikan ringkasan {created, restart_needed, live_changed, failures}.
+              on_member_error: Optional[Callable[[dict, Exception], None]] = None,
+              sandbox: str = "require") -> dict:
+    """Idempoten. Kembalikan ringkasan {created, restart_needed, live_changed, failures[, managed_pending]}.
 
     `on_member_error(member, exc)`: bila diisi, profile anggota yang gagal dibuat tidak menghentikan apply;
     pemanggil (onboarding massal) WAJIB membatalkan anggota itu di dalam callback (mengeluarkannya dari
     members.yaml — `team` ikut diperbarui), supaya rute dan roster yang ditulis sesudahnya tidak memuatnya.
+
+    `sandbox`: mode penjaga managed config (lihat `sandbox_gate`). Dengan "bootstrap" dan managed belum
+    terpasang, profile diprovisi tetapi host/roster TIDAK ditulis; hasilnya memuat `managed_pending`.
 
     Dipanggil paling luar (CLI `apply`, teamctl): team.yaml + members.yaml dibaca ULANG setelah kunci
     tim dipegang, supaya tidak bekerja dari salinan sebelum proses lain selesai menulis. Dipanggil dari
@@ -157,8 +190,10 @@ def cmd_apply(team: dict, hermes: Hermes, *, only: Optional[list[str]] = None, h
     with team_lock(team):
         if _lock_depth() == 1:
             reload_team(team)
+        pending = sandbox_gate(team, hermes, sandbox, host_only=host_only)
         return _cmd_apply(team, hermes, only=only, host_only=host_only, force_soul=force_soul,
-                          sync_shared=set(sync_shared or ()), on_member_error=on_member_error)
+                          sync_shared=set(sync_shared or ()), on_member_error=on_member_error,
+                          managed_pending=pending)
 
 
 def _check_only(team: dict, only: Optional[list[str]]) -> None:
@@ -175,7 +210,8 @@ def _check_only(team: dict, only: Optional[list[str]]) -> None:
 
 def _cmd_apply(team: dict, hermes: Hermes, *, only: Optional[list[str]], host_only: bool,
                force_soul: bool, sync_shared: Iterable[str] = (),
-               on_member_error: Optional[Callable[[dict, Exception], None]] = None) -> dict:
+               on_member_error: Optional[Callable[[dict, Exception], None]] = None,
+               managed_pending: str = "") -> dict:
     created: list[str] = []
     if not host_only:
         _check_only(team, only)
@@ -197,8 +233,14 @@ def _cmd_apply(team: dict, hermes: Hermes, *, only: Optional[list[str]], host_on
                 on_member_error(member, exc)
         if not only:
             hermes.say("\n[3/4] Profile bersama & admin")
-            for key in SYSTEM_KINDS:
+            for key in active_system_kinds(team):
                 provision_role(team, hermes, key, force_soul=force_soul)
+    if managed_pending:
+        # Rute/roster sengaja TIDAK ditulis: tanpa pin sandbox di managed config, anggota yang dirutekan bisa
+        # mendapat terminal di host. Profile sudah siap; `apply` berikutnya (setelah managed --install) menulisnya.
+        hermes.say(f"\n[4/4] Host gateway DILEWATI: {managed_pending}")
+        return {"created": created, "restart_needed": False, "live_changed": [], "failures": list(hermes.failures),
+                "managed_pending": managed_pending}
     hermes.say("\n[4/4] Host gateway (profile default)")
     provision_host(team, hermes)
     sync_parking(team, hermes)

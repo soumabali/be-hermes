@@ -39,6 +39,12 @@ flowchart TD
 | Beban RAM | Sandbox 1 GB per orang secara bawaan, bisa dinaikkan per anggota; `check` menghitung kasus terburuk dan memperingatkan bila melebihi RAM server; browser otomatis & computer use mati; `kit_doctor.py --docker` melaporkan RAM tiap sandbox | `sandbox.memory_mb`, `members.yaml` → `sandbox`, `allow_browser: false` |
 | Model berbeda, jendela konteks berbeda | Ambang kompresi bisa diatur per model | `llm.models.<alias>.compression_threshold_tokens`, `.proactive_prune_tokens` |
 
+Tiga pembatas bawaannya `0` (= tanpa batas) di `team.example.yaml`: `daily_token_budget`,
+`team_daily_token_budget`, dan `max_llm_parallel`. Wizard `setup.sh` menanyakannya di langkah `options` dengan
+titik awal yang disarankan (Enter = pakai; `0` tetap boleh): 3.000.000 token per orang per hari, 30.000.000 per
+tim per hari, dan 10 panggilan LLM paralel (= 8 sesi + 2 slot admin). Angka itu **bukan hasil pengukuran**;
+ukur endpoint-mu dengan cara di bawah lalu ubah di `team.yaml`. Instalasi manual: isi sendiri ketiganya.
+
 ## Mengukur, bukan menebak
 
 ```bash
@@ -103,7 +109,9 @@ Container yang sudah ada tetap memakai batas lama sampai dibuat ulang.
   contoh konfigurasi bawaan memang memicunya sampai kamu menambah provider kedua.
 - `tools/sandbox_idle.py` (menghentikan container sandbox yang menganggur) **hanya melaporkan** secara
   bawaan. Apakah Hermes menyalakan lagi container yang dihentikan belum dibuktikan; uji di server
-  percobaan sebelum memakai `--apply`.
+  percobaan sebelum memakai `--apply`. Wizard menawarkan memasang timernya (langkah `extras`, bawaan ya,
+  kunci jawaban `sandbox_idle_timer`) dalam mode hanya-melapor; laporannya:
+  `journalctl --user -u hermes-sandbox-idle.service`.
 
 Simulasi 20 pengguna (`tests/test_scale_sim.py`) memeriksa bahwa pembatas di atas bekerja bersama:
 satu pembanjir tidak membuat orang lain kelaparan, batas tidak pernah terlampaui, pembatas adaptif

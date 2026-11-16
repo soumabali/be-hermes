@@ -14,7 +14,9 @@ File (di $HERMES_TEAM_DIR, bawaan ~/.hermes-team/; atau folder team.yaml yang di
 Perintah:
   check          validasi + peta channel → profile → model
   apply          buat/perbarui profile, plugin team-guard, MCP admin, setelan gateway, roster
-                 (--only andi,budi untuk sebagian anggota; --host-only untuk gateway saja)
+                 (--only andi,budi untuk sebagian anggota; --host-only untuk gateway saja).
+                 Rute gateway baru ditulis setelah /etc/hermes/config.yaml mem-pin sandbox Docker
+                 (`managed --install`): apply pertama hanya menyiapkan profile; onboarding menolak
   managed        cetak /etc/hermes/config.yaml (kebijakan global yang tidak bisa diubah user);
                  --diff bandingkan dengan yang terpasang, --install pasang (sebagai root)
   host-yaml      cetak setelan gateway sebagai YAML (untuk dicek / ditempel manual)

@@ -2,6 +2,12 @@
 
 Sama dengan yang dikerjakan wizard `setup.sh` (lihat [README](../README.md#instalasi-cepat-satu-perintah)), langkah demi langkah. Pakai bila wizard tidak cocok untuk servermu atau kamu ingin memahami tiap langkah. Perkiraan waktu: 1–2 jam.
 
+**Platform yang didukung:** Debian 12+ atau Ubuntu 22.04+ dengan **systemd** (VM atau bare metal), arsitektur
+x86_64 atau arm64. Wizard berhenti di langkah pertama bila `apt-get` tidak ada, dan (tanpa `--no-systemd`) bila
+systemd tidak berjalan. Di distro lain, panduan manual ini bisa diikuti dengan menyesuaikan perintah paketnya,
+tetapi belum pernah dicoba. Docker harus Docker Engine sistem dengan grup `docker` (bukan Docker rootless atau
+Docker dari snap).
+
 
 ```mermaid
 flowchart TD
@@ -131,6 +137,17 @@ hermes --version
 `--skip-setup` penting: tanpa itu installer menjalankan `hermes setup` dan memasang layanan gateway,
 sehingga gateway bisa menyala **sebelum** konfigurasi tim diterapkan. Hermes terbaru berjalan di
 Python 3.14; installer menyiapkannya sendiri.
+
+Perintah di atas memasang rilis *stable* terbaru Hermes, yang **belum tentu** versi yang diuji dengan kit ini.
+Kit diuji CI terhadap satu commit `hermes-agent`, tertulis di berkas `HERMES_REF` di akar repo kit. Untuk
+memasang persis commit itu (yang dikerjakan wizard), tambahkan `--commit`:
+
+```bash
+curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash -s -- --non-interactive --skip-setup --commit <SHA dari HERMES_REF>
+git -C ~/.hermes/hermes-agent rev-parse HEAD      # harus sama dengan isi HERMES_REF
+```
+
+Bila versinya berbeda, `tests/selftest.sh` di Langkah 9 adalah satu-satunya bukti kecocokan di servermu.
 
 Sambungkan bot dengan menulis token langsung ke berkasnya (jangan pakai `hermes gateway setup`: wizard
 itu diakhiri tawaran menyalakan gateway):
@@ -326,7 +343,9 @@ hermes gateway status
 
 Log: `hermes logs -f` (cari `team-guard`).
 
-Pasang juga pemotret pemakaian token (timer tiap 15 menit); perintahnya ada di [[Pemakaian](PEMAKAIAN.md)](PEMAKAIAN.md#pencatatan-pemakaian-token-dan-request).
+Pasang juga pemotret pemakaian token (timer tiap 15 menit); perintahnya ada di [Pemakaian](PEMAKAIAN.md#pencatatan-pemakaian-token-dan-request). Opsional: pelapor sandbox
+menganggur (`systemd/hermes-sandbox-idle.*`, hanya melapor) dan pemantau gateway
+([Operasional → Gateway mati](OPERASI.md#gateway-mati)).
 
 Yang seharusnya terlihat: bot online di Discord, dan di log ada baris plugin `team-guard` dimuat
 tanpa galat.
@@ -398,14 +417,103 @@ Bila semua lolos, mulai beri role `backend` ke anggota tim.
 
 Setelah perbaikan apa pun: `python3 /opt/hermes-team/kit_doctor.py --discord`.
 
-## Upgrade dari v3.0
+<a id="upgrade-dari-v30"></a>
 
-1. Perbarui kit: `sudo git -C /opt/hermes-team pull` (atau salin versi baru), pemilik tetap root.
-2. Tambahkan blok `threads` dan `usage`, serta setelan `scale` baru, dari `team.example.yaml` ke `team.yaml`-mu.
+## Upgrade dan rollback kit
+
+Lihat dulu tata letak `/opt/hermes-team` di servermu, karena cara memperbaruinya berbeda:
+
+```bash
+ls -d /opt/hermes-team/.kit-installed /opt/hermes-team/.git 2>/dev/null
+```
+
+- `.kit-installed` → **salinan wizard**: `setup.sh` menyalin daftar berkas yang diizinkan, **tanpa** `.git`.
+  `git pull` di `/opt/hermes-team` tidak akan pernah bekerja; yang diperbarui adalah clone tempat kamu
+  menjalankan `setup.sh`, lalu wizard menyalin ulang.
+- `.git` → **clone git** (instalasi manual, Langkah 5).
+
+Baca `CHANGELOG.md` versi tujuan sebelum mulai, dan buat [backup](OPERASI.md#backup).
+
+### 1. Perbarui kode kit
+
+Salinan wizard — di clone-mu (bukan di `/opt/hermes-team`; bila clone lama sudah dihapus, clone ulang di mana saja):
+
+```bash
+cd ~/be-hermes
+git fetch --tags
+git checkout <tag atau branch tujuan>      # di branch: lanjutkan dengan `git pull`
+sudo bash setup.sh --only kit_install      # mengganti /opt/hermes-team dengan salinan baru (yang lama dibuang utuh)
+```
+
+`--only kit_install` hanya menyalin kit dan merapikan pemiliknya (root); langkah lain tidak disentuh. Ia memakai
+user dan `--kit-dir` yang tersimpan di state wizard; bila state hilang, sebutkan lagi `--kit-dir /opt/hermes-team`.
+
+Clone git:
+
+```bash
+sudo git -C /opt/hermes-team fetch --tags
+sudo git -C /opt/hermes-team checkout <tag atau branch tujuan>     # di branch: `sudo git -C /opt/hermes-team pull`
+sudo chown -R root:root /opt/hermes-team && sudo chmod -R a+rX,go-w /opt/hermes-team
+```
+
+### 2. Terapkan
+
+Sebagai user `hermes` (kecuali baris `sudo`):
+
+```bash
+H=/opt/hermes-team/hermes_team.py
+python3 $H check                   # kunci baru/berubah di team.yaml dilaporkan di sini
+python3 $H apply
+sudo python3 $H managed --install --config ~hermes/.hermes-team/team.yaml
+python3 $H apply                   # sekali lagi: setelan yang pindah dari managed ke tiap profile
+```
+
+Lalu `/restart` **sekali** di Discord (atau `hermes gateway restart`), dan `python3 /opt/hermes-team/kit_doctor.py --discord`.
+
+Bila CHANGELOG menyebut unit systemd berubah atau bertambah: salinan wizard → `sudo bash setup.sh --only extras`;
+clone git → salin ulang `systemd/hermes-*.{service,timer}` ke `~/.config/systemd/user/` lalu
+`systemctl --user daemon-reload`.
+
+### 3. Samakan versi Hermes bila `HERMES_REF` berubah
+
+Tiap versi kit diuji terhadap satu commit Hermes (`/opt/hermes-team/HERMES_REF`). Bandingkan:
+
+```bash
+grep -v '^#' /opt/hermes-team/HERMES_REF
+git -C ~hermes/.hermes/hermes-agent rev-parse HEAD
+```
+
+Bila berbeda: `sudo bash setup.sh --only hermes_install` (dari clone yang sudah diperbarui) menampilkan kedua commit
+dan menawarkan menjalankan ulang installer dengan `--commit` yang baru (jawab **y**; non-interaktif:
+`hermes_repin: true`), lalu `hermes gateway restart`. Tanpa wizard: jalankan perintah installer di Langkah 4
+dengan `--commit` yang baru sebagai user `hermes`. Memindahkan instalasi Hermes yang sudah ada ke commit lain
+lewat installer **belum pernah dicoba dengan kit ini** di server sungguhan; jalankan `bash
+/opt/hermes-team/tests/selftest.sh` sesudahnya.
+
+### Rollback
+
+Sama dengan upgrade, dengan tujuan versi sebelumnya:
+
+```bash
+# salinan wizard
+cd ~/be-hermes && git checkout <tag sebelumnya> && sudo bash setup.sh --only kit_install
+# clone git
+sudo git -C /opt/hermes-team checkout <tag sebelumnya>
+```
+
+lalu ulangi bagian 2 (`check` → `apply` → `managed --install` → `apply` → `/restart`). Profile, memory, dan data
+tim tidak tersentuh. Dua hal yang perlu diketahui: kunci `team.yaml` yang baru dikenal versi lebih baru
+dilaporkan `check` sebagai tidak dikenal (hapus atau biarkan sesuai pesannya), dan menurunkan **Hermes** ke commit
+lama (bagian 3) belum pernah dicoba — data Hermes (`state.db`) mungkin tidak bisa dibaca versi lama; pulihkan
+dari backup bila itu terjadi.
+
+### Dari v3.0 ke v3.1
+
+Selain langkah di atas:
+
+1. Tambahkan blok `threads` dan `usage`, serta setelan `scale` baru, dari `team.example.yaml` ke `team.yaml`-mu.
    Perhatikan: cron dan `/goal` untuk anggota mati secara bawaan ([Skala](SKALA.md)).
-3. `python3 /opt/hermes-team/hermes_team.py apply`, lalu `sudo python3 /opt/hermes-team/hermes_team.py managed
-   --install --config ~hermes/.hermes-team/team.yaml`, lalu `apply` **sekali lagi** (empat setelan pindah dari managed ke tiap profile; lihat [Skala](SKALA.md)).
-4. Pasang timer pemakaian dan, bila dipakai, timer laporan terjadwal ([Pemakaian](PEMAKAIAN.md)).
-5. `/restart` **sekali**, lalu `python3 /opt/hermes-team/kit_doctor.py --discord`.
+2. Urutan `apply` → `managed --install` → `apply` wajib: empat setelan pindah dari managed ke tiap profile ([Skala](SKALA.md)).
+3. Pasang timer pemakaian dan, bila dipakai, timer laporan terjadwal ([Pemakaian](PEMAKAIAN.md)).
 
 Baca [Perubahan v3.1](PERUBAHAN-V3.1.md) untuk perubahan perilaku. SOUL.md yang sudah ada tidak ditimpa kecuali `--force-soul`.

@@ -19,8 +19,12 @@ Yang diperiksa:
   managed      /etc/hermes/config.yaml ada dan sama dengan `hermes_team.py managed`; key yang sudah dipindah
                kit ke config per profile tidak lagi dipin; /etc/hermes/.env ada, tidak terbaca semua orang,
                dan memuat tiap `key_env` di llm.providers (hanya NAMA yang diperiksa, nilai tidak dicetak)
-  systemd      linger user aktif (gateway tetap hidup setelah logout); timer hermes-usage-collect,
-               hermes-usage-report (bila laporan terjadwal diisi), hermes-sandbox-idle
+  systemd      gateway hidup (`systemctl --user is-active hermes-gateway.service`); linger user aktif (gateway
+               tetap hidup setelah logout); timer hermes-usage-collect, hermes-usage-report (bila laporan
+               terjadwal diisi), hermes-sandbox-idle
+  plugin       capabilities.json (fitur plugin yang aktif) dan kesehatan buku besar anggaran yang dilaporkan
+               plugin (`budget_ledger_ok` di metrics.json / capabilities.json, bila ada)
+  hermes       commit Hermes terpasang vs commit yang diuji CI (berkas HERMES_REF di folder kit, bila ada)
   discord      (--discord) preflight tim: token bot, bot ada di server, role member/admin/entry, urutan role
                bot, kategori (< 50 channel), channel bersama & admin, izin bot, channel laporan; lalu
                channel tiap anggota: ada, di server yang benar, bertipe teks, @everyone tidak bisa melihat
@@ -50,7 +54,7 @@ if _HERE not in sys.path:
 import yaml
 
 import kit_paths
-from kit.profiles import PROFILE_KINDS, SYSTEM_KINDS
+from kit.profiles import PROFILE_KINDS, SYSTEM_KINDS, active_system_kinds
 
 ERROR, WARN, INFO = "error", "warn", "info"
 SYSTEM_PROFILES_KEYS = SYSTEM_KINDS      # jenis profile ber-channel sendiri (kit/profiles.py)
@@ -105,7 +109,7 @@ def _read_yaml(path: Path) -> dict:
 def check_local(team: dict, root: Path, rep: Report, ht: Any) -> None:
     active = ht.active_members(team)
     inactive = [m for m in team["members"] if not m.get("active", True)]
-    known = {m["profile"] for m in team["members"]} | {team[k]["profile"] for k in SYSTEM_KINDS} | {team["template"]}
+    known = {m["profile"] for m in team["members"]} | {team[k]["profile"] for k in active_system_kinds(team)} | {team["template"]}
     # profile
     for m in active:
         if not _home(root, m["profile"]).is_dir():
@@ -165,6 +169,7 @@ def check_local(team: dict, root: Path, rep: Report, ht: Any) -> None:
                 rep.add(ERROR, "model", f"{m['name']} memakai model '{alias}' yang tidak ada di katalog")
     check_usage(team, rep)
     check_capabilities(team, rep)
+    check_budget_ledger(team, rep)
 
 
 def check_usage(team: dict, rep: Report, now: Optional[float] = None) -> None:
@@ -229,6 +234,59 @@ def check_capabilities(team: dict, rep: Report, now: Optional[float] = None) -> 
         rep.add(INFO, "plugin", f"capabilities.json berumur {int(age // 86400)} hari; ditulis ulang tiap gateway start")
 
 
+METRICS_STALE_SECONDS = 15 * 60       # metrics.json ditulis plugin tiap ±30 detik selama gateway hidup
+
+
+def _budget_ledger_flag(doc: Any) -> Optional[bool]:
+    """Nilai `budget_ledger_ok` (atau `ledger_ok` di bagian `budget`) bila plugin menulisnya; None bila tidak ada.
+    Dibaca defensif: kunci ini opsional dan baru ada di plugin yang lebih baru."""
+    if not isinstance(doc, dict):
+        return None
+    for node in (doc, doc.get("budget")):
+        if isinstance(node, dict):
+            for key in ("budget_ledger_ok", "ledger_ok"):
+                if isinstance(node.get(key), bool):
+                    return node[key]
+    return None
+
+
+def check_budget_ledger(team: dict, rep: Report, now: Optional[float] = None) -> None:
+    """Kesehatan buku besar ANGGARAN menurut plugin (`budget_ledger_ok` di metrics.json, cadangan:
+    capabilities.json). False = plugin tidak bisa membaca usage.db → anggaran token harian tidak ditegakkan.
+    Kunci tidak ada (plugin lama / gateway belum pernah jalan) → tidak ada temuan."""
+    import time
+    state = Path(team["paths"]["state_dir"])
+    flag: Optional[bool] = None
+    source, age = "", None
+    for name in ("metrics.json", "capabilities.json"):
+        try:
+            doc = json.loads((state / name).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        flag = _budget_ledger_flag(doc)
+        if flag is not None:
+            source = name
+            if name == "metrics.json" and isinstance(doc.get("ts"), (int, float)) and not isinstance(doc.get("ts"), bool):
+                age = (time.time() if now is None else now) - float(doc["ts"])
+            break
+    if flag is None:
+        return
+    scale = team.get("scale") or {}
+    budgeted = bool(int(scale.get("daily_token_budget") or 0) or int(scale.get("team_daily_token_budget") or 0))
+    old = age is not None and age > METRICS_STALE_SECONDS
+    note = f" ({source} berumur {int(age // 60)} menit — gateway mungkin tidak berjalan)" if old else f" ({source})"
+    if flag:
+        if budgeted:
+            rep.add(INFO, "plugin", "buku besar anggaran terbaca plugin: anggaran token harian ditegakkan" + note)
+        return
+    level = ERROR if budgeted and not old else WARN
+    what = ("anggaran token harian TIDAK ditegakkan" if budgeted
+            else "anggaran token belum dikonfigurasi, tetapi tidak akan ditegakkan bila diisi")
+    rep.add(level, "plugin", f"plugin melaporkan buku besar anggaran tidak terbaca: {what}{note}",
+            f"periksa {state / 'usage.db'} (ada, mode 0600, milik user Hermes) dan timer kolektor — "
+            + timer_install_command("hermes-usage-collect") + "; lalu restart gateway")
+
+
 KIT_DIR = Path(__file__).resolve().parent
 
 
@@ -243,6 +301,11 @@ def check_config(team: dict, rep: Report, ht: Any) -> None:
     """Peringatan pemuatan (key tak dikenal) dan ID contoh yang belum diganti."""
     for line in team.get("warnings") or []:
         rep.add(WARN, "konfigurasi", line, "perbaiki ejaan key itu (atau hapus), lalu: hermes_team.py check")
+    for line in ht.budget_warnings(team):
+        rep.add(WARN, "konfigurasi", line, "isi scale.daily_token_budget / team_daily_token_budget / "
+                "max_llm_parallel di team.yaml, lalu: hermes_team.py apply")
+    for line in ht.unmanaged_warnings(team):
+        rep.add(WARN, "konfigurasi", line, "hapus sandbox.allow_unmanaged dari team.yaml setelah managed terpasang")
     if not ht.placeholders_allowed():
         found = ht.placeholder_ids(team)
         if found:
@@ -263,6 +326,10 @@ def check_managed(team: dict, rep: Report, ht: Any, managed_dir: Optional[Path] 
         rep.add(ERROR, "managed", f"{diff['path']} tidak terbaca ({diff['unreadable']})",
                 f"perbaiki izin/isi berkas (seharusnya 0644 root), atau pasang ulang — {install}")
     else:
+        unpinned = ht.managed_sandbox_problem(folder / "config.yaml")
+        if unpinned:
+            rep.add(ERROR, "managed", f"{unpinned}: sandbox Docker TIDAK dipaksakan — terminal anggota bisa "
+                    "berjalan di host; `apply` dan onboarding menolak sampai ini diperbaiki", install)
         if diff["moved"]:
             rep.add(ERROR, "managed", f"{diff['path']} masih mem-pin {', '.join(diff['moved'])} (berkas dari kit "
                     "versi lama). Key itu sekarang ditulis per profile; selama masih dipin, batas sandbox per "
@@ -370,14 +437,123 @@ def check_timers(team: dict, rep: Report, run: "Runner") -> None:
         rep.add(level, "systemd", f"timer {unit}.timer belum aktif ({state}): {why}", timer_install_command(unit))
 
 
+GATEWAY_UNIT = "hermes-gateway.service"      # nama unit bawaan `hermes gateway install`
+_NO_USER_BUS = ("failed to connect to bus", "no medium found")
+
+
+def check_gateway(rep: Report, run: "Runner", unit: str = GATEWAY_UNIT) -> None:
+    """Gateway hidup? `systemctl --user is-active hermes-gateway.service`; bila unit bawaan tidak aktif, unit
+    berakhiran profil/hash (`hermes-gateway-<x>.service`) yang aktif juga diterima. systemctl tidak ada / tanpa
+    sesi user → satu catatan, bukan kegagalan."""
+    try:
+        code, out = run(["systemctl", "--user", "is-active", unit])
+    except (OSError, subprocess.SubprocessError):
+        rep.add(INFO, "systemd", "systemctl tidak tersedia; gateway tidak diperiksa")
+        return
+    text = (out or "").strip()
+    state = text.splitlines()[0].strip() if text else f"exit {code}"
+    if code == 0 and state == "active":
+        return
+    if any(marker in text.lower() for marker in _NO_USER_BUS):
+        rep.add(INFO, "systemd", "systemd --user tidak terjangkau dari sesi ini (jalankan sebagai user Hermes "
+                "lewat login/ssh, bukan `su`); gateway tidak diperiksa")
+        return
+    logs = f"journalctl --user -u {unit} -n 50 --no-pager"
+    if state == "failed":
+        rep.add(ERROR, "systemd", f"gateway {unit} GAGAL (failed): bot tidak menjawab siapa pun",
+                f"lihat sebabnya: {logs}; lalu: systemctl --user restart {unit}")
+        return
+    if state in ("activating", "reloading"):
+        rep.add(INFO, "systemd", f"gateway {unit} sedang {state}; periksa lagi sebentar")
+        return
+    try:      # unit berakhiran (profil/hash) yang dipasang `hermes gateway install` versi tertentu
+        lcode, listing = run(["systemctl", "--user", "list-units", "--type=service", "--state=active",
+                              "--no-legend", "--plain", "hermes-gateway*.service"])
+    except (OSError, subprocess.SubprocessError):
+        lcode, listing = 1, ""
+    others = [line.split()[0] for line in (listing or "").splitlines()
+              if lcode == 0 and re.match(r"hermes-gateway(-[A-Za-z0-9_-]+)?\.service\b", line.strip())
+              and not line.strip().startswith("hermes-gateway-watch")]
+    if others:
+        return
+    rep.add(WARN, "systemd", f"gateway {unit} tidak berjalan ({state}): bot tidak menjawab siapa pun",
+            f"systemctl --user start {unit} (belum terpasang: `hermes gateway install`, lalu "
+            f"systemctl --user enable --now {unit}); log: {logs}")
+
+
+# ----------------------------------------------------------------------------- versi Hermes vs yang diuji CI
+HERMES_REF_FILE = "HERMES_REF"
+_SHA_RE = re.compile(r"[0-9a-f]{7,40}\Z")
+
+
+def read_tested_ref(path: Optional[Path] = None) -> str:
+    """Commit hermes-agent yang diuji CI untuk kit ini: baris pertama yang bukan komentar di berkas HERMES_REF
+    (folder kit). "" bila berkas tidak ada / tidak terbaca / kosong."""
+    try:
+        lines = Path(path or KIT_DIR / HERMES_REF_FILE).read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeDecodeError):
+        return ""
+    for line in lines:
+        line = line.strip()
+        if line and not line.startswith("#"):
+            return line.split()[0]
+    return ""
+
+
+def installed_hermes_commit(root: Path, run: "Runner") -> str:
+    """Commit Hermes terpasang ("" = tidak bisa ditentukan): `git rev-parse HEAD` di checkout installer
+    (<hermes_root>/hermes-agent), lalu `pinnedCommit` di .hermes-bootstrap-complete yang ditulis installer."""
+    source = Path(root) / "hermes-agent"
+    try:
+        code, out = run(["git", "-C", str(source), "rev-parse", "HEAD"])
+    except (OSError, subprocess.SubprocessError):
+        code, out = 1, ""
+    head = ((out or "").strip().splitlines() or [""])[0].strip().lower()
+    if code == 0 and re.fullmatch(r"[0-9a-f]{40}", head):
+        return head
+    try:
+        receipt = json.loads((source / ".hermes-bootstrap-complete").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return ""
+    commit = str(receipt.get("pinnedCommit") or "").strip().lower() if isinstance(receipt, dict) else ""
+    return commit if re.fullmatch(r"[0-9a-f]{40}", commit) else ""
+
+
+def check_hermes_ref(root: Path, rep: Report, run: "Runner", ref_file: Optional[Path] = None) -> None:
+    """Hermes terpasang vs commit yang diuji CI (HERMES_REF). Berkas tidak ada → dilewati. Berbeda atau tidak
+    bisa ditentukan → peringatan (bukan error: Hermes lain bisa saja jalan, tetapi belum diuji dengan kit ini)."""
+    tested = read_tested_ref(ref_file).lower()
+    if not tested:
+        return
+    selftest = f"bash {KIT_DIR}/tests/selftest.sh"
+    installed = installed_hermes_commit(root, run)
+    if not _SHA_RE.match(tested):
+        rep.add(WARN, "hermes", f"HERMES_REF berisi '{tested[:40]}' (bukan SHA commit): Hermes terpasang "
+                f"({installed[:12] or 'tidak diketahui'}) tidak bisa dibandingkan", f"uji sendiri: {selftest}")
+    elif not installed:
+        rep.add(WARN, "hermes", "commit Hermes yang terpasang tidak bisa ditentukan (tidak ada checkout git di "
+                f"{Path(root) / 'hermes-agent'}); kit ini diuji terhadap {tested[:12]}",
+                f"pastikan sendiri versinya (`hermes --version`) dan jalankan: {selftest}")
+    elif not installed.startswith(tested):
+        rep.add(WARN, "hermes", f"Hermes terpasang ({installed[:12]}) berbeda dari commit yang diuji CI untuk kit "
+                f"ini ({tested[:12]}): plugin team-guard memakai API internal Hermes yang bisa berubah",
+                f"jalankan: {selftest}; untuk menyamakan, pasang commit di {KIT_DIR / HERMES_REF_FILE} "
+                "(lihat docs/OPERASI.md)")
+
+
 def check_system(team: dict, rep: Report, ht: Any, run: Optional["Runner"] = None,
-                 managed_dir: Optional[Path] = None, user: Optional[str] = None) -> None:
-    """Pemeriksaan di luar folder Hermes: konfigurasi, managed scope, linger, timer."""
+                 managed_dir: Optional[Path] = None, user: Optional[str] = None,
+                 root: Optional[Path] = None) -> None:
+    """Pemeriksaan di luar folder Hermes: konfigurasi, managed scope, gateway, linger, timer, dan (bila `root`
+    diisi) commit Hermes terpasang."""
     run = run or run_command
     check_config(team, rep, ht)
     check_managed(team, rep, ht, managed_dir)
+    check_gateway(rep, run)
     check_linger(rep, run, user)
     check_timers(team, rep, run)
+    if root is not None:
+        check_hermes_ref(root, rep, run)
 
 
 # ----------------------------------------------------------------------------- sandbox Docker & state.db
@@ -466,7 +642,7 @@ def check_docker(team: dict, root: Path, rep: Report, run: Runner = run_command,
                  meminfo: Path = Path("/proc/meminfo")) -> None:
     """Sandbox per profile (status, RAM) dan ukuran state.db. Hanya membaca; docker hilang → satu peringatan
     dan pemeriksaan state.db tetap jalan."""
-    profiles = [m["profile"] for m in team["members"]] + [team[k]["profile"] for k in SYSTEM_KINDS] + ["default"]
+    profiles = [m["profile"] for m in team["members"]] + [team[k]["profile"] for k in active_system_kinds(team)] + ["default"]
     by_profile: dict[str, list] = {}
     docker_ok = True
     try:
@@ -656,9 +832,9 @@ def _check_category(team: dict, rep: Report, state: GuildState) -> None:
 
 def _team_channel_targets(team: dict) -> list:
     """[(key di team.yaml, id channel, harus privat?)] untuk channel bersama, admin, dan laporan."""
-    targets = [(f"{k}.channel_id", team[k]["channel_id"], True) for k in SYSTEM_KINDS]
+    targets = [(f"{k}.channel_id", team[k]["channel_id"], True) for k in active_system_kinds(team)]
     report_channel = (team.get("usage") or {}).get("report_channel_id")
-    if report_channel and report_channel not in (team[k]["channel_id"] for k in SYSTEM_KINDS):
+    if report_channel and report_channel not in (team[k]["channel_id"] for k in active_system_kinds(team)):
         targets.append(("usage.report_channel_id", report_channel, False))
     return targets
 
@@ -771,7 +947,7 @@ def main(argv: Optional[list[str]] = None, *, run: Optional[Runner] = None, api:
     root = Path(args.hermes_root).expanduser()
     rep = Report()
     check_local(team, root, rep, ht)
-    check_system(team, rep, ht, run=run)
+    check_system(team, rep, ht, run=run, root=root)
     if args.discord:
         try:
             client = api or ht.DiscordAPI(ht.discord_token(root))

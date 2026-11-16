@@ -323,7 +323,8 @@ def test_config_warnings_and_placeholders_reach_doctor(env, monkeypatch):
     rep = kd.Report()
     kd.check_config(team, rep, ht)
     warn = [i for i in rep.items if i["level"] == kd.WARN]
-    assert len(warn) == 1 and "max_concurrent_sessions" in warn[0]["message"] and warn[0]["area"] == "konfigurasi"
+    assert len(warn) == 2 and "max_concurrent_sessions" in warn[0]["message"] and warn[0]["area"] == "konfigurasi"
+    assert "tidak ada batas biaya" in warn[1]["message"] and "daily_token_budget" in warn[1]["fix"]
     errors = [i for i in rep.items if i["level"] == kd.ERROR]
     assert len(errors) == 1 and "ID contoh" in errors[0]["message"] and "guild_id" in errors[0]["message"]
     monkeypatch.setenv("HERMES_TEAM_ALLOW_PLACEHOLDERS", "1")
@@ -516,7 +517,8 @@ def test_main_runs_system_checks_with_injected_runner(env, monkeypatch, capsys):
     assert kd.main(argv, run=run) == 1                                   # managed belum terpasang → error
     out = json.loads(capsys.readouterr().out)
     assert [i["area"] for i in out["items"] if i["level"] == "error"] == ["managed"]
-    assert {c[0] for c in calls} == {"loginctl", "systemctl"}
+    assert {c[0] for c in calls} == {"loginctl", "systemctl", "git"}
+    assert ["systemctl", "--user", "is-active", "hermes-gateway.service"] in calls
     ht.install_managed(team, target_dir=folder, euid=0, allow_user_owned_kit=True)
     assert kd.main(argv, run=run) == 0
 
@@ -781,3 +783,226 @@ def test_capabilities_stale_file_is_noted_using_the_real_timestamp_format(env):
     rep = kd.Report()
     kd.check_capabilities(team, rep, now=calendar.timegm(_t.strptime("2026-03-01", "%Y-%m-%d")))
     assert any("berumur 59 hari" in i["message"] for i in rep.items)
+
+
+# ----------------------------------------------------------------------------- konfigurasi: tanpa batas biaya / escape hatch
+def test_budget_warning_disappears_once_a_limit_is_set(env):
+    team, _root, tmp = env
+    (tmp / "team" / "team.yaml").write_text(yaml.safe_dump(dict(TEAM, scale={"team_daily_token_budget": 1000})))
+    limited = ht.load_team(tmp / "team" / "team.yaml")
+    rep = kd.Report()
+    kd.check_config(limited, rep, ht)
+    assert not [i for i in rep.items if "batas biaya" in i["message"]]
+
+
+def test_allow_unmanaged_is_reported_and_unpinned_sandbox_is_an_error(env, monkeypatch):
+    team, _root, tmp = env
+    folder = tmp / "etc-hermes"
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(folder))
+    (tmp / "team" / "team.yaml").write_text(yaml.safe_dump(dict(TEAM, sandbox={"allow_unmanaged": True})))
+    loose = ht.load_team(tmp / "team" / "team.yaml")
+    rep = kd.Report()
+    kd.check_config(loose, rep, ht)
+    item = next(i for i in rep.items if "allow_unmanaged" in i["message"])
+    assert item["level"] == kd.WARN and "HOST" in item["message"]
+    # berkas managed ada tetapi backend bukan docker → error tersendiri (bukan sekadar "berbeda")
+    ht.install_managed(team, target_dir=folder, euid=0, allow_user_owned_kit=True)
+    data = yaml.safe_load((folder / "config.yaml").read_text())
+    data["terminal"]["backend"] = "local"
+    (folder / "config.yaml").write_text(yaml.safe_dump(data))
+    rep = managed_report(team, folder)
+    errors = [i for i in rep.items if i["level"] == kd.ERROR]
+    assert len(errors) == 1 and "terminal.backend: docker" in errors[0]["message"]
+    assert "managed --install" in errors[0]["fix"] and "sudo" in errors[0]["fix"]
+
+
+# ----------------------------------------------------------------------------- gateway hidup?
+GATEWAY_CMD = ["systemctl", "--user", "is-active", "hermes-gateway.service"]
+
+
+def gateway_report(table, calls=None):
+    rep = kd.Report()
+    kd.check_gateway(rep, runner(table, calls))
+    return rep
+
+
+def test_gateway_active_is_silent_and_uses_the_injected_runner():
+    calls = []
+    assert gateway_report({"hermes-gateway.service": (0, "active\n")}, calls).items == []
+    assert calls == [GATEWAY_CMD]
+
+
+def test_gateway_failed_is_an_error_with_restart_and_log_commands():
+    rep = gateway_report({"hermes-gateway.service": (3, "failed\n")})
+    item = rep.items[0]
+    assert item["level"] == kd.ERROR and item["area"] == "systemd" and "failed" in item["message"]
+    assert "systemctl --user restart hermes-gateway.service" in item["fix"]
+    assert "journalctl --user -u hermes-gateway.service" in item["fix"]
+
+
+def test_gateway_inactive_or_missing_is_a_warning_with_the_start_command():
+    for answer in ((3, "inactive\n"), (4, "unknown\n"), None):
+        calls = []
+        rep = gateway_report({"hermes-gateway.service": answer}, calls)
+        assert [i["level"] for i in rep.items] == [kd.WARN] and rep.errors == 0
+        assert "systemctl --user start hermes-gateway.service" in rep.items[0]["fix"]
+        assert "hermes gateway install" in rep.items[0]["fix"]
+        assert calls[1][:3] == ["systemctl", "--user", "list-units"]              # unit berakhiran dicari dulu
+
+
+def test_gateway_suffixed_unit_counts_and_the_watcher_does_not():
+    listing = "hermes-gateway-default.service loaded active running Hermes Gateway\n"
+    assert gateway_report({"hermes-gateway.service": (3, "inactive"),
+                           "hermes-gateway*.service": (0, listing)}).items == []
+    watcher = "hermes-gateway-watch.service loaded active running Pemantau\n"
+    rep = gateway_report({"hermes-gateway.service": (3, "inactive"), "hermes-gateway*.service": (0, watcher)})
+    assert [i["level"] for i in rep.items] == [kd.WARN]
+
+
+def test_gateway_check_tolerates_missing_systemctl_bus_and_transitions():
+    rep = gateway_report({"hermes-gateway.service": FileNotFoundError(2, "systemctl")})
+    assert [i["level"] for i in rep.items] == [kd.INFO]
+    rep = gateway_report({"hermes-gateway.service": (1, "Failed to connect to bus: No medium found")})
+    assert [i["level"] for i in rep.items] == [kd.INFO]
+    rep = gateway_report({"hermes-gateway.service": (3, "activating\n")})
+    assert [i["level"] for i in rep.items] == [kd.INFO] and rep.errors == 0
+
+
+# ----------------------------------------------------------------------------- kesehatan buku besar anggaran (plugin)
+def write_state(team, name, payload):
+    state = Path(team["paths"]["state_dir"])
+    state.mkdir(parents=True, exist_ok=True)
+    (state / name).write_text(payload if isinstance(payload, str) else json.dumps(payload))
+
+
+def ledger_report(team, now=1_800_000_060):
+    rep = kd.Report()
+    kd.check_budget_ledger(team, rep, now=now)
+    return rep
+
+
+def budgeted_team(tmp):
+    (tmp / "team" / "team.yaml").write_text(yaml.safe_dump(dict(TEAM, scale={"daily_token_budget": 1000})))
+    return ht.load_team(tmp / "team" / "team.yaml")
+
+
+def test_budget_ledger_field_absent_or_files_missing_is_silent(env):
+    team, _root, tmp = env
+    assert ledger_report(team).items == []                                         # belum ada berkas apa pun
+    write_state(team, "metrics.json", {"schema": 1, "ts": 1_800_000_000, "budget": {"stale": False}})
+    write_state(team, "capabilities.json", {"capabilities": {}})
+    assert ledger_report(team).items == []                                         # plugin lama: kunci tidak ada
+    write_state(team, "metrics.json", "{bukan json")
+    assert ledger_report(team).items == []
+    write_state(team, "metrics.json", {"budget_ledger_ok": "ya"})                   # bukan boolean → diabaikan
+    assert ledger_report(team).items == []
+    write_state(team, "metrics.json", [1, 2])
+    assert ledger_report(team).items == []
+
+
+def test_budget_ledger_broken_is_an_error_when_a_budget_is_configured(env):
+    team, _root, tmp = env
+    team = budgeted_team(tmp)
+    write_state(team, "metrics.json", {"schema": 1, "ts": 1_800_000_000, "budget_ledger_ok": False})
+    item = ledger_report(team).items[0]
+    assert item["level"] == kd.ERROR and item["area"] == "plugin" and "TIDAK ditegakkan" in item["message"]
+    assert "usage.db" in item["fix"] and "hermes-usage-collect" in item["fix"]
+    # nilai di dalam bagian `budget` juga dibaca
+    write_state(team, "metrics.json", {"ts": 1_800_000_000, "budget": {"budget_ledger_ok": False}})
+    assert ledger_report(team).items[0]["level"] == kd.ERROR
+    # metrics.json basi (gateway mati) → peringatan, bukan error
+    stale = ledger_report(team, now=1_800_000_000 + 3600).items[0]
+    assert stale["level"] == kd.WARN and "60 menit" in stale["message"]
+
+
+def test_budget_ledger_ok_and_fallback_to_capabilities(env):
+    team, _root, tmp = env
+    unbudgeted = team
+    write_state(unbudgeted, "metrics.json", {"ts": 1_800_000_000, "budget_ledger_ok": False})
+    assert ledger_report(unbudgeted).items[0]["level"] == kd.WARN                  # tanpa anggaran: peringatan saja
+    write_state(unbudgeted, "metrics.json", {"ts": 1_800_000_000, "budget_ledger_ok": True})
+    assert ledger_report(unbudgeted).items == []
+    team = budgeted_team(tmp)
+    item = ledger_report(team).items[0]
+    assert item["level"] == kd.INFO and "ditegakkan" in item["message"]
+    (Path(team["paths"]["state_dir"]) / "metrics.json").unlink()
+    write_state(team, "capabilities.json", {"budget_ledger_ok": False, "capabilities": {}})
+    item = ledger_report(team).items[0]
+    assert item["level"] == kd.ERROR and "capabilities.json" in item["message"]
+
+
+def test_check_local_includes_the_budget_ledger_finding(env):
+    team, root, tmp = env
+    sync(team, root)
+    team = budgeted_team(tmp)
+    import time
+    write_state(team, "metrics.json", {"ts": int(time.time()), "budget_ledger_ok": False})
+    assert (kd.ERROR, "plugin") in areas(run(team, root))
+
+
+# ----------------------------------------------------------------------------- Hermes terpasang vs HERMES_REF
+TESTED = "5d87ea2242c7e5a4ce76098b6113f04bf11348c6"
+OTHER = "0123456789abcdef0123456789abcdef01234567"
+
+
+def ref_report(tmp, root, git_answer, ref_text=f"# komentar\n\n{TESTED}  # catatan\n"):
+    ref_file = tmp / "HERMES_REF"
+    if ref_text is None:
+        ref_file.unlink(missing_ok=True)
+    else:
+        ref_file.write_text(ref_text)
+    calls = []
+    rep = kd.Report()
+    kd.check_hermes_ref(root, rep, runner({"HEAD": git_answer}, calls), ref_file=ref_file)
+    return rep, calls
+
+
+def test_hermes_ref_file_missing_or_empty_skips_the_check(env):
+    _team, root, tmp = env
+    rep, calls = ref_report(tmp, root, (0, OTHER), ref_text=None)
+    assert rep.items == [] and calls == []
+    rep, calls = ref_report(tmp, root, (0, OTHER), ref_text="# hanya komentar\n\n")
+    assert rep.items == [] and calls == []
+
+
+def test_hermes_ref_match_is_silent_and_mismatch_warns(env):
+    _team, root, tmp = env
+    rep, calls = ref_report(tmp, root, (0, TESTED + "\n"))
+    assert rep.items == [] and calls == [["git", "-C", str(root / "hermes-agent"), "rev-parse", "HEAD"]]
+    rep, _ = ref_report(tmp, root, (0, TESTED.upper() + "\n"))                     # huruf besar tetap sama
+    assert rep.items == []
+    rep, _ = ref_report(tmp, root, (0, TESTED), ref_text=TESTED[:12] + "\n")        # ref pendek = awalan
+    assert rep.items == []
+    rep, _ = ref_report(tmp, root, (0, OTHER + "\n"))
+    item = rep.items[0]
+    assert item["level"] == kd.WARN and item["area"] == "hermes" and rep.errors == 0
+    assert OTHER[:12] in item["message"] and TESTED[:12] in item["message"] and "selftest.sh" in item["fix"]
+
+
+def test_hermes_ref_undeterminable_warns_and_receipt_is_a_fallback(env):
+    _team, root, tmp = env
+    for answer in ((128, "fatal: not a git repository"), FileNotFoundError(2, "git"), (0, "bukan sha")):
+        rep, _ = ref_report(tmp, root, answer)
+        assert [i["level"] for i in rep.items] == [kd.WARN] and "tidak bisa ditentukan" in rep.items[0]["message"]
+    (root / "hermes-agent").mkdir()
+    (root / "hermes-agent" / ".hermes-bootstrap-complete").write_text(json.dumps({"pinnedCommit": TESTED}))
+    rep, _ = ref_report(tmp, root, (128, "fatal"))
+    assert rep.items == []
+    (root / "hermes-agent" / ".hermes-bootstrap-complete").write_text(json.dumps({"pinnedCommit": OTHER}))
+    rep, _ = ref_report(tmp, root, (128, "fatal"))
+    assert "berbeda" in rep.items[0]["message"]
+    (root / "hermes-agent" / ".hermes-bootstrap-complete").write_text("[]")
+    rep, _ = ref_report(tmp, root, (128, "fatal"))
+    assert "tidak bisa ditentukan" in rep.items[0]["message"]
+
+
+def test_hermes_ref_that_is_not_a_sha_cannot_be_compared(env):
+    _team, root, tmp = env
+    rep, _ = ref_report(tmp, root, (0, OTHER), ref_text="main\n")
+    assert [i["level"] for i in rep.items] == [kd.WARN] and "bukan SHA" in rep.items[0]["message"]
+
+
+def test_kit_root_hermes_ref_is_read_when_present():
+    ref = kd.read_tested_ref()
+    assert ref == "" or kd._SHA_RE.match(ref.lower())                               # berkas milik agen lain: defensif
+    assert kd.read_tested_ref(Path("/tidak/ada/HERMES_REF")) == ""

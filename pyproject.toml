@@ -19,3 +19,14 @@ version = { file = ["VERSION"] }
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 filterwarnings = ["ignore::DeprecationWarning:discord.*"]
+
+# Lint konservatif (CI job `lint`): galat sintaks + pyflakes dasar. Bukan pemformat dan bukan aturan gaya.
+[tool.ruff]
+extend-exclude = ["arsip-versi-lama"]
+
+[tool.ruff.lint]
+select = ["E9", "F63", "F7", "F82", "F401", "F811", "F841"]
+
+[tool.ruff.lint.per-file-ignores]
+# `_DIR` dipakai `_read()` saat impor lalu di-`del` di akhir modul: ruff mengiranya nama tak dikenal (positif palsu).
+"kit/templates/__init__.py" = ["F821"]

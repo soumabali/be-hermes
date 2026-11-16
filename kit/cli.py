@@ -13,10 +13,13 @@ import kit_config
 import kit_paths
 from kit_base import KIT_VERSION, TeamError, rewrite_env_text
 from kit.constants import PLUGIN_NAME
-from kit.profiles import MODEL_TARGETS, PROFILE_KINDS, SYSTEM_KINDS
+from kit.profiles import MODEL_TARGETS, PROFILE_KINDS, SYSTEM_KINDS, active_system_kinds  # noqa: F401
 from kit.util import atomic_write
 from kit.config import load_team, placeholder_ids, placeholder_message, placeholders_allowed, reload_team, team_lock
-from kit.derive import _get_nested, active_members, fallback_warnings, host_memory_mb, host_settings, install_managed, managed_diff, managed_diff_clean, managed_diff_lines, managed_install_command, managed_yaml, model_alias, nested_yaml, sandbox_limits, sandbox_warnings, sandbox_worst_case_mb
+from kit.derive import (_get_nested, active_members, budget_warnings, fallback_warnings, host_memory_mb,
+                        host_settings, install_managed, managed_diff, managed_diff_clean, managed_diff_lines,
+                        managed_install_command, managed_yaml, model_alias, nested_yaml, sandbox_limits,
+                        sandbox_warnings, sandbox_worst_case_mb, unmanaged_warnings)
 from kit.hermes_cli import Hermes, resolve_hermes_bin
 from kit.skills import list_skills, share_skill, unshare_skill
 from kit.provision import cmd_apply
@@ -37,7 +40,9 @@ File (di $HERMES_TEAM_DIR, bawaan ~/.hermes-team/; atau folder team.yaml yang di
 Perintah:
   check          validasi + peta channel → profile → model
   apply          buat/perbarui profile, plugin team-guard, MCP admin, setelan gateway, roster
-                 (--only andi,budi untuk sebagian anggota; --host-only untuk gateway saja)
+                 (--only andi,budi untuk sebagian anggota; --host-only untuk gateway saja).
+                 Rute gateway baru ditulis setelah /etc/hermes/config.yaml mem-pin sandbox Docker
+                 (`managed --install`): apply pertama hanya menyiapkan profile; onboarding menolak
   managed        cetak /etc/hermes/config.yaml (kebijakan global yang tidak bisa diubah user);
                  --diff bandingkan dengan yang terpasang, --install pasang (sebagai root)
   host-yaml      cetak setelan gateway sebagai YAML (untuk dicek / ditempel manual)
@@ -79,7 +84,7 @@ def describe(team: dict, hermes: Optional[Hermes] = None) -> str:
         model = model_alias(team, "member", m) if llm else "-"
         state = "" if m["active"] else "  [NONAKTIF]"
         lines.append(f"{m['channel_id']:<21} {m['profile']:<18} {model:<14} pribadi {m['display_name']}{state}")
-    for key in SYSTEM_KINDS:
+    for key in active_system_kinds(team):
         note = PROFILE_KINDS[key].note
         model = model_alias(team, key) if llm else "-"
         lines.append(f"{team[key]['channel_id']:<21} {team[key]['profile']:<18} {model:<14} {note}")
@@ -100,7 +105,7 @@ def describe(team: dict, hermes: Optional[Hermes] = None) -> str:
     default_cpu, default_memory = sandbox_limits(team)
     total, host = sandbox_worst_case_mb(team), host_memory_mb()
     lines.append(f"Sandbox: {default_memory} MB, {default_cpu} CPU per profile; plafon RAM terburuk {total} MB "
-                 f"({len(active_members(team))} anggota aktif + {' + '.join(SYSTEM_KINDS)})"
+                 f"({len(active_members(team))} anggota aktif + {' + '.join(active_system_kinds(team))})"
                  + (f" dari RAM server {host} MB" + (" — MELEBIHI" if total > host else "") if host else ""))
     for m in team["members"]:
         if m.get("sandbox"):
@@ -120,7 +125,7 @@ def describe(team: dict, hermes: Optional[Hermes] = None) -> str:
     if hermes is not None:
         lines.append("")
         for profile in [team["template"], *(m["profile"] for m in team["members"]),
-                        *(team[kind]["profile"] for kind in SYSTEM_KINDS), "default"]:
+                        *(team[kind]["profile"] for kind in active_system_kinds(team)), "default"]:
             cfg = hermes.read_config(profile)
             ok = hermes.exists(profile)
             plugin = PLUGIN_NAME in (_get_nested(cfg, "plugins.enabled") or [])
@@ -301,7 +306,10 @@ def _run_readonly(args: argparse.Namespace, team: dict, hermes: Hermes, placehol
 
 def _do_apply(team: dict, hermes: Hermes, args: argparse.Namespace) -> None:
     only = [n.strip() for n in args.only.split(",") if n.strip()] or None
-    result = cmd_apply(team, hermes, only=only, host_only=args.host_only, force_soul=args.force_soul)
+    # "bootstrap": apply PERTAMA (managed belum terpasang, host belum punya rute) boleh memprovisi profile;
+    # rute/roster baru ditulis setelah `managed --install` (lihat kit.provision.sandbox_gate).
+    result = cmd_apply(team, hermes, only=only, host_only=args.host_only, force_soul=args.force_soul,
+                       sandbox="bootstrap")
     _print_apply_tail(team, hermes, result)
 
 
@@ -546,6 +554,8 @@ def _llm_key_target(team: dict, who: str) -> tuple[str, str]:
     """(profile, nama env key) untuk `llm-key <who>`."""
     if not team["llm"]:
         raise TeamError("team.yaml belum punya bagian llm")
+    if who in SYSTEM_KINDS and who not in active_system_kinds(team):
+        raise TeamError(f"jenis '{who}' tidak dipakai tim ini (blok `{who}` belum diisi di team.yaml)")
     if who in SYSTEM_KINDS:
         profile, alias = team[who]["profile"], model_alias(team, who)
     elif who in ("default", "lobby"):
@@ -599,7 +609,8 @@ def managed_blocked_warning(hermes: Hermes) -> list[str]:
 
 def _print_warnings(team: dict, hermes: Optional[Hermes] = None) -> None:
     """Peringatan konfigurasi (tidak menggagalkan `check`/`apply`)."""
-    warnings = list(team.get("warnings") or []) + fallback_warnings(team) + sandbox_warnings(team)
+    warnings = (list(team.get("warnings") or []) + fallback_warnings(team) + sandbox_warnings(team)
+                + budget_warnings(team) + unmanaged_warnings(team))
     if hermes is not None:
         warnings += managed_blocked_warning(hermes)
     if warnings:
@@ -620,6 +631,13 @@ def _print_apply_tail(team: dict, hermes: Hermes, result: dict) -> None:
                    and d.name not in known) if profiles_dir.is_dir() else []
     if stale:
         print(f"Profile berawalan sama yang tidak ada di members.yaml: {', '.join(stale)}")
+    if result.get("managed_pending"):
+        print(f"\n⚠️  BELUM SELESAI — {result['managed_pending']}.\n"
+              "Profile sudah dibuat, tetapi rute gateway, daftar channel, dan roster BELUM ditulis: tanpa managed "
+              "config, terminal anggota bisa berjalan di HOST (bukan di sandbox Docker).\n"
+              f"Lanjutkan persis:\n  {managed_install_command(team)}\n"
+              "  python3 hermes_team.py apply       # sekali lagi: baru sekarang rute ditulis")
+        return
     if result.get("restart_needed"):
         print("\n⚠️  Setelan gateway berubah → restart gateway: ketik /restart di Discord (admin) atau "
               "`hermes gateway restart`.")

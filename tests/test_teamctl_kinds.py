@@ -79,3 +79,39 @@ def test_admin_role_kind_channel_blocks_assign_role_like_the_builtin_admin_chann
     with pytest.raises((tm.ToolError, ht.TeamError), match="channel oncall tim"):
         ctl.call("discord_assign_role", user="citra", role="designer")
     assert ctl.previews == [] and len(mutating(tc.state)) == before
+
+
+# ---- jenis terdaftar yang bloknya TIDAK ada di team.yaml (jenis opsional yang tidak dipakai tim ini)
+def _absent_kind(register_kind, **kw):
+    return register_kind(kit_profiles.ProfileKind(
+        "ops", ht.SOUL_SHARED, kit_profiles._shared_settings, needs_channel=True, reserved=True,
+        model_target=True, channel_label="channel ops", model_label="ops", **kw))
+
+
+def test_registered_kind_absent_from_team_does_not_break_server_guard(tc, register_kind):
+    ctl = tc.ctl()
+    team = ctl.team()                      # dimuat SEBELUM jenis didaftarkan → dict tim tanpa kunci `ops`
+    _absent_kind(register_kind, role="admin")
+    assert "ops" in kit_profiles.SYSTEM_KINDS and "ops" not in team
+    srv = tm.Server(team, ctl.api())       # dulu: KeyError 'ops'
+    assert set(srv.team_channels) == {fd.CH_SHARED, fd.CH_ADMIN} and "" not in srv.team_channels
+    assert srv.admin_labels == {"channel admin tim"}
+    for partial in ({}, {"profile": "team-ops"}, {"profile": "team-ops", "channel_id": ""}, None):
+        srv = tm.Server({**team, "ops": partial}, ctl.api())
+        assert set(srv.team_channels) == {fd.CH_SHARED, fd.CH_ADMIN} and srv.admin_labels == {"channel admin tim"}
+    assert srv.channel_kind(srv.channel(fd.CH_ADMIN)) == "channel admin tim"   # pagar jenis yang ADA tetap utuh
+
+
+def test_set_model_skips_registered_kind_absent_from_team(tc, register_kind, monkeypatch):
+    ctl = tc.ctl()
+    team = ctl.team()
+    _absent_kind(register_kind)
+    monkeypatch.setattr(ctl, "team", lambda: team)
+    assert tm.tools_team._model_target_kinds(team) == ["shared", "admin", "lobby"]
+    with pytest.raises(tm.ToolError, match="ops tidak dipakai tim ini.*shared, admin, atau lobby"):
+        ctl.call("set_model", target="ops", model="td-normal")
+    with pytest.raises(tm.ToolError, match="tidak dikenal; pakai nama anggota, all, shared, admin, atau lobby$"):
+        ctl.call("set_model", target="opz", model="td-normal")
+    assert ctl.previews == []
+    present = {**team, "ops": {"profile": "team-ops", "channel_id": OPS_CH}}
+    assert tm.tools_team._model_target_kinds(present) == ["shared", "admin", "lobby", "ops"]

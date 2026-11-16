@@ -7,7 +7,9 @@ registry.py) dan kerangka tool yang menjalankannya lewat `GuardMixin._guarded`.
 from __future__ import annotations
 
 import json
+import os
 import re
+import stat
 import sys
 import unicodedata
 from pathlib import Path
@@ -87,6 +89,33 @@ def _clean_message(value: Any) -> str:
     return re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
 
 
+def _append_private(path: Path, line: str) -> None:
+    """Tambahkan satu baris ke berkas milik sendiri bermode 0600 (dibuat 0600 apa pun umask-nya; berkas lama yang
+    lebih longgar dirapikan). O_NOFOLLOW: symlink di tempat audit.log ditolak (OSError), tidak diikuti; yang bukan
+    berkas biasa (FIFO, perangkat) juga ditolak.
+
+    BATAS YANG JUJUR: ini hanya menutup akses user LAIN di host. Proses teamctl, gateway Hermes, dan profile admin
+    berjalan sebagai user Unix yang SAMA, jadi akun yang diaudit tetap bisa mengubah/menghapus audit.log (mode 0600
+    tidak mencegah pemiliknya). Jejak yang tahan-rusak butuh penyimpanan di luar user ini (user lain, append-only
+    `chattr +a` oleh root, atau log jarak jauh) — itu di luar jangkauan teamctl."""
+    flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0) \
+        | getattr(os, "O_NONBLOCK", 0)                       # NONBLOCK: FIFO tanpa pembaca tidak menggantung proses
+    fd = os.open(path, flags, 0o600)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise OSError(f"{path} bukan berkas biasa")
+        if stat.S_IMODE(info.st_mode) != 0o600:
+            try:
+                os.fchmod(fd, 0o600)
+            except OSError as exc:        # bukan pemilik berkas: tetap catat, tapi jangan diam
+                print(f"teamctl: mode {path} ({stat.S_IMODE(info.st_mode):04o}) tidak bisa dijadikan 0600: {exc}",
+                      file=sys.stderr, flush=True)
+        os.write(fd, line.encode("utf-8"))
+    finally:
+        os.close(fd)
+
+
 class GuardMixin:
     """Audit log + pagar konfirmasi untuk TeamCtl. Butuh `self.team()`, `self.confirm()`, `self.work_lock`,
     `self._abort_reason()` dari kelas induknya."""
@@ -95,9 +124,9 @@ class GuardMixin:
         path = Path(team["paths"]["state_dir"]) / "audit.log"
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
-            with open(path, "a", encoding="utf-8") as fh:
-                fh.write(json.dumps({"ts": ht.now_iso(), "event": event, "via": "teamctl", **fields},
-                                    ensure_ascii=False, default=str) + "\n")
+            line = json.dumps({"ts": ht.now_iso(), "event": event, "via": "teamctl", **fields},
+                              ensure_ascii=False, default=str) + "\n"
+            _append_private(path, line)
         except (OSError, TypeError, ValueError) as exc:
             print(f"teamctl: GAGAL menulis audit log {path} (event {event}): {type(exc).__name__}: {exc}",
                   file=sys.stderr, flush=True)

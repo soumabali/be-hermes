@@ -5,6 +5,7 @@ Lapisan utama tetap penyamaran output (redact.py); guard ini mencegah kebocoran 
 """
 from __future__ import annotations
 
+import fnmatch
 import re
 import shlex
 from typing import Any, Iterable, Optional
@@ -25,6 +26,12 @@ _SAFE_PRINTENV = {"PATH", "HOME", "USER", "SHELL", "PWD", "LANG", "LC_ALL", "TER
                   "EDITOR", "PAGER", "TMPDIR", "OLDPWD", "SHLVL"}
 
 _PROC_ENVIRON = re.compile(r"/proc/[^\s;|&'\"<>]*environ")
+# Path /proc/… yang memuat karakter glob (`/proc/self/envi*`, `/proc/*/en?iron`, `/proc/self/{environ,x}`):
+# dicocokkan per segmen terhadap path environ yang mungkin (lihat _proc_environ_hit).
+_PROC_TOKEN = re.compile(r"/proc/[^\s;|&<>()`,]+")
+_PROC_TARGETS = tuple(t.split("/") for t in (
+    "/proc/self/environ", "/proc/thread-self/environ", "/proc/1/environ", "/proc/4242/environ",
+    "/proc/self/task/4242/environ", "/proc/4242/task/4242/environ"))
 _ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 _VAR_REF = re.compile(r"\$\{?[!#]?([A-Za-z_][A-Za-z0-9_]*)")
 _SECRETISH = re.compile(
@@ -48,11 +55,79 @@ _CODE_DUMPS: list[tuple[str, re.Pattern]] = [
     ("os.Environ()", re.compile(r"\bos\.Environ\s*\(\s*\)")),
     ("System.getenv()", re.compile(r"\bSystem\.getenv\s*\(\s*\)")),
     ("ENVIRON (awk)", re.compile(r"\bin\s+ENVIRON\b")),
+    # Satu secret dicetak dengan pemisah antar-karakter ("s-e-c-r-e-t") supaya lolos penyamaran output.
+    ("'-'.join(os.environ[…])", re.compile(
+        r"[\"']\s*\.\s*join\s*\(\s*(?:os\.)?(?:environ\s*\[[^\]]*\]|environ\s*\.\s*get\s*\([^()]*\)|"
+        r"getenv\s*\([^()]*\))\s*\)")),
 ]
+# Alias untuk SELURUH environment (`e = os.environ`, `e = dict(os.environ)`, `e = getattr(os, "environ")`,
+# `from os import environ as e`): nama aliasnya diganti `os.environ` lalu pola di atas dicoba lagi, jadi `print(e)` tertangkap
+# tetapi `subprocess.run(..., env=e)` tidak.
+_ENV_ALIAS = re.compile(
+    r"(?:^|[;\n\"'(])\s*([A-Za-z_]\w*)\s*(?::\s*[\w\[\], .]+?)?:?=\s*"
+    r"(?:(?:dict|list|sorted)\s*\(\s*)?(?:(?:os\.)?environ\b(?!\s*(?:\[|\.\s*(?:get|setdefault|pop)\b))"
+    r"|getattr\s*\(\s*os\s*,\s*[\"']environ[\"']\s*\))")
+_ENV_IMPORT_ALIAS = re.compile(r"\bfrom\s+os\s+import\s+(?:[\w ,]*,\s*)?environ\s+as\s+([A-Za-z_]\w*)")
+_GETATTR_ENVIRON = re.compile(r"\bgetattr\s*\(\s*os\s*,\s*[\"']environ[\"']\s*\)")
 # Perintah shell yang ditanam di dalam kode: os.system("env"), subprocess.run("printenv", ...), terminal("env").
 _CODE_SHELL = re.compile(
     r"\b(?:system|popen|run|call|check_output|check_call|Popen|getoutput|getstatusoutput|terminal|execSync|exec|spawn)"
     r"\s*\(\s*\[?\s*(?:[rbuf]{0,2})(\"\"\"|'''|\"|')(.*?)\1", re.S)
+
+
+def _expand_braces(token: str, _depth: int = 0) -> list[str]:
+    """Ekspansi kurung kurawal shell satu tingkat demi satu tingkat (`a{b,c}d` → abd, acd); dibatasi."""
+    match = re.search(r"\{([^{}]*,[^{}]*)\}", token)
+    if not match or _depth > 3:
+        return [token]
+    out: list[str] = []
+    for option in match.group(1).split(",")[:16]:
+        out += _expand_braces(token[:match.start()] + option + token[match.end():], _depth + 1)
+    return out[:64]
+
+
+def _proc_environ_hit(text: str) -> Optional[str]:
+    """Potongan `text` yang menunjuk /proc/<pid>/environ — persis, atau lewat glob/kurung kurawal/kutip yang
+    disisipkan (`envi*`, `en?iron`, `env"iron"`, `{environ,x}`). None bila tidak ada. Best-effort: path yang
+    dirakit dari variabel atau potongan string tidak terlihat di sini."""
+    found = _PROC_ENVIRON.search(text)
+    if found:
+        return found.group(0)
+    if "/proc/" not in text:
+        return None
+    bare = re.sub(r"[\"'\\]", "", text)               # kutip/backslash di tengah path dibuang shell
+    found = _PROC_ENVIRON.search(bare)
+    if found:
+        return found.group(0)
+    for match in _PROC_TOKEN.finditer(bare):
+        token = match.group(0)
+        if not any(ch in token for ch in "*?[{"):
+            continue
+        for candidate in _expand_braces(token):
+            # segmen berisi ekspansi shell (`$$`, `$PID`, `$(pgrep x)`) bisa menjadi apa saja → wildcard
+            parts = ["*" if "$" in seg else seg for seg in candidate.rstrip("/").split("/")]
+            for target in _PROC_TARGETS:
+                if len(parts) != len(target):
+                    continue
+                try:
+                    if all(fnmatch.fnmatchcase(want, have) for have, want in zip(parts, target)):
+                        return token
+                except re.error:
+                    continue
+    return None
+
+
+def _alias_expanded(code: str) -> Optional[str]:
+    """`code` dengan alias seluruh-environment diganti `os.environ`; None bila tidak ada alias."""
+    names = {m.group(1) for m in _ENV_ALIAS.finditer(code)} | {m.group(1) for m in _ENV_IMPORT_ALIAS.finditer(code)}
+    names = {n for n in names if n not in ("os", "environ")}
+    direct = _GETATTR_ENVIRON.search(code) is not None
+    if not names and not direct:
+        return None
+    out = _GETATTR_ENVIRON.sub("os.environ", code)
+    for name in sorted(names)[:8]:
+        out = re.sub(rf"(?<![\w.]){re.escape(name)}\b(?!\s*:?=[^=])", "os.environ", out)
+    return out
 
 
 def message(what: str) -> str:
@@ -260,9 +335,9 @@ def check_command(command: Any, secret_names: Iterable[str] = (), _depth: int = 
         return None
     command = command[:MAX_SCAN]
     names = set(secret_names)
-    proc = _PROC_ENVIRON.search(command)
+    proc = _proc_environ_hit(command)
     if proc:
-        return message(proc.group(0))
+        return message(proc)
     here = re.search(r"<<<\s*[\"']?\$\{?([A-Za-z_][A-Za-z0-9_]*)", command)
     if here and (here.group(1) in names or _SECRETISH.search(here.group(1))):
         return message(f"<<< ${here.group(1)}")
@@ -306,12 +381,17 @@ def check_code(code: Any, secret_names: Iterable[str] = (), _depth: int = 0, _sh
     if not isinstance(code, str) or not code.strip():
         return None
     code = code[:MAX_SCAN]
-    proc = _PROC_ENVIRON.search(code)
+    proc = _proc_environ_hit(code)
     if proc:
-        return message(proc.group(0))
+        return message(proc)
     for label, pattern in _CODE_DUMPS:
         if pattern.search(code):
             return message(label)
+    expanded = _alias_expanded(code)
+    if expanded is not None:
+        for label, pattern in _CODE_DUMPS:
+            if pattern.search(expanded):
+                return message(f"{label} lewat alias")
     if _shell and _depth < MAX_DEPTH:
         for match in _CODE_SHELL.finditer(code):
             found = check_command(match.group(2), secret_names, _depth + 1)
@@ -342,7 +422,7 @@ def check_tool_call(tool_name: Any, args: Any, secret_names: Iterable[str] = ())
         if key in _COMMAND_KEYS or key in _CODE_KEYS:
             continue
         if isinstance(value, str) and len(value) < 4096:
-            proc = _PROC_ENVIRON.search(value)
+            proc = _proc_environ_hit(value)
             if proc:
-                return message(proc.group(0))
+                return message(proc)
     return None

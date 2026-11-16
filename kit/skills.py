@@ -46,6 +46,13 @@ def _frontmatter(skill_md: Path) -> dict:
     return {}
 
 
+def _one_line(value: Any) -> str:
+    """Teks bebas dari SKILL.md (ditulis pemilik profile) → satu baris tanpa karakter kontrol. Deskripsi ini
+    ditampilkan ke admin/AI admin (list-skills, teamctl), jadi tidak boleh membawa newline atau kontrol terminal."""
+    text = re.sub(r"[\x00-\x1f\x7f-\x9f\u2028\u2029]+", " ", str(value or ""))
+    return re.sub(r" {2,}", " ", text).strip()
+
+
 def list_skills(hermes: Hermes, profile: str) -> list[dict]:
     root = hermes.home(profile) / "skills"
     out = []
@@ -57,7 +64,7 @@ def list_skills(hermes: Hermes, profile: str) -> list[dict]:
             continue
         meta = _frontmatter(skill_md)
         out.append({"name": str(meta.get("name") or skill_md.parent.name), "dir": skill_md.parent.name,
-                    "path": str(rel), "description": str(meta.get("description") or "")[:200],
+                    "path": str(rel), "description": _one_line(meta.get("description"))[:200],
                     "shared": rel.parts[0] == SHARED_CATEGORY if rel.parts else False})
     return out
 

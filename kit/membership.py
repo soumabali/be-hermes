@@ -14,10 +14,12 @@ import yaml
 from kit_base import TeamError, _id
 from kit_discord import PERM, discord_token, private_overwrites, DiscordAPI
 from kit.constants import NAME_RE
-from kit.profiles import MODEL_TARGETS, PROFILE_KINDS, RESERVED_NAMES, SYSTEM_KINDS
+from kit.profiles import (MODEL_TARGETS, PROFILE_KINDS, RESERVED_NAMES, SYSTEM_KINDS, active_model_targets,  # noqa: F401
+                          active_system_kinds)
 from kit.util import _profile, atomic_write, clean_display_name, now_iso
 from kit.config import _sandbox_override, _validate_unique, load_team, members_lock, reload_team, save_members, team_lock
-from kit.derive import _get_nested, compression_settings, model_settings, sandbox_limits, sandbox_settings, sandbox_worst_case_mb
+from kit.derive import (_get_nested, compression_settings, model_settings, require_managed_sandbox,  # noqa: F401
+                        sandbox_limits, sandbox_settings, sandbox_worst_case_mb)
 from kit.hermes_cli import Hermes
 from kit.skills import _save_registry, _unshare_skill, shared_skill_registry
 from kit.provision import cmd_apply, write_roster
@@ -75,7 +77,7 @@ def _taken_names(team: dict, hermes: Hermes) -> set[str]:
     yang sudah ada (sisa anggota lama yang dihapus dari members.yaml masih menyimpan .env/memory/skill)."""
     prefix = team["prefix"]
     taken = {m["name"] for m in team["members"]}
-    profiles = hermes.profile_dirs() | {team["template"], *(team[kind]["profile"] for kind in SYSTEM_KINDS)}
+    profiles = hermes.profile_dirs() | {team["template"], *(team[kind]["profile"] for kind in active_system_kinds(team))}
     taken |= {p[len(prefix):] for p in profiles if p.startswith(prefix) and len(p) > len(prefix)}
     return taken
 
@@ -95,7 +97,7 @@ def _validate_new_member(team: dict, hermes: Hermes, *, name: str, user_id: str,
         if m["user_id"] == user_id:
             raise TeamError(f"user {user_id} sudah terdaftar sebagai '{m['name']}'")
     profile = _profile(f"{team['prefix']}{name}", "name")
-    if profile in (team["template"], *(team[kind]["profile"] for kind in SYSTEM_KINDS)):
+    if profile in (team["template"], *(team[kind]["profile"] for kind in active_system_kinds(team))):
         raise TeamError(f"nama '{name}' menghasilkan profile '{profile}' yang dipakai sistem; pilih nama lain")
     if hermes.dir_exists(profile):
         raise TeamError(
@@ -111,7 +113,7 @@ def _validate_new_member(team: dict, hermes: Hermes, *, name: str, user_id: str,
 
 def _channel_conflict(team: dict, channel_id: str, user_id: str) -> str:
     """Kenapa channel ini tidak boleh jadi channel pribadi user tsb. ('' = boleh)."""
-    for kind in SYSTEM_KINDS:
+    for kind in active_system_kinds(team):
         if channel_id == team[kind]["channel_id"]:
             return f"itu {PROFILE_KINDS[kind].channel_label}"
     if channel_id == team["category_id"]:
@@ -262,6 +264,7 @@ def add_member(team: dict, hermes: Hermes, *, name: str, user_id: str, display_n
     lengkap). Gagal setelah channel dibuat → channel & entri dibatalkan."""
     with team_lock(team):
         reload_team(team)
+        require_managed_sandbox(team, "add-member")        # sebelum channel/profile apa pun dibuat
         name = _check_new_name(team, name)
         user_id = _id(user_id, "discord_user_id")
         explicit = bool(str(channel_id or "").strip())
@@ -469,8 +472,9 @@ def onboard_member(team: dict, hermes: Hermes, *, user_id: str, username: str = 
         notes: list[str] = []
         plan = _plan_onboard(team, hermes, user_id=user_id, username=username, display_name=display_name,
                              name=name, model=model)
-        if plan["kind"] == "exists":
+        if plan["kind"] == "exists":      # tidak ada yang baru dilayani; penerapan ulang dijaga cmd_apply sendiri
             return _onboard_existing(team, hermes, plan["previous"], api, emit, notes)
+        require_managed_sandbox(team, "onboarding")        # sebelum channel/profile apa pun dibuat
         if not hermes.dry_run:
             api = _discord(hermes, api)
         channel_created = _onboard_channel(team, hermes, plan, api, emit, notes)
@@ -623,7 +627,7 @@ def _batch_apply(team: dict, hermes: Hermes, items: list[dict], pending: dict[st
                     undo(item, exc)
             # Samakan lagi host gateway + roster dengan members.yaml yang sekarang (tanpa anggota batal).
             try:
-                merge(cmd_apply(team, hermes, only=[], host_only=True))
+                merge(cmd_apply(team, hermes, only=[], host_only=True, sandbox="off"))
             except Exception as sync_exc:  # noqa: BLE001
                 hermes.failures.append(f"sinkronisasi host setelah pembatalan gagal: {sync_exc}")
     return summary
@@ -658,6 +662,8 @@ def onboard_batch(team: dict, hermes: Hermes, entries: Iterable[Any], *, api: Op
     with team_lock(team):
         reload_team(team)
         items = _batch_validate(team, hermes, entries)
+        if any(it["plan"]["kind"] != "exists" for it in items):
+            require_managed_sandbox(team, "onboarding massal")      # sebelum channel/profile apa pun dibuat
         if not hermes.dry_run and any(it["plan"]["kind"] != "exists" for it in items):
             api = _discord(hermes, api)
         _batch_channels(team, hermes, items, api, emit)
@@ -685,7 +691,7 @@ def offboard_member(team: dict, hermes: Hermes, *, user_id: str, hide_channel: b
         if member.get("active", True):
             member = dict(member, active=False)
             _store_member(team, hermes, member, replace=True)
-            result = cmd_apply(team, hermes, only=[], host_only=True)
+            result = cmd_apply(team, hermes, only=[], host_only=True, sandbox="off")   # hanya mengurangi akses
             status = "deactivated"
         else:
             result = {"restart_needed": False, "live_changed": [], "failures": list(hermes.failures)}
@@ -714,6 +720,9 @@ def _set_model(team: dict, hermes: Hermes, target: str, alias: str) -> dict:
     with members_lock(Path(team["paths"]["team_file"])):
         fresh = load_team(Path(team["paths"]["team_file"]), Path(team["paths"]["members_file"]))
         touched: list[tuple[str, str, Optional[dict]]] = []
+        if target in MODEL_TARGETS and target not in active_model_targets(fresh):
+            raise TeamError(f"jenis '{target}' tidak dipakai tim ini (blok `{target}` belum diisi di team.yaml); "
+                            f"target yang ada: {', '.join(active_model_targets(fresh))}, nama anggota, atau all")
         if target in MODEL_TARGETS:
             fresh["model_overrides"][target] = alias
             profile = fresh[target]["profile"] if PROFILE_KINDS[target].needs_channel else "default"   # lobby = host
@@ -786,6 +795,8 @@ def _set_sandbox(team: dict, hermes: Hermes, name: str, *, memory_mb: Any, cpu: 
 
 def set_member_active(team: dict, hermes: Hermes, name: str, active: bool) -> dict:
     with team_lock(team):
+        if active:
+            require_managed_sandbox(team, "set-active on")
         with members_lock(Path(team["paths"]["team_file"])):
             fresh = load_team(Path(team["paths"]["team_file"]), Path(team["paths"]["members_file"]))
             member = next((m for m in fresh["members"] if m["name"] == name), None)
@@ -797,7 +808,7 @@ def set_member_active(team: dict, hermes: Hermes, name: str, active: bool) -> di
         team.clear()
         team.update(fresh)
         result = cmd_apply(team, hermes, only=[name] if active else [], host_only=not active,
-                           sync_shared=[name] if active else ())
+                           sync_shared=[name] if active else (), sandbox="require" if active else "off")
         notes: list[str] = []
         if not hermes.dry_run and (active or team["onboarding"]["hide_channel_on_offboard"]):
             # Samakan izin channel pribadi dengan status: aktif → pemilik melihat lagi; nonaktif → dicabut.
@@ -963,7 +974,7 @@ def remove_member(team: dict, hermes: Hermes, name: str, *, delete_profile: bool
         team.update(fresh)
         done.append(f"entri '{name}' dihapus dari members.yaml")
         # 3) roster & rute diselaraskan (anggota nonaktif memang sudah tanpa rute; roster memuat daftar nonaktif).
-        result = cmd_apply(team, hermes, only=[], host_only=True)
+        result = cmd_apply(team, hermes, only=[], host_only=True, sandbox="off")
         # 4) profile
         if delete_profile and hermes.dir_exists(member["profile"]):
             if hermes.run("profile", "delete", member["profile"], "--yes"):

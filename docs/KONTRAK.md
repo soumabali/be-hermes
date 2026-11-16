@@ -41,6 +41,12 @@ di [`kit_contracts.py`](../kit_contracts.py) (stdlib saja), dan diuji di `tests/
 * **Kunci opsional entri `channels` (aditif, `schema` tetap 1):** `role` (`"admin"` bila jenis ber-role admin; hilang =
   bukan admin) dan `cron_exempt` (`true` = boleh membuat cron rapat). Hilang pada roster lama: plugin jatuh ke perilaku
   lama (hanya `kind: "admin"`). Plugin juga membentuk placeholder `{<kind>_channel}` dari `kind` di `channels`.
+* **Jenis opsional (`ProfileKind.optional`):** `channels` dan `gateway` hanya memuat jenis ber-channel yang DIPAKAI tim
+  (`kit.profiles.active_system_kinds(team)`). Jenis terdaftar yang bloknya tidak ada di `team.yaml` tidak pernah
+  muncul di roster, jadi pembaca tidak perlu mengenal `optional`.
+* **Kapan ditulis:** hanya setelah managed config terpasang mem-pin sandbox Docker (`kit.provision.sandbox_gate`).
+  `apply` pertama pada instalasi baru (sebelum `managed --install`) memprovisi profile tetapi TIDAK menulis roster
+  maupun rute; pembaca harus tetap menganggap roster bisa belum ada.
 * **`settings`, `onboarding`, `usage`, `live_reload`, `restart_fallback` DITURUNKAN dari tabel**
   `kit_config.FIELDS`: hanya baris yang punya `plugin_key` (dan `plugin_section` yang sesuai) yang masuk. Menambah
   setelan yang ditegakkan plugin = satu baris di tabel + titik pakainya di plugin; tidak ada daftar kunci lain yang
@@ -59,6 +65,10 @@ di [`kit_contracts.py`](../kit_contracts.py) (stdlib saja), dan diuji di `tests/
   `budget` (`day`, `used_by_user`, `team_used`, `stale`, `last_collect`).
 * **Pembaca:** teamctl `team_status` (berkas lebih tua dari beberapa menit diberi label "DATA BASI"),
   `tools/metrics_export.py` (Prometheus). Keduanya mengabaikan kunci tak dikenal.
+* **Kunci opsional `budget_ledger_ok` (boolean):** dibaca `kit_doctor.check_budget_ledger` bila ada — di tingkat atas
+  atau di dalam `budget` (juga diterima: `budget.ledger_ok`), dengan cadangan kunci yang sama di
+  `capabilities.json`. `false` = plugin tidak bisa membaca buku besar, anggaran token tidak ditegakkan (doctor:
+  error bila anggaran dikonfigurasi dan berkasnya segar, selain itu peringatan). Tidak ada = tidak ada temuan.
 
 ## `state/budget_overrides.json`
 

@@ -10,6 +10,7 @@ import stat
 import subprocess
 import sys
 import threading
+import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -61,8 +62,11 @@ class FakeSystem(ks.HostSystem):
     def __init__(self, tmp: Path, with_user: bool = False):
         self.tmp = tmp
         self.calls = []
-        self.present = {"curl", "timedatectl", "adduser"}
+        self.present = {"curl", "timedatectl", "adduser", "apt-get"}
         self.users, self.groups = {}, set()
+        self.missing_groups = set()       # grup Linux yang TIDAK ada di mesin (mis. {"docker"} pada Docker rootless/snap)
+        self.hermes_commit = None         # commit checkout Hermes tiruan; None = `git rev-parse` gagal (tidak diketahui)
+        self.unpinned_commit = "f" * 40   # yang "dipasang" installer tiruan bila tanpa --commit
         self.linger_dir = tmp / "linger"
         self.fail = None            # callable(inner_argv) → Result | None
         self.slept = 0.0
@@ -137,6 +141,12 @@ class FakeSystem(ks.HostSystem):
             target = Path(self.users[user].home) / ".local" / "bin" / "hermes"
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text("#!/bin/sh\n")
+            words = text.split()
+            self.hermes_commit = words[words.index("--commit") + 1] if "--commit" in words else self.unpinned_commit
+        elif cmd[:1] == ["git"] and cmd[-2:] == ["rev-parse", "HEAD"]:
+            if self.hermes_commit is None:
+                return ks.Result(128, "", "fatal: not a git repository")
+            return ks.Result(0, self.hermes_commit + "\n")
         elif cmd[:2] == ["mkdir", "-p"]:
             Path(cmd[2]).mkdir(parents=True, exist_ok=True)
         elif cmd[:1] == ["timedatectl"]:
@@ -165,6 +175,9 @@ class FakeSystem(ks.HostSystem):
 
     def user_groups(self, name):
         return set(self.groups) if name in self.users else set()
+
+    def group_exists(self, name):
+        return name not in self.missing_groups
 
     def chown(self, path, user, group):
         self.chowns.append((str(path), user, group))
@@ -313,7 +326,8 @@ class Wizard:
 
 def write_answers(tmp: Path, llm_base: str, **extra) -> Path:
     data = {"install_docker": True, "install_hermes": True, "llm_base_url": llm_base, "admins": [fd.ADMIN],
-            "timezone": "Asia/Makassar", "moderation": False, "usage_reports": True, "team_name": "Platform"}
+            "timezone": "Asia/Makassar", "moderation": False, "usage_reports": True, "team_name": "Platform",
+            "run_selftest": False}       # bawaan wizard = ya; uji yang memeriksanya menyetel sendiri
     data.update(extra)
     path = tmp / "jawaban.yaml"
     path.write_text(yaml.safe_dump(data))
@@ -375,7 +389,6 @@ def test_invite_permission_integer_matches_documented_set():
 
 
 def test_invite_url_shape():
-    import urllib.parse
     url = ks.invite_url("990000000000000001")
     parts = urllib.parse.urlsplit(url)
     query = urllib.parse.parse_qs(parts.query)
@@ -881,7 +894,9 @@ def test_non_interactive_end_to_end(tmp_path, discord, llm, secrets_env):
     again = Wizard(tmp_path, wizard.sys)
     assert again.main("--non-interactive", "--answers", str(tmp_path / "jawaban.yaml")) == 0
     assert again.text.count("sudah selesai — dilewati") == 13
-    assert [c for c in wizard.sys.commands()[before:]] == [c for c in wizard.sys.commands()[before:] if "kit_doctor" in c]
+    # satu-satunya perintah: pemeriksaan hidup gateway (check() langkah 13) dan kit_doctor
+    later = wizard.sys.commands()[before:]
+    assert later[0] == "systemctl --user is-active hermes-gateway.service" and len(later) == 2 and "kit_doctor" in later[1]
     assert len(posts(discord)) == writes
 
 
@@ -1128,9 +1143,7 @@ def test_module_does_not_import_hermes_team():
 
 # =========================================================================== audit: perbaikan cacat (item 1–15)
 # --------------------------------------------------------------------------- bantu
-import http.client  # noqa: E402
 import shutil  # noqa: E402
-import urllib.parse  # noqa: E402
 
 
 def serve(fn):
@@ -1918,3 +1931,566 @@ def test_usage_channel_that_is_public_needs_confirmation_too(tmp_path, discord):
     assert ctx.data["usage_channel_id"] == "400000000000000088"
     overwrites = {o["id"] for o in discord.channels["400000000000000088"]["permission_overwrites"]}
     assert overwrites == {fd.GUILD, fd.ROLE_ADMIN, fd.BOT}
+
+
+# =========================================================================== audit operasi: versi Hermes, kontrak hulu,
+# gateway hidup, skala, platform, pemantau (HERMES_REF, tools/hermes_contract.py, tools/gateway_watch.py)
+import importlib.util  # noqa: E402
+import re  # noqa: E402
+
+
+def load_tool(name):
+    spec = importlib.util.spec_from_file_location(f"tool_{name}", KIT_DIR / "tools" / f"{name}.py")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+hc = load_tool("hermes_contract")
+gw = load_tool("gateway_watch")
+TESTED_REF = ks.read_hermes_ref(KIT_DIR)
+OTHER_REF = "a" * 40
+CI_TEXT = (KIT_DIR / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+
+
+def preinstalled(tmp_path, commit):
+    """Mesin tiruan tempat Hermes SUDAH terpasang (launcher ada) pada `commit` (None = tidak bisa ditentukan)."""
+    system = FakeSystem(tmp_path, with_user=True)
+    launcher = Path(system.users["hermes"].home) / ".local" / "bin" / "hermes"
+    launcher.parent.mkdir(parents=True)
+    launcher.write_text("#!/bin/sh\n")
+    system.hermes_commit = commit
+    return system
+
+
+# --------------------------------------------------------------------------- 1: versi Hermes yang diuji
+def test_hermes_ref_is_one_file_read_by_ci_and_the_wizard():
+    assert ks.SHA_RE.match(TESTED_REF), "HERMES_REF harus berisi satu SHA 40 heksadesimal"
+    lines = [ln for ln in (KIT_DIR / "HERMES_REF").read_text().splitlines() if ln.strip() and not ln.startswith("#")]
+    assert lines == [TESTED_REF]
+    # ci.yml tidak lagi menyimpan salinan SHA: ia membaca berkasnya
+    assert not re.search(r"\b[0-9a-f]{40}\b", CI_TEXT) and "HERMES_REF" in CI_TEXT and "GITHUB_ENV" in CI_TEXT
+    assert "HERMES_REF" in ks.KIT_TOP_FILES
+    assert ks.read_hermes_ref("/tidak/ada", KIT_DIR) == TESTED_REF and ks.read_hermes_ref("/tidak/ada") == ""
+
+
+def test_install_command_pins_only_a_full_sha():
+    base = ks.hermes_install_command()
+    assert base.endswith("| bash -s -- --non-interactive --skip-setup") and ks.HERMES_INSTALL_URL in base
+    assert ks.hermes_install_command(TESTED_REF) == base + f" --commit {TESTED_REF}"
+    for bad in ("main", "v1.2.3", TESTED_REF[:12], TESTED_REF + "; rm -rf /", ""):
+        assert ks.hermes_install_command(bad) == base, bad
+
+
+@pytest.mark.parametrize("installed,tested,expected", [
+    (TESTED_REF, TESTED_REF, "match"), (TESTED_REF.upper(), TESTED_REF, "match"), (TESTED_REF, TESTED_REF[:12], "match"),
+    (OTHER_REF, TESTED_REF, "mismatch"), ("", TESTED_REF, "unknown"), ("bukan-sha", TESTED_REF, "unknown"),
+    (TESTED_REF, "", "unknown"), (TESTED_REF, "main", "unknown")])
+def test_hermes_ref_status(installed, tested, expected):
+    assert ks.hermes_ref_status(installed, tested) == expected
+
+
+def test_wizard_installs_the_tested_commit_and_records_a_match(tmp_path, discord, llm, secrets_env):
+    wizard, code = run_end_to_end(tmp_path, llm[0])
+    assert code == 0, wizard.text
+    install = next(c for c in wizard.sys.commands() if "install.sh" in c)
+    assert install.endswith(f"--non-interactive --skip-setup --commit {TESTED_REF}")
+    data = wizard.state()["data"]
+    assert (data["hermes_commit"], data["hermes_ref_tested"], data["hermes_ref_status"]) == (TESTED_REF, TESTED_REF, "match")
+    assert data["hermes_version"] == "Hermes Agent tiruan 0.0"
+    assert f"commit yang diuji CI untuk kit ini ({TESTED_REF[:12]})" in wizard.text
+    assert "sama dengan yang diuji CI" in wizard.text and "BUKAN commit yang diuji" not in wizard.text
+    assert (wizard.kit / "HERMES_REF").read_text() == (KIT_DIR / "HERMES_REF").read_text()      # ikut tersalin
+
+
+def test_unpinned_install_is_a_recorded_mismatch_with_a_clear_warning(tmp_path, discord, llm, secrets_env):
+    wizard, code = run_end_to_end(tmp_path, llm[0], hermes_pin=False)
+    assert code == 0, wizard.text
+    install = next(c for c in wizard.sys.commands() if "install.sh" in c)
+    assert "--commit" not in install and install.endswith("--non-interactive --skip-setup")
+    data = wizard.state()["data"]
+    assert data["hermes_ref_status"] == "mismatch" and data["hermes_commit"] == "f" * 40
+    assert f"BUKAN commit yang diuji CI untuk kit v{ks.KIT_VERSION} ({TESTED_REF[:12]})" in wizard.text
+    assert "hermes_pin: false" in wizard.text and "BEDA dari yang diuji CI" in wizard.text      # peringatan + ringkasan
+
+
+def test_existing_hermes_on_another_commit_warns_and_is_not_touched_by_default(tmp_path):
+    system = preinstalled(tmp_path, OTHER_REF)
+    ctx = make_ctx(tmp_path, system=system)
+    ks.HermesInstall().run(ctx)
+    assert ctx.data["hermes_ref_status"] == "mismatch" and ctx.data["hermes_commit"] == OTHER_REF
+    assert not any("install.sh" in c for c in system.commands())
+    assert any("BUKAN commit yang diuji" in w and "hermes_repin" in w for w in ctx.warnings)
+
+
+def test_existing_hermes_can_be_repinned_on_request(tmp_path):
+    system = preinstalled(tmp_path, OTHER_REF)
+    ctx = make_ctx(tmp_path, {"hermes_repin": True}, system=system)
+    ks.HermesInstall().run(ctx)
+    assert [c for c in system.commands() if "install.sh" in c][0].endswith(f"--commit {TESTED_REF}")
+    assert ctx.data["hermes_ref_status"] == "match" and not any("BUKAN commit" in w for w in ctx.warnings)
+
+
+def test_undeterminable_hermes_commit_is_recorded_as_unknown(tmp_path):
+    system = preinstalled(tmp_path, None)
+    ctx = make_ctx(tmp_path, system=system)
+    ks.HermesInstall().run(ctx)
+    assert ctx.data["hermes_ref_status"] == "unknown" and ctx.data["hermes_commit"] == ""
+    assert any("tidak bisa ditentukan" in w and "selftest" in w for w in ctx.warnings)
+    # tanpa git: resi installer (.hermes-bootstrap-complete) dipakai
+    receipt = Path(system.users["hermes"].home) / ".hermes" / "hermes-agent" / ".hermes-bootstrap-complete"
+    receipt.parent.mkdir(parents=True)
+    receipt.write_text(json.dumps({"schemaVersion": 1, "pinnedCommit": TESTED_REF, "pinnedBranch": "main"}))
+    ctx = make_ctx(tmp_path, system=system)
+    ks.HermesInstall().run(ctx)
+    assert ctx.data["hermes_ref_status"] == "match" and ctx.data["hermes_commit"] == TESTED_REF
+
+
+def test_missing_hermes_ref_file_installs_unpinned_and_says_so(tmp_path):
+    system = FakeSystem(tmp_path, with_user=True)
+    ctx = make_ctx(tmp_path, {"install_hermes": True}, system=system)
+    ctx.source_dir = tmp_path / "tanpa-ref"
+    ks.HermesInstall().run(ctx)
+    assert "--commit" not in next(c for c in system.commands() if "install.sh" in c)
+    assert ctx.data["hermes_ref_status"] == "unknown" and any("HERMES_REF tidak ada" in w for w in ctx.warnings)
+
+
+def test_selftest_runs_by_default_because_it_is_the_only_on_server_check(tmp_path):
+    system = preinstalled(tmp_path, OTHER_REF)
+    ctx = make_ctx(tmp_path, system=system)                       # non-interaktif, TANPA jawaban run_selftest
+    ctx.data["hermes_ref_status"] = "mismatch"
+    ks.Verify().run(ctx)
+    assert any("selftest.sh" in c for c in system.commands())
+    assert "satu-satunya bukti kecocokan" in "\n".join(ctx.lines)
+    asked = []
+    prompter = ks.Prompter({}, {}, False, False, print, lambda prompt: asked.append(prompt) or "")
+    assert prompter.confirm("run_selftest", "Jalankan uji?", True) is True and "[Y/t]" in asked[0]      # Enter = ya
+    opted_out = make_ctx(tmp_path, {"run_selftest": False}, system=preinstalled(tmp_path / "b", TESTED_REF))
+    ks.Verify().run(opted_out)
+    assert not any("selftest.sh" in c for c in opted_out.sys.commands())
+
+
+# --------------------------------------------------------------------------- 2: kontrak installer + CLI hulu
+def test_every_hermes_command_the_wizard_issues_is_in_the_contract(tmp_path, discord, llm, secrets_env):
+    wizard, code = run_end_to_end(tmp_path, llm[0])
+    assert code == 0, wizard.text
+    dead = FakeSystem(tmp_path / "mati", with_user=True)          # jalur gagal: status + logs
+    dead.script_cmd("systemctl --user is-active", ks.Result(3, "failed\n"))
+    with pytest.raises(ks.StepError):
+        ks.Gateway().run(make_ctx(tmp_path / "mati", system=dead))
+    issued = {c for c in wizard.sys.commands() + dead.commands() if c.startswith("hermes ")}
+    assert {"hermes --version", "hermes doctor", "hermes gateway install", "hermes gateway start", "hermes gateway status",
+            "hermes logs gateway -n 40"} <= issued
+    uncovered = sorted(c for c in issued if not hc.covers(c.split()))
+    assert not uncovered, f"tambahkan ke tools/hermes_contract.py CLI_CONTRACT: {uncovered}"
+    # installer: job CI menjalankan fungsi yang sama dengan wizard, bukan salinan teksnya
+    assert ks.HermesInstall().command(TESTED_REF) == ks.hermes_install_command(TESTED_REF)
+    assert "hermes_install_command" in (KIT_DIR / "tools" / "hermes_contract.py").read_text()
+
+
+def test_contract_names_what_the_kit_really_calls():
+    cli = (KIT_DIR / "kit" / "hermes_cli.py").read_text()
+    membership = (KIT_DIR / "kit" / "membership.py").read_text()
+    assert '"profile", "create"' in cli and '"--clone-from"' in cli and '"--no-alias"' in cli
+    assert '"config", "set"' in cli and '"plugins", "enable"' in cli and '"-p"' in cli
+    assert '"profile", "delete"' in membership and '"--yes"' in membership
+    by_argv = {c.argv: c for c in hc.CLI_CONTRACT}
+    assert by_argv[("profile", "create")].needles == ("--clone-from", "--no-alias")
+    assert by_argv[("profile", "delete")].needles == ("--yes",)
+    assert {("config", "set"), ("plugins", "enable"), ("gateway", "install"), ("logs",), ("doctor",)} <= set(by_argv)
+    assert "-p" in by_argv[()].needles
+    assert ks.Gateway.DEFAULT_UNIT == "hermes-gateway.service"
+    assert any('_SERVICE_BASE = "hermes-gateway"' == needle for _rel, needle, _why in hc.SOURCE_CONTRACT)
+    # kalimat status yang ditafsir wizard = yang dicari di sumber hulu
+    verdicts = {"gateway service is running": ("✓ User {}", "running"), "gateway service is stopped": ("✗ User {}", "stopped"),
+                "Gateway service is not installed": ("✗ {}", "not_installed"), "Gateway is not running": ("✗ {}", "stopped"),
+                "Restart pending": ("  ⏳ {}: systemd is waiting", "stopped")}
+    assert {needle for _rel, needle, _why in hc.SOURCE_CONTRACT[1:]} == set(verdicts)
+    for needle, (shape, verdict) in verdicts.items():
+        assert ks.parse_gateway_status(shape.format(needle)) == verdict, needle
+
+
+def contract_home(tmp_path, launcher=True, drop=None):
+    home = tmp_path / "home"
+    source = home / ".hermes" / "hermes-agent" / "hermes_cli"
+    source.mkdir(parents=True)
+    text = "\n".join(needle for _rel, needle, _why in hc.SOURCE_CONTRACT if needle != drop)
+    (source / "gateway.py").write_text(text)
+    if launcher:
+        (home / ".local" / "bin").mkdir(parents=True)
+        (home / ".local" / "bin" / "hermes").write_text("#!/bin/sh\n")
+    return home
+
+
+def contract_runner(commit=TESTED_REF, broken=(), missing_flag=None):
+    def run(argv):
+        if argv[:1] == ["git"]:
+            return 0, commit + "\n"
+        rest = tuple(argv[1:])
+        if any(rest[:len(b)] == b for b in broken):
+            return 2, "usage: hermes [-h]\nhermes: error: argument command: invalid choice"
+        text = "usage: hermes … -p PROFILE -n LINES --clone-from NAME --no-alias --yes\ngateway agent errors\nHermes Agent v0"
+        return 0, text.replace(missing_flag, "") if missing_flag else text
+    return run
+
+
+def test_contract_check_passes_against_a_conforming_install(tmp_path):
+    lines = []
+    assert hc.run_checks(contract_runner(), contract_home(tmp_path), TESTED_REF, lines.append) == []
+    assert sum("✓" in line for line in lines) == 2 + len(hc.CLI_CONTRACT) + len(hc.SOURCE_CONTRACT)
+
+
+@pytest.mark.parametrize("case,needle", [
+    ("launcher", "launcher"), ("commit", "HERMES_REF"), ("subcommand", "hermes gateway install --help"),
+    ("flag", "--clone-from"), ("source", "_SERVICE_BASE")])
+def test_contract_check_reports_each_kind_of_drift(tmp_path, case, needle):
+    home = contract_home(tmp_path, launcher=case != "launcher",
+                         drop='_SERVICE_BASE = "hermes-gateway"' if case == "source" else None)
+    runner = contract_runner(commit=OTHER_REF if case == "commit" else TESTED_REF,
+                             broken=[("gateway", "install")] if case == "subcommand" else (),
+                             missing_flag="--clone-from" if case == "flag" else None)
+    failures = hc.run_checks(runner, home, TESTED_REF, lambda line: None)
+    assert len(failures) == 1 and needle in failures[0], failures
+
+
+def test_contract_tool_lists_itself_and_refuses_install_without_a_user():
+    out = subprocess.run([sys.executable, str(KIT_DIR / "tools" / "hermes_contract.py"), "--list"], capture_output=True, text=True)
+    assert out.returncode == 0 and f"--commit {TESTED_REF}" in out.stdout and "hermes profile create --help" in out.stdout
+    assert hc.main(["--install"]) == 2
+    for tool in ("hermes_contract.py", "gateway_watch.py"):
+        helped = subprocess.run([sys.executable, "-I", str(KIT_DIR / "tools" / tool), "--help"], capture_output=True, text=True,
+                                cwd="/")
+        assert helped.returncode == 0 and "Traceback" not in helped.stderr, helped.stderr
+
+
+def ci_job(name):
+    """Teks satu job di ci.yml (dari `  <name>:` sampai job berikutnya)."""
+    match = re.search(rf"^  {re.escape(name)}:\n(.*?)(?=^  [a-z][a-z0-9_-]*:\n|\Z)", CI_TEXT, re.S | re.M)
+    assert match, f"job {name} tidak ada di ci.yml"
+    return match.group(1)
+
+
+def test_ci_runs_the_real_installer_contract_as_a_required_job():
+    workflow = yaml.safe_load(CI_TEXT)
+    jobs = workflow["jobs"]
+    assert {"unit", "lint", "integration", "installer-contract"} <= set(jobs)
+    contract = ci_job("installer-contract")
+    assert "tools/hermes_contract.py --install --user" in contract
+    assert "continue-on-error" not in jobs["installer-contract"]                  # wajib lulus
+    assert not any("continue-on-error" in step for step in jobs["installer-contract"]["steps"])
+    assert "adduser --disabled-password" in contract                              # user non-root, seperti wizard
+    assert {"3.10", "3.12", "3.13"} <= set(jobs["unit"]["strategy"]["matrix"]["python"])
+    assert "ruff check" in ci_job("lint") and "E9,F63,F7,F82,F401,F811,F841" in CI_TEXT
+    assert workflow["concurrency"]["cancel-in-progress"] is not None
+    integration = ci_job("integration")
+    assert "continue-on-error" in integration and "::warning" in integration      # drift `main`: tidak memblokir, tapi terlihat
+
+
+# --------------------------------------------------------------------------- 3: gateway mati terdeteksi saat diulang
+def test_rerun_restarts_a_gateway_that_died_after_setup(tmp_path, discord, llm, secrets_env):
+    wizard, code = run_end_to_end(tmp_path, llm[0])
+    assert code == 0, wizard.text
+    before = len(wizard.sys.calls)
+    listing = Wizard(tmp_path, wizard.sys)
+    assert listing.main("--list") == 0 and len(wizard.sys.calls) == before        # --list: dari state saja, tanpa perintah
+    dry = Wizard(tmp_path, wizard.sys)
+    assert dry.main("--dry-run", "--non-interactive") == 0 and len(wizard.sys.calls) == before
+
+    wizard.sys.script_cmd("systemctl --user is-active", ks.Result(3, "failed\n"), ks.Result(0, "active\n"))
+    again = Wizard(tmp_path, wizard.sys)
+    assert again.main("--non-interactive", "--answers", str(tmp_path / "jawaban.yaml")) == 0, again.text
+    later = wizard.sys.commands()[before:]
+    assert "hermes gateway install" in later and "hermes gateway start" in later
+    assert "tercatat selesai, tetapi hermes-gateway.service TIDAK aktif" in again.text
+    assert again.text.count("sudah selesai — dilewati") == 12 and "aktif dan stabil" in again.text
+
+
+def test_rerun_reports_a_gateway_that_cannot_be_restarted(tmp_path, discord, llm, secrets_env):
+    wizard, code = run_end_to_end(tmp_path, llm[0])
+    assert code == 0, wizard.text
+    wizard.sys.script_cmd("systemctl --user is-active", ks.Result(3, "failed\n"))
+    wizard.sys.script_cmd("hermes logs", ks.Result(0, "discord.errors.LoginFailure: Improper token has been passed.\n"))
+    again = Wizard(tmp_path, wizard.sys)
+    assert again.main("--non-interactive", "--answers", str(tmp_path / "jawaban.yaml")) == 1
+    assert "✗ Langkah 'gateway' gagal" in again.text and "token bot ditolak Discord" in again.text
+    assert "gateway" not in again.state()["completed"]
+
+
+def test_gateway_check_trusts_only_state_in_read_only_and_no_systemd_modes(tmp_path):
+    system = FakeSystem(tmp_path, with_user=True)
+    system.script_cmd("systemctl --user is-active", ks.Result(3, "inactive\n"))
+    ctx = make_ctx(tmp_path, system=system)
+    assert ks.Gateway().check(ctx) is False and system.calls == []                # belum pernah selesai: tidak memeriksa
+    ctx.state.mark("gateway")
+    ctx.read_only = True
+    assert ks.Gateway().check(ctx) is True and system.calls == []
+    ctx.read_only, ctx.no_systemd = False, True
+    assert ks.Gateway().check(ctx) is True and system.calls == []
+    ctx.no_systemd = False
+    assert ks.Gateway().check(ctx) is False and "systemctl --user is-active hermes-gateway.service" in system.commands()
+
+
+# --------------------------------------------------------------------------- 4: upgrade salinan wizard
+def test_only_kit_install_recopies_over_an_existing_wizard_install(tmp_path, discord, llm, secrets_env):
+    """docs/INSTALL.md "Upgrade": `git pull` di clone, lalu `setup.sh --only kit_install` mengganti salinan lama."""
+    wizard, code = run_end_to_end(tmp_path, llm[0])
+    assert code == 0, wizard.text
+    (wizard.kit / "VERSION").write_text("0.0.1\n")                # salinan "versi lama"
+    (wizard.kit / "berkas-usang.py").write_text("# dihapus di versi baru\n")
+    (wizard.kit / "hermes_team.py").write_text("# usang\n")
+    again = Wizard(tmp_path, wizard.sys)
+    assert again.main("--non-interactive", "--only", "kit_install") == 0, again.text
+    assert (wizard.kit / "VERSION").read_text() == (KIT_DIR / "VERSION").read_text()
+    assert (wizard.kit / "hermes_team.py").read_text() == (KIT_DIR / "hermes_team.py").read_text()
+    assert not (wizard.kit / "berkas-usang.py").exists() and (wizard.kit / ks.KIT_MARKER).is_file()
+    assert not wizard.kit.with_name("hermes-team.lama").exists() and not wizard.kit.with_name("hermes-team.baru").exists()
+    assert [h for h in again.lines if str(h).startswith("[")] == ["[9/14] " + ks.KitInstall.title]
+
+
+# --------------------------------------------------------------------------- 7: bawaan skala dan timer tambahan
+def test_scale_answer_keys_are_not_mistaken_for_secrets(tmp_path):
+    path = tmp_path / "jawaban.yaml"
+    path.write_text(yaml.safe_dump({"daily_token_budget": 1000, "team_daily_token_budget": 5000, "max_llm_parallel": 4,
+                                    "sandbox_idle_timer": False, "gateway_watch_timer": True, "hermes_pin": True,
+                                    "hermes_repin": False}))
+    assert ks.load_answers(path)["daily_token_budget"] == 1000
+    path.write_text(yaml.safe_dump({"webhook_token": "x"}))
+    with pytest.raises(ks.StepError):
+        ks.load_answers(path)
+
+
+def test_recommended_scale_defaults_reach_team_yaml(tmp_path, discord, llm, secrets_env):
+    wizard, code = run_end_to_end(tmp_path, llm[0])               # berkas jawaban TANPA kunci skala
+    assert code == 0, wizard.text
+    team = ht.load_team(wizard.home / ".hermes-team" / "team.yaml")
+    assert (team["scale"]["daily_token_budget"], team["scale"]["team_daily_token_budget"],
+            team["scale"]["max_llm_parallel"]) == (3_000_000, 30_000_000, 10)
+    example = yaml.safe_load((KIT_DIR / "team.example.yaml").read_text())
+    for key, value in example["scale"].items():
+        if key not in {k for k, _q, _r in ks.SCALE_RECOMMENDED}:
+            assert team["scale"][key] == value, key
+
+
+def test_scale_answers_override_and_old_state_keeps_example_values(tmp_path):
+    example = yaml.safe_load((KIT_DIR / "team.example.yaml").read_text())
+    custom = ks.build_team_config(example, DATA, dict(ANSWERS, daily_token_budget="500000", team_daily_token_budget=0,
+                                                      max_llm_parallel="6"))
+    assert (custom["scale"]["daily_token_budget"], custom["scale"]["team_daily_token_budget"],
+            custom["scale"]["max_llm_parallel"]) == (500000, 0, 6)
+    old = ks.build_team_config(example, DATA, ANSWERS)             # state dari wizard lama: kunci skala tidak ada
+    assert old["scale"] == example["scale"]
+
+
+def test_scale_questions_show_the_recommendation_and_enter_accepts_it(tmp_path):
+    answers = {"team_name": "Platform", "timezone": "Asia/Makassar", "threads_personal": True, "usage_reports": False}
+    ctx = make_ctx(tmp_path, answers, non_interactive=False, inputs=["", "0", "banyak", "12"])
+    ks.Options().run(ctx)
+    saved = ctx.state.answers
+    assert (saved["daily_token_budget"], saved["team_daily_token_budget"], saved["max_llm_parallel"]) == ("3000000", "0", "12")
+    text = "\n".join(ctx.lines)
+    assert "[3000000]" in text and "[30000000]" in text and "[10]" in text and "bilangan bulat" in text
+    with pytest.raises(ks.StepError):
+        ks.Options().run(make_ctx(tmp_path, dict(answers, max_llm_parallel="-1")))
+
+
+def extras_ctx(tmp_path, answers=None):
+    system = FakeSystem(tmp_path, with_user=True)
+    ctx = make_ctx(tmp_path, answers, system=system)
+    shutil.copytree(KIT_DIR / "systemd", ctx.kit_dir / "systemd")
+    return ctx, Path(system.users["hermes"].home)
+
+
+def test_sandbox_idle_timer_is_installed_report_only_by_default(tmp_path):
+    ctx, home = extras_ctx(tmp_path)
+    ks.Extras().run(ctx)
+    units = home / ".config" / "systemd" / "user"
+    service = (units / "hermes-sandbox-idle.service").read_text()
+    exec_line = next(line for line in service.splitlines() if line.startswith("ExecStart="))
+    assert "--apply" not in exec_line and str(ctx.kit_dir) in exec_line           # hanya melapor
+    assert "systemctl --user enable --now hermes-sandbox-idle.timer" in ctx.sys.commands()
+    assert not (units / "hermes-gateway-watch.timer").exists()                     # pemantau: bawaan tidak
+    assert not any("gateway-watch" in c for c in ctx.sys.commands())
+    off, home2 = extras_ctx(tmp_path / "b", {"sandbox_idle_timer": False})
+    ks.Extras().run(off)
+    assert not (home2 / ".config" / "systemd" / "user" / "hermes-sandbox-idle.timer").exists()
+
+
+def test_gateway_watch_timer_installs_units_and_a_private_env_template(tmp_path):
+    ctx, home = extras_ctx(tmp_path, {"gateway_watch_timer": True})
+    ks.Extras().run(ctx)
+    units = home / ".config" / "systemd" / "user"
+    service = (units / "hermes-gateway-watch.service").read_text()
+    assert f"ExecStart=/usr/bin/python3 {ctx.kit_dir}/tools/gateway_watch.py\n" in service
+    assert "EnvironmentFile=-%h/.hermes-team/gateway-watch.env" in service
+    assert "systemctl --user enable --now hermes-gateway-watch.timer" in ctx.sys.commands()
+    env_file = home / ".hermes-team" / "gateway-watch.env"
+    assert stat.S_IMODE(env_file.stat().st_mode) == 0o600
+    assert gw.read_env_file(env_file) == {}                                        # templat: semua baris komentar
+    env_file.write_text("HERMES_WATCH_WEBHOOK_URL=https://discord.com/api/webhooks/1/rahasia\n")
+    ks.Extras().run(ctx)                                                           # diulang: isi operator tidak ditimpa
+    assert "rahasia" in env_file.read_text()
+    assert "rahasia" not in "\n".join(ctx.lines)
+
+
+def test_units_carry_no_secrets_and_the_watch_unit_documents_its_limits():
+    for unit in sorted((KIT_DIR / "systemd").glob("hermes-gateway-watch.*")):
+        live = [line for line in unit.read_text().splitlines() if line.strip() and not line.startswith("#")]
+        assert not any("http" in line or "TOKEN" in line.upper() for line in live), unit.name
+    text = (KIT_DIR / "systemd" / "hermes-gateway-watch.service").read_text()
+    assert "server yang sama" in text and "SuccessExitStatus=1" in text
+
+
+# --------------------------------------------------------------------------- 6: pemantau gateway (tools/gateway_watch.py)
+WEBHOOK = "https://discord.com/api/webhooks/123/RAHASIA-webhook-token"
+
+
+def watch_once(tmp_path, word, now, url=WEBHOOK, post_ok=True, **kw):
+    sent, lines = [], []
+
+    def post(target, payload):
+        sent.append((target, payload))
+        return (True, "HTTP 204") if post_ok else (False, "HTTP 500")
+
+    code = gw.watch(run=lambda argv: (0 if word == "active" else 3, word + "\n"), post=post, url=url,
+                    unit="hermes-gateway.service", state_path=tmp_path / "state" / "gateway_watch.json", now=now,
+                    host="srv-uji", out=lines.append, **kw)
+    return code, sent, "\n".join(lines)
+
+
+def test_watch_alerts_after_two_dead_checks_reminds_hourly_and_reports_recovery(tmp_path):
+    assert watch_once(tmp_path, "active", 0)[:2] == (0, [])
+    code, sent, _ = watch_once(tmp_path, "failed", 300)            # pertama kali mati: belum dikabarkan (restart biasa)
+    assert (code, sent) == (1, [])
+    code, sent, text = watch_once(tmp_path, "failed", 600)
+    assert code == 1 and len(sent) == 1 and sent[0][0] == WEBHOOK
+    message = sent[0][1]["content"]
+    assert message.startswith("[MATI]") and "srv-uji" in message and "systemctl --user status hermes-gateway.service" in message
+    assert "OPERASI.md" in message and "RAHASIA" not in text and "discord.com" in text      # host saja, bukan URL-nya
+    assert watch_once(tmp_path, "failed", 900)[1] == []            # tidak membanjiri
+    code, sent, _ = watch_once(tmp_path, "inactive", 600 + 3600)
+    assert len(sent) == 1 and sent[0][1]["content"].startswith("[MASIH MATI]")
+    code, sent, _ = watch_once(tmp_path, "active", 600 + 3900)
+    assert code == 0 and len(sent) == 1 and sent[0][1]["content"].startswith("[PULIH]")
+    assert watch_once(tmp_path, "active", 600 + 4200)[1] == []
+    assert stat.S_IMODE((tmp_path / "state" / "gateway_watch.json").stat().st_mode) == 0o600
+
+
+def test_watch_retries_an_alert_that_could_not_be_sent_and_never_alerts_on_unknown(tmp_path):
+    watch_once(tmp_path, "failed", 0)
+    assert len(watch_once(tmp_path, "failed", 300, post_ok=False)[1]) == 1
+    code, sent, text = watch_once(tmp_path, "failed", 600)        # gagal tadi → dicoba lagi sebagai [MATI], bukan pengingat
+    assert len(sent) == 1 and sent[0][1]["content"].startswith("[MATI]")
+    code, sent, text = watch_once(tmp_path / "b", "Failed to connect to bus: No medium found", 0)
+    assert (code, sent) == (2, []) and "tidak bisa ditentukan" in text and not (tmp_path / "b" / "state").exists()
+
+
+def test_watch_without_a_url_only_logs_and_dry_run_changes_nothing(tmp_path):
+    watch_once(tmp_path, "failed", 0, url="")
+    code, sent, text = watch_once(tmp_path, "failed", 300, url="")
+    assert (code, sent) == (1, []) and "HERMES_WATCH_WEBHOOK_URL belum diisi" in text and "[MATI]" in text
+    code, sent, text = watch_once(tmp_path / "b", "failed", 0, dry_run=True, confirm_runs=1)
+    assert sent == [] and "(dry-run)" in text and not (tmp_path / "b" / "state").exists()
+
+
+@pytest.mark.parametrize("url,ok", [
+    (WEBHOOK, True), ("http://localhost:8080/jalur-rahasia", True), ("http://alert.example.com/jalur-rahasia", False),
+    ("ftp://x/jalur-rahasia", False), ("bukan-url", False)])
+def test_watch_only_posts_over_https(tmp_path, url, ok):
+    assert (gw.webhook_problem(url) is None) is ok
+    problem = gw.webhook_problem(url) or ""
+    assert "jalur-rahasia" not in problem and "RAHASIA" not in problem
+    if not ok:
+        code, sent, text = watch_once(tmp_path, "failed", 0, url=url, confirm_runs=1)
+        assert sent == [] and "TIDAK terkirim" in text
+
+
+def test_watch_posts_real_json_to_a_local_webhook_and_reads_its_env_file(tmp_path):
+    received = []
+
+    class Hook(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_POST(self):
+            body = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+            received.append((self.path, self.headers.get("Content-Type"), self.headers.get("User-Agent"), json.loads(body)))
+            self.send_response(204)
+            self.end_headers()
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Hook)
+    threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.02}, daemon=True).start()
+    try:
+        url = f"http://127.0.0.1:{server.server_address[1]}/api/webhooks/1/abc"
+        assert gw.post_webhook(url, {"content": "halo"}) == (True, "HTTP 204")
+        env_file = tmp_path / "gateway-watch.env"
+        env_file.write_text(f"# komentar\n\nHERMES_WATCH_WEBHOOK_URL=\"{url}\"\nLAIN=1\n")
+        assert gw.read_env_file(env_file) == {"HERMES_WATCH_WEBHOOK_URL": url, "LAIN": "1"}
+        proc = subprocess.run([sys.executable, "-I", str(KIT_DIR / "tools" / "gateway_watch.py"), "--test", "--env-file",
+                               str(env_file)], capture_output=True, text=True, env={"PATH": "/usr/bin:/bin", "HOME": str(tmp_path)})
+        assert proc.returncode == 0 and "pesan uji terkirim ke 127.0.0.1" in proc.stdout and "abc" not in proc.stdout
+    finally:
+        server.shutdown()
+        server.server_close()
+    assert [r[0] for r in received] == ["/api/webhooks/1/abc"] * 2
+    assert received[0][1] == "application/json" and received[0][2] == gw.USER_AGENT and received[1][3]["content"].startswith("[UJI]")
+    assert gw.post_webhook("http://127.0.0.1:9/x", {"content": "x"})[0] is False
+    empty = subprocess.run([sys.executable, "-I", str(KIT_DIR / "tools" / "gateway_watch.py"), "--test"], capture_output=True,
+                           text=True, env={"PATH": "/usr/bin:/bin", "HOME": str(tmp_path / "kosong")})
+    assert empty.returncode == 2 and "belum diisi" in empty.stderr
+
+
+def test_watch_finds_the_installed_unit_like_the_wizard_does(tmp_path):
+    assert gw.find_unit(tmp_path / "tidak-ada") == "hermes-gateway.service"
+    (tmp_path / "hermes-gateway-team.service").write_text("")
+    (tmp_path / "lain.service").write_text("")
+    assert gw.find_unit(tmp_path) == "hermes-gateway-team.service"
+    (tmp_path / "hermes-gateway.service").write_text("")
+    assert gw.find_unit(tmp_path) == "hermes-gateway.service"
+    assert gw.gateway_state(lambda argv: (0, "active\n"), "u") == ("up", "active")
+    assert gw.gateway_state(lambda argv: (3, "activating\n"), "u") == ("down", "activating")
+    assert gw.DEFAULT_UNIT == ks.Gateway.DEFAULT_UNIT
+
+
+# --------------------------------------------------------------------------- 8: platform
+def test_preflight_stops_on_an_os_without_apt_before_anything_is_changed(tmp_path):
+    system = FakeSystem(tmp_path)
+    system.present.discard("apt-get")
+    system.os_release = lambda: {"ID": "fedora", "PRETTY_NAME": "Fedora 41"}
+    wizard = Wizard(tmp_path, system)
+    assert wizard.main("--non-interactive") == 1
+    assert "✗ Langkah 'preflight' gagal: OS 'Fedora 41' tidak didukung" in wizard.text
+    assert "Debian/Ubuntu" in wizard.text and "docs/INSTALL.md" in wizard.text
+    assert system.calls == [] and "[2/14]" not in wizard.text and wizard.state()["completed"] == []
+
+
+def test_missing_docker_group_gives_an_actionable_error_instead_of_a_usermod_failure(tmp_path):
+    system = FakeSystem(tmp_path, with_user=True)
+    system.groups.clear()
+    system.missing_groups.add("docker")
+    ctx = make_ctx(tmp_path, system=system)
+    with pytest.raises(ks.StepError) as err:
+        ks.LinuxUser().run(ctx)
+    assert "grup Linux `docker` tidak ada" in err.value.message
+    assert "rootless" in err.value.cause and "snap" in err.value.cause
+    assert "snap remove docker" in err.value.fix and "groupadd docker" in err.value.fix
+    assert not any(c.startswith("usermod") for c in system.commands())
+    system.missing_groups.clear()
+    ks.LinuxUser().run(make_ctx(tmp_path, system=system))
+    assert "usermod -aG docker hermes" in system.commands()
+
+
+def test_docs_state_supported_platforms_and_the_supervised_nature_of_the_wizard():
+    readme = (KIT_DIR / "README.md").read_text()
+    install = (KIT_DIR / "docs" / "INSTALL.md").read_text()
+    operasi = (KIT_DIR / "docs" / "OPERASI.md").read_text()
+    for text in (readme, install):
+        assert "Debian" in text and "Ubuntu" in text and "systemd" in text
+    assert "didampingi" in readme and "Developer Portal" in readme
+    assert "pull` (atau salin versi baru)" not in install and "--only kit_install" in install
+    assert ".kit-installed" in install and "tanpa** `.git`" in install and "### Rollback" in install
+    assert 'id="upgrade-dari-v30"' in install and "[[" not in install
+    for needle in ("state.json", "getent passwd", "--only kit_install", "Gateway mati", "Belum pernah diuji di server sungguhan",
+                   "hermes-gateway-watch", "docker run --rm"):
+        assert needle in operasi, needle
+    assert "--from hermes_install` akan melewati" not in operasi

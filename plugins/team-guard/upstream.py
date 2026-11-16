@@ -13,7 +13,7 @@ Internal yang disentuh (semuanya dibungkus getattr/try):
   gateway/profile_routing.py   parse_profile_routes, match_profile_route
   gateway/control_socket.py    rescan_gateway_profiles
   gateway/run.py               _multiplex_profile_homes; GatewayRunner._running_agent_count / _is_session_running
-                               / _session_key_for_source / .config.profile_routes
+                               / _session_key_for_source / .config.profile_routes / .adapters
   gateway/run_shutdown.py      GatewayRunner.request_restart (kode keluar 75 → supervisor)
   gateway/restart.py           is_gateway_supervisor_process, is_container_restart_context
   gateway/platforms/event.py   MessageEvent.get_command
@@ -22,6 +22,11 @@ Internal yang disentuh (semuanya dibungkus getattr/try):
   tools/env_passthrough.py     _is_hermes_provider_credential, register_env_passthrough
   agent/redact.py              register_vault_redaction_value
   hermes_constants.py          get_hermes_home
+Pendaftaran kapabilitas TIDAK otomatis dari kode, tetapi dijaga uji: tiap metode `HermesGateway` yang menyentuh
+internal Hermes wajib diberi `@uses("<kunci _PROBES>", …)`, dan `TestUpstreamProbeCoverage` (tests/test_plugin.py)
+memindai AST berkas ini — impor internal, atribut objek hulu (`gateway`, `runner`, `adapter`, `event`, …), dan nama
+privat — lalu gagal bila ada yang tidak tercakup probe yang dideklarasikan metodenya, atau ada probe yatim.
+
 Modul sintetis `hermes_plugins.team_guard[__home_<digest>]` (skema penamaan loader plugin) hanya dirujuk di
 `shared.py` sebagai penjelasan; tidak ada kode yang bergantung pada nama itu.
 """
@@ -57,6 +62,10 @@ class UpstreamMissing(Exception):
 # ---------------------------------------------------------------------------------------------------------
 # Tabel kapabilitas: SATU entri per API internal yang dipakai. (kunci, modul-modul tempat mencarinya,
 # kelas pemilik atau "", nama, untuk apa). Daftar modul > 1 = nama bisa berada di mixin.
+# Pemilik bertitik ("GatewayRunner.config") = atribut DATA di objek bersarang (bukan fungsi/metode): tidak bisa
+# diperiksa di kelasnya, jadi probe-nya hanya mencari pemakaian/penugasan nama itu di sumber modul-modul tsb.
+# (lebih lemah daripada probe fungsi; nama modul `gateway.config` / `gateway.platforms.base` adalah dugaan
+# terbaik dan hanya menambah tempat mencari).
 _PROBES: tuple[tuple[str, tuple[str, ...], str, str, str], ...] = (
     ("gateway.profile_routing.parse_profile_routes", ("gateway.profile_routing",), "", "parse_profile_routes",
      "live reload: urai rute profile"),
@@ -94,7 +103,35 @@ _PROBES: tuple[tuple[str, tuple[str, ...], str, str, str], ...] = (
      "penyamaran: nilai tersimpan ikut redaktor Hermes"),
     ("hermes_constants.get_hermes_home", ("hermes_constants",), "", "get_hermes_home",
      "lokasi HERMES_HOME profile yang memuat plugin"),
+    ("GatewayRunner.adapters", ("gateway.run",), "GatewayRunner", "adapters",
+     "balasan sampingan (penolakan, kabar admin) lewat adapter Discord gateway"),
+    ("GatewayRunner.config.profile_routes", ("gateway.run", "gateway.config", "gateway.profile_routing"),
+     "GatewayRunner.config", "profile_routes", "live reload: rute profile ditulis ke gateway yang sedang jalan"),
+    ("DiscordAdapter.config.extra", ("plugins.platforms.discord.adapter", "gateway.config", "gateway.platforms.base"),
+     "DiscordAdapter.config", "extra", "live reload: gerbang channel di PlatformConfig.extra"),
 )
+
+
+def uses(*keys: str) -> Callable[[Any], Any]:
+    """Deklarasi: metode ini menyentuh internal Hermes yang diperiksa probe `keys` (kunci `_PROBES`).
+    Kunci yang tidak ada di tabel = salah ketik → gagal saat modul dimuat, bukan diam-diam."""
+    known = {entry[0] for entry in _PROBES}
+    unknown = [k for k in keys if k not in known]
+    if unknown:
+        raise KeyError(f"@uses: kunci probe tidak dikenal: {unknown}")
+
+    def mark(fn: Any) -> Any:
+        fn.__upstream_uses__ = tuple(keys)
+        return fn
+    return mark
+
+
+def probe_names(key: str) -> set[str]:
+    """Nama-nama yang dicakup satu probe: bagian kuncinya + nama atributnya (dipakai uji cakupan)."""
+    for entry in _PROBES:
+        if entry[0] == key:
+            return set(key.split(".")) | set(entry[2].split(".")) | {entry[3]}
+    return set()
 
 
 def _read_limited(path: Path, root: Path) -> Optional[str]:
@@ -141,7 +178,15 @@ def _source_text(module: str) -> Optional[str]:
 
 
 def _probe(modules: tuple[str, ...], owner: str, attr: str) -> dict:
-    """{available, reason}. Modul sudah dimuat → periksa objeknya langsung; belum → cari namanya di sumber."""
+    """{available, reason}. Modul sudah dimuat → periksa objeknya langsung; belum → cari namanya di sumber.
+    Pemilik bertitik (atribut data bersarang) → hanya pencarian `.nama` / `nama =` di sumber."""
+    if "." in owner:
+        pattern = re.compile(rf"\.{re.escape(attr)}\b|\b{re.escape(attr)}\s*(?::[^=\n]+)?=")
+        for module in modules:
+            text = _source_text(module)
+            if text and pattern.search(text):
+                return {"available": True, "reason": f"atribut data dipakai di sumber {module}"}
+        return {"available": False, "reason": f"{owner}.{attr} tidak ditemukan di sumber " + ", ".join(modules)}
     seen_missing = []
     for module in modules:
         mod = sys.modules.get(module)
@@ -201,28 +246,45 @@ def note_ctx(what: str, ok: bool, reason: str = "") -> None:
     table[what] = {"available": bool(ok), "reason": reason or ("terdaftar" if ok else "ditolak/tidak ada")}
 
 
+def note_health(what: str, ok: bool, reason: str = "") -> bool:
+    """Catat kesehatan satu bagian plugin yang BUKAN API Hermes (mis. `budget.ledger`, `limiter.<nama>`) supaya
+    tampil di capabilities.json dengan bentuk yang sama ({available, reason}) dan terbaca kit_doctor.
+    True bila isinya berubah (pemanggil lalu menulis ulang berkasnya)."""
+    table = shared.slot("upstream:health", dict)
+    entry = {"available": bool(ok), "reason": str(reason or ("sehat" if ok else "bermasalah"))[:300]}
+    if table.get(what) == entry:
+        return False
+    table[what] = entry
+    return True
+
+
 class HermesGateway:
     """Fasad internal Hermes. Tanpa state; aman dibuat di mana saja. Uji memakai subkelas yang menimpa
     `parse_profile_routes` / `match_profile_route` / `rescan` / `served_profiles` / `restart`."""
 
     # ------------------------------------------------------------------ rute & multiplexer
+    @uses("gateway.profile_routing.parse_profile_routes")
     def parse_profile_routes(self, raw: list) -> list:
         from gateway.profile_routing import parse_profile_routes  # type: ignore[import-not-found]
         return parse_profile_routes(raw)
 
+    @uses("gateway.profile_routing.match_profile_route")
     def match_profile_route(self, routes: list, **kwargs: Any) -> Any:
         from gateway.profile_routing import match_profile_route  # type: ignore[import-not-found]
         return match_profile_route(routes, "discord", **kwargs)
 
+    @uses("gateway.control_socket.rescan_gateway_profiles")
     def rescan(self, home: Any) -> Optional[dict]:
         """Blocking (soket kontrol) — panggil dari thread, bukan dari event loop."""
         from gateway.control_socket import rescan_gateway_profiles  # type: ignore[import-not-found]
         return rescan_gateway_profiles(Path(str(home)))
 
+    @uses("gateway.run._multiplex_profile_homes")
     def served_profiles(self, config: Any) -> Optional[set]:
         from gateway.run import _multiplex_profile_homes  # type: ignore[import-not-found]
         return {name for name, _home in _multiplex_profile_homes(config)}
 
+    @uses("gateway.restart.is_gateway_supervisor_process", "gateway.restart.is_container_restart_context", "GatewayRunner.request_restart")
     def restart(self, runner: Any) -> None:
         from gateway.restart import (  # type: ignore[import-not-found]
             is_container_restart_context, is_gateway_supervisor_process)
@@ -230,16 +292,19 @@ class HermesGateway:
         runner.request_restart(detached=not via_service, via_service=via_service)
 
     # ------------------------------------------------------------------ GatewayRunner.config.profile_routes
+    @uses("GatewayRunner.config.profile_routes")
     def has_profile_routes(self, runner: Any) -> bool:
         config = getattr(runner, "config", None)
         return config is not None and hasattr(config, "profile_routes")
 
+    @uses("GatewayRunner.config.profile_routes")
     def read_profile_routes(self, runner: Any) -> Any:
         try:
             return runner.config.profile_routes
         except Exception:
             raise UpstreamMissing("GatewayRunner.config.profile_routes tidak ditemukan") from None
 
+    @uses("GatewayRunner.config.profile_routes")
     def write_profile_routes(self, runner: Any, parsed: list) -> None:
         """Tulis rute di tempat (pemegang referensi lama ikut melihatnya). Melempar UpstreamMissing."""
         config = getattr(runner, "config", None)
@@ -255,6 +320,7 @@ class HermesGateway:
             raise UpstreamMissing(f"profile_routes tidak bisa ditulis ({type(exc).__name__}: {exc})") from None
 
     # ------------------------------------------------------------------ DiscordAdapter (gerbang channel)
+    @uses("DiscordAdapter._gate_env_snapshot", "DiscordAdapter.config.extra")
     def write_channel_gates(self, adapter: Any, allowed: str, free: str) -> list[str]:
         """Gerbang channel hidup di dua tempat: snapshot env per-adapter (menang untuk allowed_channels) dan
         PlatformConfig.extra (menang untuk free_response_channels). Keduanya ditulis; os.environ hanya
@@ -273,6 +339,7 @@ class HermesGateway:
                 os.environ[key] = value
         return touched
 
+    @uses("DiscordAdapter._get_allowed_channels", "DiscordAdapter._discord_free_response_channels")
     def read_channel_gate(self, adapter: Any, which: str) -> set:
         """Himpunan channel yang kini dipakai adapter: which = "allowed" | "free". Melempar UpstreamMissing."""
         getter = {"allowed": "_get_allowed_channels", "free": "_discord_free_response_channels"}[which]
@@ -285,6 +352,7 @@ class HermesGateway:
             raise UpstreamMissing(f"DiscordAdapter.{getter} gagal ({type(exc).__name__}: {exc})") from None
 
     # ------------------------------------------------------------------ GatewayRunner (sesi)
+    @uses("GatewayRunner._running_agent_count")
     def running_agent_count_fn(self, gateway: Any) -> Optional[Callable[[], Any]]:
         fn = getattr(gateway, "_running_agent_count", None)
         return fn if callable(fn) else None
@@ -299,11 +367,13 @@ class HermesGateway:
         except Exception:
             return None
 
+    @uses("GatewayRunner._is_session_running")
     def session_probe(self, gateway: Any) -> Optional[Callable[[str], bool]]:
         """`GatewayRunner._is_session_running` (kunci sesi → bool) bila ada."""
         probe = getattr(gateway, "_is_session_running", None)
         return probe if callable(probe) else None
 
+    @uses("GatewayRunner._session_key_for_source")
     def session_key(self, gateway: Any, source: Any) -> str:
         """Kunci sesi gateway untuk `source`; "" bila tidak bisa diketahui."""
         try:
@@ -311,6 +381,7 @@ class HermesGateway:
         except Exception:
             return ""
 
+    @uses("GatewayRunner._session_key_for_source", "GatewayRunner._is_session_running")
     def session_running(self, gateway: Any, source: Any) -> bool:
         """Pesan susulan ke sesi yang sedang jalan masuk antrean sesi Hermes sendiri → tidak ikut antre."""
         try:
@@ -319,10 +390,26 @@ class HermesGateway:
         except Exception:
             return False
 
+    @uses("GatewayRunner.request_restart")
     def restart_capable(self, runner: Any) -> bool:
         return self.running_agent_count_fn(runner) is not None and callable(getattr(runner, "request_restart", None))
 
+    # ------------------------------------------------------------------ GatewayRunner.adapters
+    @uses("GatewayRunner.adapters")
+    def discord_adapter(self, gateway: Any, platform: Any = None) -> Any:
+        """Adapter untuk `platform` (kunci persis di `gateway.adapters`), kalau tidak ada adapter Discord
+        mana pun; None bila tidak ada. Dipakai untuk balasan sampingan `adapter.send(chat_id, teks)`."""
+        adapters = getattr(gateway, "adapters", None)
+        if not isinstance(adapters, dict) or not adapters:
+            return None
+        found = adapters.get(platform) if platform is not None else None
+        if found is None:
+            found = next((a for p, a in adapters.items()
+                          if str(getattr(p, "value", p)).lower() == "discord"), None)
+        return found
+
     # ------------------------------------------------------------------ MessageEvent
+    @uses("MessageEvent.get_command")
     def event_get_command(self, event: Any) -> tuple[bool, Optional[str]]:
         """(ada?, perintah). `event.get_command()` milik Hermes bila ada; gagal → (True, None) = pesan biasa."""
         getter = getattr(event, "get_command", None)
@@ -335,6 +422,7 @@ class HermesGateway:
             return True, None
 
     # ------------------------------------------------------------------ env passthrough & penyamaran
+    @uses("tools.env_passthrough._is_hermes_provider_credential")
     def provider_credential_checker(self) -> Optional[Callable[[str], bool]]:
         """Daftar nama kredensial yang dikelola Hermes versi ini (bila bisa diimpor)."""
         try:
@@ -343,6 +431,7 @@ class HermesGateway:
         except Exception:
             return None
 
+    @uses("tools.env_passthrough.register_env_passthrough")
     def register_env_passthrough(self, names: Iterable[str]) -> bool:
         """Izinkan nama diteruskan ke sandbox tanpa menunggu cache config (nilai tetap diselesaikan per
         profile oleh Hermes). Diam bila API tidak ada."""
@@ -353,6 +442,7 @@ class HermesGateway:
         except Exception:
             return False
 
+    @uses("agent.redact.register_vault_redaction_value")
     def register_vault_values(self, values: Iterable[str], limit: int = 32) -> None:
         """Nilai PERSIS ke redaktor bawaan Hermes (lapisan tambahan; alasannya di hooks.ProfileHooks)."""
         try:
@@ -366,6 +456,7 @@ class HermesGateway:
             log_once("vault-redaction", "pendaftaran nilai ke redaktor Hermes gagal (%s)", exc)
 
     # ------------------------------------------------------------------ HERMES_HOME
+    @uses("hermes_constants.get_hermes_home")
     def hermes_home(self) -> Path:
         """HERMES_HOME profile yang sedang memuat plugin (loader mengikatnya selama register())."""
         try:
@@ -377,12 +468,15 @@ class HermesGateway:
     # ------------------------------------------------------------------ kapabilitas
     def capabilities(self) -> dict[str, dict]:
         """{nama API: {available, reason}} — satu entri per internal Hermes yang dipakai, ditambah entri
-        `ctx.<pendaftaran>` untuk API PluginContext yang gagal/berhasil didaftarkan. Tidak mengimpor kode hulu."""
+        `ctx.<pendaftaran>` untuk API PluginContext yang gagal/berhasil didaftarkan, dan entri kesehatan plugin
+        (`note_health`: `budget.ledger`, `limiter.<nama>`, `dispatch.<tahap>`). Tidak mengimpor kode hulu."""
         probed = shared.slot("upstream:probes", lambda: {
             key: _probe(modules, owner, attr) for key, modules, owner, attr, _why in _PROBES})
         out = {key: dict(value) for key, value in probed.items()}
         for what, entry in sorted(shared.slot("upstream:ctx", dict).items()):
             out[f"ctx.{what}"] = dict(entry)
+        for what, entry in sorted(shared.slot("upstream:health", dict).items()):
+            out.setdefault(str(what), dict(entry))        # budget.ledger, limiter.<nama>, dispatch.<tahap>
         return out
 
     def capabilities_document(self, wall: Callable[[], float] = time.time) -> dict:

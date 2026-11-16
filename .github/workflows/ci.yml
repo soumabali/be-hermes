@@ -4,39 +4,59 @@ on:
   push:
   pull_request:
   schedule:
-    - cron: "17 2 * * 1"   # mingguan: deteksi dini perubahan Hermes yang merusak kit
+    - cron: "17 2 * * 1"   # mingguan: deteksi dini perubahan Hermes / installer hulu yang merusak kit
   workflow_dispatch:
     inputs:
       hermes_ref:
-        description: "Ref hermes-agent untuk uji integrasi (kosong = pakai HERMES_REF di bawah)"
+        description: "Ref hermes-agent untuk uji integrasi (kosong = isi berkas HERMES_REF)"
         required: false
 
 permissions:
   contents: read
 
-env:
-  # Versi Hermes yang dipakai tim. Naikkan lewat PR setelah uji integrasi hijau,
-  # baru jalankan `hermes update` di server.
-  HERMES_REF: 5d87ea2242c7e5a4ce76098b6113f04bf11348c6
+# Satu putaran per branch: push dan pull_request untuk branch yang sama berbagi grup (head_ref = nama branch PR), dan
+# push baru membatalkan putaran lama yang belum selesai. Branch utama dan jadwal mingguan tidak pernah dibatalkan.
+concurrency:
+  group: ci-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: ${{ github.event_name != 'schedule' && github.ref_name != github.event.repository.default_branch }}
+
+# Versi Hermes yang dipakai tim ada di SATU tempat: berkas HERMES_REF di akar repo. Job di bawah membacanya (langkah
+# "Baca HERMES_REF"), dan wizard memasang commit yang sama (kit_setup.py: hermes_install_command). Naikkan lewat PR
+# setelah uji integrasi hijau, baru perbarui Hermes di server (docs/OPERASI.md).
 
 jobs:
+  lint:
+    # Ruleset konservatif: galat sintaks dan pyflakes dasar (nama tak dikenal, impor/variabel tak terpakai, definisi ganda).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install ruff
+      - run: ruff check --select E9,F63,F7,F82,F401,F811,F841 .
+
   unit:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        python: ["3.10", "3.11", "3.14"]   # 3.10 = python3 bawaan Ubuntu 22.04
+        python: ["3.10", "3.11", "3.12", "3.13", "3.14"]   # 3.10 = python3 Ubuntu 22.04, 3.12 = Ubuntu 24.04, 3.13 = Debian 13
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
       - run: pip install -r requirements-dev.txt
       - run: python -m pytest tests -q
 
   integration:
     # Uji yang butuh Hermes asli (resolver rute, loader plugin, daftar toolset/config). Hermes dipasang
     # dengan uv dari lockfile-nya sendiri: pip biasa tidak bisa menyelesaikan dependensinya.
+    # Kaki `main` tidak memblokir (continue-on-error), tetapi kegagalannya TIDAK diam: langkah terakhir memasang
+    # anotasi ::warning dan ringkasan job, supaya pergeseran Hermes hulu terlihat sebelum HERMES_REF dinaikkan.
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -45,11 +65,24 @@ jobs:
     continue-on-error: ${{ matrix.hermes == 'main' }}
     steps:
       - uses: actions/checkout@v4
+      - name: Baca HERMES_REF
+        run: |
+          ref="$(grep -v '^[[:space:]]*#' HERMES_REF | awk 'NF {print $1; exit}')"
+          if ! printf '%s' "$ref" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error file=HERMES_REF::HERMES_REF harus berisi satu SHA commit 40 heksadesimal (isi sekarang: '$ref')"
+            exit 1
+          fi
+          echo "HERMES_REF=$ref" >> "$GITHUB_ENV"
       - uses: actions/checkout@v4
         with:
           repository: NousResearch/hermes-agent
           ref: ${{ matrix.hermes == 'main' && 'main' || (inputs.hermes_ref || env.HERMES_REF) }}
           path: .hermes-src
+      - name: Catat commit Hermes yang diuji
+        run: |
+          sha="$(git -C .hermes-src rev-parse HEAD)"
+          echo "HERMES_TESTED_SHA=$sha" >> "$GITHUB_ENV"
+          echo "Hermes (${{ matrix.hermes }}): \`$sha\` — HERMES_REF: \`$HERMES_REF\`" >> "$GITHUB_STEP_SUMMARY"
       - uses: astral-sh/setup-uv@v5
       - name: Pasang Hermes (uv, lockfile upstream)
         working-directory: .hermes-src
@@ -66,3 +99,40 @@ jobs:
           PYTHONPATH: ${{ github.workspace }}/.hermes-src
           KIT_REQUIRE_HERMES: "1"
           HERMES_SOURCE_DIR: ${{ github.workspace }}/.hermes-src   # uji drift nama env /env-set
+      - name: Hermes main bergeser dari kit (peringatan, tidak memblokir)
+        if: ${{ failure() && matrix.hermes == 'main' }}
+        run: |
+          msg="Uji integrasi GAGAL terhadap hermes-agent main (${HERMES_TESTED_SHA:-commit tidak diketahui}). Kit masih diuji hijau hanya pada HERMES_REF ($HERMES_REF). Jangan naikkan HERMES_REF atau menjalankan 'hermes update' di server sebelum ini diperbaiki."
+          echo "::warning title=Hermes main bergeser dari kit::$msg"
+          {
+            echo "### ⚠ Hermes \`main\` bergeser dari kit"
+            echo
+            echo "$msg"
+            echo
+            echo "Lihat langkah yang gagal di job ini (kaki matriks \`main\`)."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  installer-contract:
+    # Installer + CLI Hermes ASLI. Uji unit hanya membuktikan wizard terhadap tiruan; job ini menjalankan installer hulu
+    # dengan perintah yang dirangkai wizard sendiri (kit_setup.hermes_install_command, dipin ke HERMES_REF), sebagai
+    # user non-root lewat runuser + lingkungan bersih (kit_setup.user_command) — persis jalur langkah hermes_install —
+    # lalu memeriksa daftar di tools/hermes_contract.py: lokasi launcher, `hermes --version`, commit terpasang, dan tiap
+    # subperintah/flag yang dipakai wizard dan kit (lewat --help; gateway tidak dijalankan).
+    # WAJIB lulus (tanpa continue-on-error): bila gagal, wizard akan gagal dengan cara yang sama di server.
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - name: Prasyarat wizard (sama dengan setup.sh dan langkah packages)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3 python3-yaml git curl ca-certificates
+      - name: User Linux tanpa sudo (sama dengan langkah linux_user)
+        run: sudo adduser --disabled-password --gecos "" hermes-ci
+      - name: Kontrak (tanpa memasang apa pun)
+        run: python3 tools/hermes_contract.py --list
+      - name: Installer hulu persis seperti wizard, lalu periksa kontrak CLI
+        run: sudo python3 tools/hermes_contract.py --install --user hermes-ci
+      - name: Log installer (bila gagal)
+        if: failure()
+        run: sudo tail -n 120 /home/hermes-ci/.hermes/logs/install.log || true

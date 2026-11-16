@@ -13,6 +13,7 @@ import inspect
 import json
 import logging
 import os
+import re
 import stat
 import subprocess
 import sys
@@ -1168,7 +1169,46 @@ class TestDispatchGate:
         self.rt.state.hold(S.U_CITRA, "x")
         assert self.go(d, event(S.U_CITRA, S.CH_SHARED))["action"] == "skip"
         self.rt.state.unhold(S.U_CITRA)
+        # Lepas tahanan saja BELUM cukup: non-admin dilayani hanya bila terdaftar aktif di roster.
+        got = self.go(d, event(S.U_CITRA, S.CH_SHARED))
+        assert got["action"] == "skip" and "belum terdaftar" in got["reason"]
+        S.roster_add(self.env.roster, S.U_CITRA, "citra", "610000000000000003")
+        self.env.save()
         assert self.go(d, event(S.U_CITRA, S.CH_SHARED)) is None
+
+    # --- E2. punya role tetapi belum ada di roster (role diberikan saat bot offline, sebelum susulan)
+    @pytest.mark.parametrize("chat", [S.CH_SHARED, S.CH_BUDI, S.CH_ADMIN])
+    def test_unlisted_user_is_refused_everywhere_until_in_roster(self, d, chat):
+        """Regresi: hanya `held`/`inactive` yang ditolak; orang ber-role yang belum ada di roster dilayani."""
+        got = self.go(d, event(S.U_CITRA, chat))
+        assert got == {"action": "skip", "reason": "team-guard: belum terdaftar di roster"}
+        assert len(self.said()) == 1 and "belum terdaftar" in self.said()[0]
+        assert self.go(d, event(S.U_CITRA, chat, "/stop"))["action"] == "skip"     # perintah kendali pun tidak
+
+    def test_unlisted_user_is_refused_before_scrub_and_limiters(self, d):
+        calls = []
+        self.rt.limiters[:] = [type("L", (), {"name": "x", "check": staticmethod(
+            lambda ctx: calls.append(ctx.uid) or _async(None))})()]
+        raw = Raw()
+        got = self.go(d, event(S.U_CITRA, S.CH_SHARED, "ghp_" + "A1b2C3d4" * 5, raw_message=raw))
+        assert got["action"] == "skip" and calls == [] and not raw.deleted
+
+    def test_admin_listed_only_in_admins_is_served(self, d):
+        assert self.rt.roster().user_status(S.ADMIN) == "admin" and S.ADMIN not in self.rt.roster().users
+        assert self.go(d, event(S.ADMIN, S.CH_SHARED)) is None
+
+    def test_held_state_lost_with_unreadable_onboarding_file_still_refuses(self, env):
+        """Regresi: onboarding.json rusak → `held` kosong → orang yang ditahan dilayani."""
+        path = env.state_dir / "onboarding.json"
+        first = statemod.StateStore(path)
+        first.hold(S.U_CITRA, "role diberikan oleh orang lain")
+        path.write_text('{"held": {"5000', encoding="utf-8")                  # terpotong saat ditulis
+        rt = env.rt()
+        assert rt.state.unreadable and not rt.state.is_held(S.U_CITRA)
+        d = dispatch.Dispatcher(rt, clock=S.Clock(), sleep=S.Clock().sleep)
+        got = run(d.handle(event=event(S.U_CITRA, S.CH_SHARED), gateway=env.runner, session_store=None))
+        assert got["action"] == "skip" and "belum terdaftar" in got["reason"]
+        assert run(d.handle(event=event(S.U_BUDI, S.CH_BUDI), gateway=env.runner, session_store=None)) is None
 
     def test_member_already_in_roster_is_never_treated_as_held(self, d):
         """Admin sudah menyetujui (anggota aktif di roster) → tahanan lama tidak boleh memblokirnya."""
@@ -2185,7 +2225,7 @@ class TestSlashCommandGate(ScaleBase):
         with caplog.at_level(logging.WARNING, logger="team-guard"):
             got = self.go(d, event(S.U_BUDI, S.CH_BUDI, f"pakai {token} ya", raw_message=Raw()))
         assert got and got["action"] == "rewrite" and token not in got["text"]
-        assert any("token tersamar" in r.getMessage() for r in caplog.records)
+        assert any("pembatas 'rate' gagal" in r.getMessage() for r in caplog.records)
         assert self.go(d, event(S.U_BUDI, S.CH_BUDI, "halo")) is None         # tanpa token: tetap gagal-terbuka
 
 
@@ -2519,7 +2559,8 @@ class TestCronGuard:
     @pytest.mark.parametrize("schedule", ["", "   ", None, 15, "sesekali saja", "every now and then", "in a while",
                                           "*/0 * * * *", "61 * * * *", "H * * * *", "50-10/20 * * * *",
                                           "*/5 * * * * 2026", "* * * * * * * *", "0 9 * * * 0 tahun",
-                                          "0 9 * * * 61", "5/ * * * *", "every monday", "@hourly"])
+                                          "0 9 * * * 61", "5/ * * * *", "every monday", "@reboot", "@aneh",
+                                          "every\u200b1m", "every 1.5h", "30 x"])
     def test_unparseable_schedules_return_none(self, schedule):
         assert cronguard.schedule_interval_minutes(schedule) is None
 
@@ -2541,10 +2582,42 @@ class TestCronGuard:
         assert msg and "tidak bisa diperiksa" in msg and "every 15m" in msg and schedule.strip()[:20] in msg
         assert not any("diloloskan" in r.getMessage() for r in caplog.records)
 
-    @pytest.mark.parametrize("schedule", ["kapan-kapan", "sesekali saja", "every now and then", "@hourly",
-                                          "besok pagi (kira-kira) jam 9.30 ya", "every monday"])
-    def test_free_text_is_not_treated_as_cron(self, schedule):
+    @pytest.mark.parametrize("schedule", ["kapan-kapan", "sesekali saja", "every now and then", "@aneh",
+                                          "besok pagi (kira-kira) jam 9.30 ya", "every monday", "every\u200b1m",
+                                          "every 1.5h", 30, ["every 1m"], {"every": "1m"}, True])
+    def test_free_text_is_not_cron_shaped_and_is_rejected_with_the_accepted_forms(self, schedule):
+        """Regresi: jadwal yang tidak dipahami dulu DILOLOSKAN (mengandalkan Hermes menolaknya)."""
         assert not cronguard.looks_like_cron(schedule)
+        msg = cronguard.check_cron_call("cronjob_manage", {"action": "create", "schedule": schedule}, 15)
+        assert msg and "tidak dipahami" in msg and "every 15m" in msg and "0 9 * * *" in msg and "in 30m" in msg
+        assert cronguard.check_cron_call("cronjob_manage", {"action": "create", "schedule": schedule}, 0) is None
+
+    @pytest.mark.parametrize("schedule,every", [
+        ("every\t1m", "1 menit"), ("every\n 5 \t minutes", "5 menit"), ("  EVERY\xa02M ", "2 menit"),
+        ("30s", "30 detik"), ("every 90s", "1.5 menit"), ("every 45 seconds", "45 detik"), ("10 secs", "10 detik"),
+        ("every second", "1 detik"), ("*/5\t*\t*\t*\t*", "5 menit")])
+    def test_whitespace_and_seconds_forms_are_parsed_and_blocked(self, schedule, every):
+        """Regresi: `every\\t1m`, `30s`, `every 90s` tidak terurai → diloloskan."""
+        msg = cronguard.check_cron_call("cronjob_manage", {"action": "create", "schedule": schedule}, 15)
+        assert msg and f"tiap ±{every}" in msg and "15 menit" in msg
+
+    @pytest.mark.parametrize("schedule,minutes", [("@hourly", 60), ("@daily", 1440), ("@midnight", 1440),
+                                                  ("@weekly", 10080), ("@monthly", 40320), ("@yearly", 525600),
+                                                  ("@annually", 525600), (" @Hourly ", 60), ("every 120s", 2),
+                                                  ("90s", 1.5), ("every\t30m", 30)])
+    def test_macros_and_seconds_have_intervals(self, schedule, minutes):
+        assert cronguard.schedule_interval_minutes(schedule) == minutes
+        blocked = cronguard.check_cron_call("cronjob_manage", {"action": "create", "schedule": schedule}, 90)
+        assert bool(blocked) == (minutes < 90)
+
+    def test_reboot_macro_is_rejected_by_name(self):
+        msg = cronguard.check_cron_call("cronjob_manage", {"action": "create", "schedule": " @reboot\n"}, 15)
+        assert msg and "@reboot" in msg and "tidak diizinkan" in msg
+
+    @pytest.mark.parametrize("schedule", ["in 5m", "in 30m", "in\t2h", "in 30s", "2026-06-01T09:00:00",
+                                          "2026-06-01 09:00", " 2030-01-01T00:00:00Z ", "every 15m", "0 9 * * *",
+                                          "weekdays at 9am", "every monday 9am", "1d", "@daily"])
+    def test_accepted_forms_still_pass_the_interval_check(self, schedule):
         assert cronguard.check_cron_call("cronjob_manage", {"action": "create", "schedule": schedule}, 15) is None
 
     def test_sparse_wraparound_and_yearly_forms_are_allowed(self):
@@ -2567,12 +2640,23 @@ class TestCronGuard:
         assert check("cronjob_manage", {"schedule": "* * * * *"}, 0) is None   # mati
         assert check("cronjob_manage", {"schedule": "* * * * *"}, "x") is None
 
-    def test_unparseable_schedule_is_allowed_and_logged_once(self, caplog):
+    def test_unparseable_schedule_is_rejected_and_logged_once(self, caplog):
         with caplog.at_level(logging.WARNING, logger="team-guard"):
             for _ in range(3):
                 assert cronguard.check_cron_call("cronjob_manage", {"action": "create", "schedule": "kapan-kapan"},
-                                                 15) is None
+                                                 15)
         assert sum("tidak bisa diurai" in r.getMessage() for r in caplog.records) == 1
+        assert not any("diloloskan" in r.getMessage() for r in caplog.records)
+
+    def test_hook_blocks_unparsed_schedule_for_members_only_when_guard_is_on(self, env):
+        args = {"action": "create", "schedule": "every\t1m", "prompt": "x"}
+        ctx = env.register("be-budi")
+        assert ctx.fire("pre_tool_call", tool_name="cronjob_manage", args=args) == []      # penjaga mati
+        env.set("settings", cron_min_interval_minutes=15)
+        assert ctx.fire("pre_tool_call", tool_name="cronjob_manage", args=args)[0]["action"] == "block"
+        odd = dict(args, schedule="@reboot")
+        assert "@reboot" in ctx.fire("pre_tool_call", tool_name="cronjob_manage", args=odd)[0]["message"]
+        assert env.register("team-admin").fire("pre_tool_call", tool_name="cronjob_manage", args=odd) == []
 
     def test_hook_blocks_member_and_shared_but_not_admin_profile(self, env):
         env.set("settings", cron_min_interval_minutes=15)
@@ -2714,7 +2798,7 @@ class TestBudget(ScaleBase):
         self.env.set("settings", daily_token_budget=1, rate_per_minute=0)
         with caplog.at_level(logging.WARNING, logger="team-guard"):
             assert all(self.go(d, event(S.U_BUDI, S.CH_BUDI)) is None for _ in range(4))
-        assert sum("anggaran token nonaktif" in r.getMessage() for r in caplog.records) == 1
+        assert sum("anggaran token TIDAK ditegakkan" in r.getMessage() for r in caplog.records) == 1
         assert not (self.env.state_dir / "belum-ada.db").exists()           # baca-saja: tidak pernah membuat berkas
         assert len(self.collects) == 1                                       # kolektor tetap dicoba (membuat buku besar)
 
@@ -3244,9 +3328,9 @@ class TestLimiterPipeline(ScaleBase):
                                                                                  "global_admission"}
 
     def test_every_refusal_kind_has_one_message_and_metric(self):
-        for kind, (key, template) in limiters.REFUSAL_TEXT.items():
-            assert key and "{uid}" in template, kind
-        assert set(scale.REFUSAL_KINDS) >= {"rate", "queue_full", "budget", "user_concurrent"}
+        for kind, refusal in limiters.REFUSALS.items():
+            assert refusal.say_key and "{uid}" in refusal.template, kind
+        assert set(scale.REFUSAL_KINDS) == {"rate", "queue_full", "budget", "user_concurrent"}
 
     def test_added_limiter_is_consulted_in_order_and_refuses_through_the_single_path(self, d):
         calls = []
@@ -4371,3 +4455,753 @@ class TestRegisteredKindInPlugin:
         assert roster.profile_kind(self.OPS_PROFILE) == "ops"
         assert commands.resolve_env_target(roster, S.U_BUDI, [self.OPS_CH])[1] == commands.MSG_ADMIN_ONLY
         assert commands.resolve_env_target(roster, S.ADMIN, [self.OPS_CH]) == (self.OPS_PROFILE, "")
+
+
+# ============================================================================= audit: tabel penolakan tunggal
+def _verdict_kinds_in_source(path):
+    """Semua `kind` yang diberikan ke `Verdict(...)` di satu berkas (lewat AST). Argumen pertama yang bukan
+    string literal dikembalikan sebagai None supaya ujinya gagal (tidak bisa dibuktikan terdaftar)."""
+    import ast
+    kinds = []
+    for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+        if isinstance(node, ast.Call) and getattr(node.func, "id", getattr(node.func, "attr", "")) == "Verdict":
+            first = node.args[0] if node.args else next((k.value for k in node.keywords if k.arg == "kind"), None)
+            kinds.append(first.value if isinstance(first, ast.Constant) and isinstance(first.value, str) else None)
+    return kinds
+
+
+class TestRefusalRegistry(ScaleBase):
+    def test_every_verdict_kind_produced_in_limiters_is_registered(self):
+        kinds = _verdict_kinds_in_source(S.PLUGIN_DIR / "limiters.py")
+        assert len(kinds) >= 6 and None not in kinds, kinds
+        assert set(kinds) <= set(limiters.REFUSALS), sorted(set(kinds) - set(limiters.REFUSALS))
+        assert set(kinds) == set(limiters.REFUSALS)                           # tidak ada entri tabel yatim
+
+    def test_the_source_scanner_catches_an_unregistered_or_dynamic_kind(self, tmp_path):
+        bad = tmp_path / "x.py"
+        bad.write_text("def f(k):\n    return Verdict('baru', 'x'), limiters.Verdict(k, 'y'), Verdict(kind='z', reason='r')\n")
+        assert _verdict_kinds_in_source(bad) == ["baru", None, "z"]
+
+    def test_metric_keys_come_from_the_same_table(self, monkeypatch):
+        """Satu sumber: `scale.REFUSAL_KINDS` / kunci `refused` diturunkan dari `refusals.REFUSALS`."""
+        refusals = S.sub(P, "refusals")
+        assert limiters.REFUSALS is refusals.REFUSALS and not hasattr(limiters, "REFUSAL_TEXT")
+        for name in ("limiters.py", "dispatch.py", "scale.py"):                # tidak ada tabel/daftar kedua
+            text = (S.PLUGIN_DIR / name).read_text(encoding="utf-8")
+            assert "Refusal(" not in text and '"user_concurrent"' not in text, name
+        assert not any("REFUSAL_KINDS =" in line or "REFUSAL_KINDS=" in line
+                       for line in (S.PLUGIN_DIR / "scale.py").read_text(encoding="utf-8").splitlines())
+        assert tuple(scale.REFUSAL_KINDS) == limiters.refusal_metrics() == ("rate", "queue_full", "budget",
+                                                                            "user_concurrent")
+        monkeypatch.setitem(limiters.REFUSALS, "kuota_proyek",
+                            limiters.Refusal("kuota", "🚫 <@{uid}> kuota proyek habis", "project_quota"))
+        assert "project_quota" in scale.REFUSAL_KINDS and scale.Metrics().refused["project_quota"] == 0
+        with pytest.raises(ValueError):
+            limiters.register_refusal("tanpa_uid", "tidak menyebut orangnya", "x")
+        assert "tanpa_uid" not in limiters.REFUSALS
+
+    def _only(self, verdict):
+        self.rt.limiters[:] = [type("L", (), {"name": "baru", "check": staticmethod(lambda ctx: _async(verdict))})()]
+
+    def test_limiter_with_a_brand_new_registered_kind_refuses_with_its_message_and_metric(self, d, monkeypatch):
+        monkeypatch.setitem(limiters.REFUSALS, "kuota_proyek", limiters.Refusal(
+            "kuota", "🚫 <@{uid}> kuota proyek {proyek} habis", "project_quota"))
+        self._only(limiters.Verdict("kuota_proyek", "kuota proyek", fmt={"proyek": "alfa"}))
+        got = self.go(d, event(S.U_BUDI, S.CH_BUDI))
+        assert got == {"action": "skip", "reason": "team-guard: kuota proyek"}
+        assert self.said() == [f"🚫 <@{S.U_BUDI}> kuota proyek alfa habis"]
+        refused = scale.build_metrics(self.rt, self.env.runner, d.probe)["refused"]
+        assert refused["project_quota"] == 1 and refused["rate"] == 0
+
+    def test_unregistered_kind_still_refuses_with_generic_text_and_a_metric(self, d, caplog):
+        """Regresi: `REFUSAL_TEXT[kind]` → KeyError → ditelan handler luar → pesan DITERUSKAN tanpa metrik."""
+        self._only(limiters.Verdict("jenis_yang_lupa_didaftarkan", "pembatas baru"))
+        with caplog.at_level(logging.WARNING, logger="team-guard"):
+            got = self.go(d, event(S.U_BUDI, S.CH_BUDI))
+        assert got == {"action": "skip", "reason": "team-guard: pembatas baru"}
+        assert len(self.said()) == 1 and f"<@{S.U_BUDI}>" in self.said()[0] and "tidak diproses" in self.said()[0]
+        assert self.rt.metrics.refused["other"] == 1
+        refused = scale.build_metrics(self.rt, self.env.runner, d.probe)["refused"]
+        assert refused["other"] == 1 and set(refused) == {"rate", "queue_full", "budget", "user_concurrent", "other"}
+        assert any("tidak terdaftar" in r.getMessage() for r in caplog.records)
+
+    def test_unregistered_kind_counts_under_the_metric_the_limiter_named(self, d):
+        self._only(limiters.Verdict("lain", "x", "queue_full"))
+        assert self.go(d, event(S.U_BUDI, S.CH_BUDI))["action"] == "skip"
+        assert self.rt.metrics.refused["queue_full"] == 1 and "other" not in self.rt.metrics.refused
+
+    def test_metrics_without_unknown_refusals_keep_exactly_the_registered_keys(self, d):
+        assert set(scale.build_metrics(self.rt, self.env.runner, d.probe)["refused"]) == set(scale.REFUSAL_KINDS)
+
+    @pytest.mark.parametrize("make", [
+        lambda: limiters.Verdict("rate", "isian kurang"),                                    # templat butuh wait/rate
+        lambda: limiters.Verdict("rate", "isian aneh", fmt={"wait": object(), "uid": "x"}),   # uid ganda
+        lambda: limiters.Verdict(None, "kind kosong"),
+        lambda: limiters.Verdict(["bukan", "teks"], "kind bukan teks"),
+        lambda: "bukan objek Verdict",
+        lambda: True,
+    ])
+    def test_a_refusal_is_never_turned_into_a_forward_by_a_bad_verdict(self, d, make):
+        self._only(make())
+        got = self.go(d, event(S.U_BUDI, S.CH_BUDI))
+        assert got and got["action"] == "skip" and got["reason"].startswith("team-guard: ")
+
+    def test_failing_followup_and_failing_notice_do_not_undo_the_refusal(self, d):
+        async def follow():
+            raise RuntimeError("kabar admin rusak")
+
+        self._only(limiters.Verdict("rate", "r", fmt={"wait": 3, "rate": 6}, followup=follow))
+        self.env.adapter.send = None                                           # kabar ke channel pun gagal
+        assert self.go(d, event(S.U_BUDI, S.CH_BUDI)) == {"action": "skip", "reason": "team-guard: r"}
+        assert self.rt.metrics.refused["rate"] == 1
+
+
+# ============================================================================= audit: tahap dispatch terisolasi
+class _Boom:
+    """Pembatas yang selalu melempar."""
+
+    def __init__(self, name="rusak", exc=RuntimeError):
+        self.name, self.exc, self.calls = name, exc, 0
+
+    async def check(self, ctx):
+        self.calls += 1
+        raise self.exc("pembatas rusak")
+
+
+class _Deny:
+    name = "tolak"
+
+    def __init__(self):
+        self.calls = 0
+
+    async def check(self, ctx):
+        self.calls += 1
+        return limiters.Verdict("queue_full", "antrean penuh", fmt={"wait": 9})
+
+
+class TestDispatchStageIsolation(ScaleBase):
+    TOKEN = "ghp_" + "A1b2C3d4" * 5
+
+    def test_broken_limiter_is_skipped_and_the_next_one_still_decides(self, d, caplog):
+        """Regresi: galat di satu pembatas → handler luar → pesan diteruskan, pembatas BERIKUTNYA tidak diperiksa."""
+        boom, deny = _Boom(), _Deny()
+        self.rt.limiters[:] = [boom, deny]
+        with caplog.at_level(logging.WARNING, logger="team-guard"):
+            for _ in range(3):
+                got = self.go(d, event(S.U_BUDI, S.CH_BUDI))
+                assert got == {"action": "skip", "reason": "team-guard: antrean penuh"}
+        assert boom.calls == deny.calls == 3 and self.rt.metrics.refused["queue_full"] == 3
+        assert sum("pembatas 'rusak' gagal" in r.getMessage() for r in caplog.records) == 1     # log sekali
+        assert self.rt.metrics.limiter_errors == {"rusak": 3}
+
+    def test_broken_limiter_alone_fails_open_and_is_surfaced_in_capabilities(self, d):
+        self.rt.limiters[:] = [_Boom("anggaran-x", KeyError)]
+        assert self.go(d, event(S.U_BUDI, S.CH_BUDI)) is None                 # tim tetap terlayani
+        caps = json.loads((self.env.state_dir / "capabilities.json").read_text())["capabilities"]
+        assert caps["limiter.anggaran-x"]["available"] is False and "KeyError" in caps["limiter.anggaran-x"]["reason"]
+
+    def test_real_limiters_after_a_broken_budget_still_rate_limit(self, d):
+        self.env.set("settings", rate_per_minute=1, burst=1)
+
+        def boom(*_a, **_k):
+            raise RuntimeError("anggaran rusak")
+
+        self.rt.limiters[0].check = boom                                       # BudgetLimiter.check melempar (sinkron)
+        assert self.go(d, event(S.U_BUDI, S.CH_BUDI)) is None
+        got = [self.go(d, event(S.U_BUDI, S.CH_BUDI)) for _ in range(3)]
+        assert any(g and g["reason"] == "team-guard: rate limit" for g in got)
+
+    def test_token_is_scrubbed_whatever_the_limiters_do(self, d):
+        for pipeline in ([_Boom()], [_Boom(), _Boom("dua")], []):
+            self.rt.limiters[:] = pipeline
+            got = self.go(d, event(S.U_BUDI, S.CH_BUDI, f"pakai {self.TOKEN}", raw_message=Raw()))
+            assert got == {"action": "rewrite", "text": "pakai «disamarkan:github-token»"}
+        self.rt.limiters[:] = [_Boom(), _Deny()]
+        assert self.go(d, event(S.U_BUDI, S.CH_BUDI, f"pakai {self.TOKEN}"))["action"] == "skip"
+
+    def test_held_inactive_and_unlisted_are_refused_when_every_other_stage_is_broken(self, d):
+        """Regresi: galat di kabar skema (sebelum gerbang) → pesan orang yang ditahan diteruskan."""
+        async def boom(*_a, **_k):
+            raise RuntimeError("rusak")
+
+        d._schema_notice = boom
+        d._scrub = boom
+        self.rt.limiters[:] = [_Boom()]
+        self.env.adapter.send = None
+        self.rt.state.hold(S.U_CITRA, "x")
+        S.roster_deactivate(self.env.roster, S.U_BE1)
+        self.env.save()
+        assert "ditahan" in self.go(d, event(S.U_CITRA, S.CH_SHARED))["reason"]
+        assert "nonaktif" in self.go(d, event(S.U_BE1, S.CH_SHARED))["reason"]
+        assert "belum terdaftar" in self.go(d, event(S.U_DODI, S.CH_SHARED))["reason"]
+
+    def test_access_gate_failure_is_fail_closed_for_non_admins_only(self, d, caplog):
+        def boom(*_a, **_k):
+            raise RuntimeError("onboarding.json meledak")
+
+        self.rt.state.is_held = boom
+        with caplog.at_level(logging.WARNING, logger="team-guard"):
+            got = self.go(d, event(S.U_CITRA, S.CH_SHARED))
+        assert got == {"action": "skip", "reason": "team-guard: gerbang akses gagal"}
+        assert "penjaga akses tim sedang bermasalah" in self.said()[-1]
+        assert any("gerbang akses gagal" in r.getMessage() for r in caplog.records)
+        assert self.go(d, event(S.ADMIN, S.CH_ADMIN)) is None                 # admin tetap bisa memperbaiki
+        assert self.go(d, event(S.U_BUDI, S.CH_BUDI)) is None                 # anggota aktif tidak menyentuh `held`
+        caps = json.loads((self.env.state_dir / "capabilities.json").read_text())["capabilities"]
+        assert caps["dispatch.access_gate"]["available"] is False
+
+    def test_scrub_failure_is_fail_closed_only_when_scrubbing_is_on(self, d, monkeypatch):
+        def boom(_text):
+            raise RuntimeError("regex rusak")
+
+        monkeypatch.setitem(getattr(d.handle, "__func__", d.handle).__globals__, "scrub_tokens", boom)
+        got = self.go(d, event(S.U_BUDI, S.CH_BUDI, f"pakai {self.TOKEN}"))
+        assert got == {"action": "skip", "reason": "team-guard: penyamaran token gagal"}
+        assert "tidak diteruskan ke AI" in self.said()[-1]
+        self.env.set("settings", scrub_chat=False)
+        assert self.go(d, event(S.U_BUDI, S.CH_BUDI, "halo")) is None
+
+    def test_error_before_the_scope_is_known_forwards_but_still_scrubs(self, d, caplog):
+        def boom(*_a, **_k):
+            raise RuntimeError("roster meledak")
+
+        self.rt.roster_cache.get = boom
+        with caplog.at_level(logging.WARNING, logger="team-guard"):
+            got = self.go(d, event(S.U_BUDI, S.CH_BUDI, f"pakai {self.TOKEN}"))
+            assert got == {"action": "rewrite", "text": "pakai «disamarkan:github-token»"}
+            assert self.go(d, event(S.U_BUDI, S.CH_BUDI, "halo")) is None
+        assert any("token tersamar" in r.getMessage() for r in caplog.records)
+        assert any("apa adanya" in r.getMessage() for r in caplog.records)
+
+    def test_cancellation_inside_a_limiter_is_not_swallowed(self, d):
+        class Cancel:
+            name = "batal"
+
+            async def check(self, ctx):
+                raise asyncio.CancelledError()
+
+        self.rt.limiters[:] = [Cancel(), _Deny()]
+        with pytest.raises(asyncio.CancelledError):
+            self.go(d, event(S.U_BUDI, S.CH_BUDI))
+
+
+# ============================================================================= audit: roster.json salah bentuk
+def _bad(**changes):
+    return lambda data: data.update(changes)
+
+
+def _bad_settings(data):
+    data["settings"].update({"rate_per_minute": "cepat", "min_length": [], "scrub_chat": "ya", "burst": {"a": 1},
+                             "block_env_dump": 0, "allow_names": "SEMUA", "max_active": True})
+
+
+def _bad_nested(data):
+    data["channels"][S.CH_SHARED] = 5
+    data["users"][S.U_BUDI] = "budi"
+    data["inactive_users"]["77"] = ["x"]
+
+
+MALFORMED_ROSTERS = {
+    "channels: {id: 5}": _bad_nested,
+    "channels: daftar": _bad(channels=["400000000000000001"]),
+    "channels: teks": _bad(channels="semua"),
+    "settings: daftar": _bad(settings=[]),
+    "settings: nilai salah tipe": _bad_settings,
+    "admins: angka": _bad(admins=5),
+    "admins: isi campur": lambda data: data.update(admins=[S.ADMIN, None, {"id": 1}, ["x"]]),
+    "users: daftar": _bad(users=[{"id": S.U_BUDI}]),
+    "inactive_users: teks": _bad(inactive_users="tidak ada"),
+    "roles: daftar": _bad(roles=["a", "b"]),
+    "gateway: angka": _bad(gateway=7),
+    "gateway.profile_routes: objek": _bad(gateway={"profile_routes": {"a": 1}, "allowed_channels": 9}),
+    "onboarding: teks": _bad(onboarding="ya"),
+    "kit, usage, reserved_env": _bad(kit=[1], usage="x", reserved_env={"A": 1}),
+    "skalar jadi wadah": _bad(guild_id={"x": 1}, team_name=["t"], hermes_root=[1], hermes_bin={}, schema="dua",
+                              live_reload="tidak", restart_fallback=[], shared_channel={}, admin_channel=[]),
+    "semua null": lambda data: data.update({k: None for k in list(data)}),
+}
+# Bentuk yang merusak WADAH field penentu gerbang: roster baru tidak boleh menggantikan yang sah.
+CRITICAL_SHAPES = {"channels: daftar", "channels: teks", "settings: daftar", "admins: angka", "users: daftar",
+                   "inactive_users: teks", "semua null"}
+
+
+class TestRosterIsTotal(ScaleBase):
+    TOKEN = "ghp_" + "A1b2C3d4" * 5
+
+    @pytest.mark.parametrize("shape", sorted(MALFORMED_ROSTERS))
+    def test_roster_never_raises_and_every_field_has_its_type(self, env, shape):
+        """Regresi: `Roster(data)` melempar untuk field bertipe salah (AttributeError / TypeError / ValueError)."""
+        data = json.loads(json.dumps(env.roster))
+        MALFORMED_ROSTERS[shape](data)
+        r = rostermod.Roster(data)
+        assert r.problems, shape
+        assert isinstance(r.admins, set) and all(isinstance(a, str) for a in r.admins)
+        for mapping in (r.channels, r.users, r.inactive_users):
+            assert isinstance(mapping, dict) and all(isinstance(v, dict) for v in mapping.values())
+        assert isinstance(r.settings, dict) and set(rostermod.SETTINGS_DEFAULTS) <= set(r.settings)
+        assert isinstance(r.onboarding, dict) and set(rostermod.ONBOARDING_DEFAULTS) <= set(r.onboarding)
+        for key, default in rostermod.SETTINGS_DEFAULTS.items():
+            if isinstance(default, bool):
+                assert isinstance(r.settings[key], bool), key
+            elif isinstance(default, int):
+                assert isinstance(r.settings[key], (int, float)) and not isinstance(r.settings[key], bool), key
+            else:
+                assert isinstance(r.settings[key], list) and all(isinstance(x, str) for x in r.settings[key]), key
+        for text in (r.team_name, r.guild_id, r.member_role, r.admin_role, r.entry_role, r.shared_channel,
+                     r.admin_channel, r.restart_fallback, r.hermes_bin, r.usage["ledger"], r.usage["timezone"]):
+            assert isinstance(text, str)
+        assert isinstance(r.live_reload, bool) and isinstance(r.schema, int) and isinstance(r.profile_routes, list)
+        assert isinstance(r.reserved_env, list) and isinstance(r.kit, dict) and r.hermes_root is not None
+        r.user_status("1"), r.is_admin("1"), r.channel_entry("1"), r.profile_kind("x"), r.profile_cron_exempt("x")
+        r.kinds(), r.profiles(), r.kind_channel("shared"), r.profile_home("x")
+        assert bool(r.critical) == (shape in CRITICAL_SHAPES), (shape, r.critical)
+
+    @pytest.mark.parametrize("junk", [None, 5, "rusak", [], [{"channels": {}}], {"channels": {"1": {"kind": []}}},
+                                      {"settings": {"x": object()}}, {1: 2, None: 3}, {"users": {1: {2: 3}}}])
+    def test_roster_accepts_any_python_object(self, junk):
+        r = rostermod.Roster(junk)
+        assert r.settings["block_env_dump"] is True and r.user_status("tidak-ada") == "unknown"
+        r.kinds(), r.profiles(), r.profile_kind("x"), r.profile_cron_exempt("x")
+
+    def _gates(self, d, held=S.U_CITRA):
+        """Semua gerbang yang dulu terlewat saat Roster() melempar. Mengembalikan daftar yang TIDAK jalan."""
+        missing = []
+        ctx = self.env.register("be-budi")
+        got = self.go(d, event(held, S.CH_SHARED))
+        if not (got and got["action"] == "skip"):
+            missing.append("gerbang akses (ditahan)")
+        got = self.go(d, event(S.U_BE1, S.CH_SHARED))
+        if not (got and got["action"] == "skip" and "nonaktif" in got["reason"]):
+            missing.append("gerbang akses (nonaktif)")
+        got = self.go(d, event(S.U_BUDI, S.CH_BUDI, f"pakai {self.TOKEN}"))
+        if not (got and got["action"] == "rewrite" and self.TOKEN not in got["text"]):
+            missing.append("penyamaran token")
+        if not ctx.fire("pre_tool_call", tool_name="terminal", args={"command": "printenv"}):
+            missing.append("guard dump environment")
+        if not ctx.fire("pre_tool_call", tool_name="cronjob_manage",
+                        args={"action": "create", "schedule": "every 1m", "prompt": "x"}):
+            missing.append("penjaga cron")
+        self.rt.limiters[:] = [_Deny()]
+        got = self.go(d, event(S.U_BUDI, S.CH_BUDI))
+        if not (got and got["action"] == "skip" and got["reason"] == "team-guard: antrean penuh"):
+            missing.append("pembatas")
+        return missing
+
+    @pytest.mark.parametrize("shape", sorted(MALFORMED_ROSTERS))
+    def test_gates_still_run_when_a_valid_roster_is_replaced_by_a_malformed_one(self, d, shape, caplog):
+        """Regresi: roster.json salah bentuk → dispatch meneruskan pesan "apa adanya" (tanpa gerbang
+        ditahan/nonaktif, anggaran, rate limit, penyamaran token) dan hook melempar sebelum guard env/cron."""
+        self.env.set("settings", cron_min_interval_minutes=15, rate_per_minute=0)
+        S.roster_deactivate(self.env.roster, S.U_BE1)
+        self.env.save()
+        self.rt.state.hold(S.U_CITRA, "x")
+        assert self.rt.roster().user_status(S.U_BE1) == "inactive"            # roster sah sudah dimuat
+        MALFORMED_ROSTERS[shape](self.env.roster)
+        with caplog.at_level(logging.WARNING, logger="team-guard"):
+            self.env.save()
+            assert self._gates(d) == []
+        cache = self.rt.roster_cache
+        if shape in CRITICAL_SHAPES:
+            assert "tetap dipakai" in cache.error and not cache.changed()     # tidak diurai ulang tiap pesan
+            assert cache.get().user_status(S.U_BUDI) == "active"
+        else:
+            assert "salah bentuk" in cache.error
+        assert not any("pre_gateway_dispatch gagal" in r.getMessage() for r in caplog.records)
+
+    @pytest.mark.parametrize("shape", sorted(MALFORMED_ROSTERS))
+    def test_fresh_start_with_a_malformed_roster_never_raises_and_keeps_secret_guards(self, env, shape):
+        """Tanpa roster sah sebelumnya tidak ada yang bisa dipertahankan: yang dijamin = tidak ada galat, guard
+        dump environment tetap aktif (bawaan), dan gerbang akses berjalan bila daftar channel masih terbaca."""
+        env.roster["settings"]["cron_min_interval_minutes"] = 15
+        MALFORMED_ROSTERS[shape](env.roster)
+        env.save()
+        self.env, self.rt = env, env.rt()
+        d = dispatch.Dispatcher(self.rt, clock=S.Clock(), sleep=S.Clock().sleep)
+        ctx = env.register("be-budi")
+        assert ctx.fire("pre_tool_call", tool_name="terminal", args={"command": "printenv"})[0]["action"] == "block"
+        ctx.fire("pre_tool_call", tool_name="cronjob_manage", args={"action": "create", "schedule": "every 1m"})
+        ctx.fire("transform_tool_result", result="halo")
+        for uid, chat in ((S.U_CITRA, S.CH_SHARED), (S.U_BUDI, S.CH_BUDI), (S.ADMIN, S.CH_ADMIN)):
+            self.go(d, event(uid, chat, f"pakai {self.TOKEN}"))               # tidak melempar
+        roster = self.rt.roster()
+        if roster.channel_entry(S.CH_SHARED) is not None:
+            got = self.go(d, event(S.U_CITRA, S.CH_SHARED))
+            assert got and got["action"] == "skip", shape
+
+    def test_cache_keeps_last_valid_roster_then_adopts_the_fixed_file(self, env, caplog):
+        cache = env.rt().roster_cache
+        good = cache.get()
+        broken = dict(env.roster, channels=[], users="x")
+        with caplog.at_level(logging.WARNING, logger="team-guard"):
+            S.write_roster(env.state_dir, broken)
+            for _ in range(3):
+                assert cache.get() is good
+        assert "channels" in cache.error and "users" in cache.error
+        assert sum("tetap dipakai" in r.getMessage() for r in caplog.records) == 1          # satu baris, bukan per pesan
+        S.roster_add(env.roster, S.U_DODI, "dodi", "610000000000000004")
+        env.save()
+        assert S.U_DODI in cache.get().users and cache.error == ""
+
+    def test_non_critical_problem_is_adopted_with_safe_defaults_and_one_warning_per_field(self, env, caplog):
+        cache = env.rt().roster_cache
+        cache.get()
+        env.roster["settings"].update(rate_per_minute="cepat", burst=2)
+        env.roster["onboarding"]["reconcile_minutes"] = "sering"
+        S.roster_add(env.roster, S.U_DODI, "dodi", "610000000000000004")
+        with caplog.at_level(logging.WARNING, logger="team-guard"):
+            env.save()
+            for _ in range(3):
+                r = cache.get()
+        assert S.U_DODI in r.users and r.settings["rate_per_minute"] == 6 and r.settings["burst"] == 2
+        assert r.onboarding["reconcile_minutes"] == 10
+        assert "settings.rate_per_minute" in cache.error and "onboarding.reconcile_minutes" in cache.error
+        assert sum("settings.rate_per_minute" in rec.getMessage() for rec in caplog.records) == 1
+
+    def test_settings_keep_valid_numbers_null_and_unknown_keys(self):
+        r = rostermod.Roster({"settings": {"queue_max_wait": 0.5, "burst": "3", "max_active": None,
+                                           "setelan_kit_baru": {"a": 1}, "rate_per_minute": 0}})
+        assert r.settings["queue_max_wait"] == 0.5 and r.settings["burst"] == 3 and r.settings["max_active"] == 8
+        assert r.settings["setelan_kit_baru"] == {"a": 1} and r.settings["rate_per_minute"] == 0
+        assert r.problems == []
+
+
+# ============================================================================= audit: onboarding.json tidak terbaca
+class TestStateUnreadable:
+    def test_missing_file_is_a_valid_empty_state(self, tmp_path):
+        store = statemod.StateStore(tmp_path / "onboarding.json")
+        assert not store.unreadable and store.load_error == "" and not list(tmp_path.iterdir())
+
+    @pytest.mark.parametrize("content", ["bukan json", '{"held": {"5": ', "[1, 2]", '"teks"', ""])
+    def test_unreadable_file_is_flagged_logged_and_kept_aside(self, tmp_path, content, caplog):
+        path = tmp_path / "onboarding.json"
+        path.write_text(content, encoding="utf-8")
+        with caplog.at_level(logging.WARNING, logger="team-guard"):
+            store = statemod.StateStore(path)
+        assert store.unreadable and store.load_error and store.data["held"] == {}
+        assert (tmp_path / "onboarding.json.rusak").read_text(encoding="utf-8") == content
+        assert stat.S_IMODE((tmp_path / "onboarding.json.rusak").stat().st_mode) == 0o600
+        assert sum("onboarding.json tidak terbaca" in r.getMessage() for r in caplog.records) == 1
+        store.hold("9", "baru")                                                # penyimpanan berikutnya tetap jalan
+        assert statemod.StateStore(path).is_held("9") and not statemod.StateStore(path).unreadable
+
+    def test_reload_in_the_same_process_keeps_the_last_good_state(self, tmp_path):
+        path = tmp_path / "onboarding.json"
+        store = statemod.StateStore(path)
+        store.hold("5", "pemberi role tidak dikenal")
+        path.write_text("{ terpotong", encoding="utf-8")
+        store.load()
+        assert store.unreadable and store.is_held("5")
+        store.save()
+        again = statemod.StateStore(path)
+        assert again.is_held("5") and not again.unreadable
+
+
+# ============================================================================= audit: pola token & guard dump
+def _discord_token(bot_id="1057682446486067210"):
+    head = base64.b64encode(bot_id.encode()).decode().rstrip("=")
+    return f"{head}.GaBcDe.{'aB3_-' * 6}xyz"
+
+
+class TestMoreTokenPatterns:
+    @pytest.mark.parametrize("token,label", [
+        (_discord_token(), "discord-token"), (_discord_token("12345678901234567"), "discord-token"),
+        (_discord_token("123456789012345678"), "discord-token"), (_discord_token("99999999999999999999"), "discord-token"),
+        ("sk_live_" + "a1B2c3D4" * 3, "stripe-key"), ("rk_live_" + "a1B2c3D4" * 3, "stripe-key"),
+        ("sk_test_" + "a1B2c3D4" * 4, "stripe-key"),
+    ])
+    def test_discord_and_stripe_style_tokens_are_scrubbed(self, token, label):
+        """Regresi: token bot Discord dan kunci `sk_live_`/`rk_live_` lolos penyamaran chat."""
+        for text in (token, f"pakai {token} ya", f"TOKEN={token}", f'"{token}",', f"({token})"):
+            out, kinds = redact.scrub_tokens(text)
+            assert kinds == [label] and token not in out and f"«disamarkan:{label}»" in out, text
+
+    @pytest.mark.parametrize("text", [
+        "pk_live_" + "a1B2c3D4" * 3,                                           # publishable key: bukan rahasia
+        "sk_live_pendek", "sk_live_", "risk_live_" + "a" * 24, "task_live_" + "a" * 24, "sk_prod_" + "a" * 24,
+        "disk_test_" + "a" * 24, "mask_live_update_semua_data_sekarang",
+        "Mengapa.begitu.banyak", "www.example-site.com/path/to/page.html", "Module.function.name",
+        "NamaBerkasPanjangSekaliLoh.backup.tar", "MyVeryLongClassNameHere123.method.another_long_attribute_name_here",
+        "MTA1NzY4MjQ0NjQ4NjA2NzIx", "MTA1NzY4MjQ0NjQ4NjA2NzIx.GaBcDe",          # ID saja / tanpa tanda tangan
+        "MTA1NzY4MjQ0NjQ4NjA2NzIx.GaBcDe.pendek", "1057682446486067210.123456.abcdefghijklmnopqrstuvwxyz012",
+        "org.apache.commons.lang3.StringUtils.isNotBlankAndSomethingLongerHere", "v1.2.3-rc1.build.20260101",
+        "Nama_Orang_Yang_Panjang_Sekali.dokumen.versi_final_revisi_ketiga_sekali_lagi",
+    ])
+    def test_ordinary_text_is_not_scrubbed(self, text):
+        assert redact.scrub_tokens(f"lihat {text} ya") == (f"lihat {text} ya", [])
+
+    def test_chat_message_with_a_discord_token_is_rewritten(self, env):
+        d = dispatch.Dispatcher(env.rt(), clock=S.Clock(), sleep=S.Clock().sleep)
+        token = _discord_token()
+        got = run(d.handle(event=event(S.U_BUDI, S.CH_BUDI, f"bot token: {token}"), gateway=env.runner))
+        assert got == {"action": "rewrite", "text": "bot token: «disamarkan:discord-token»"}
+
+
+class TestMoreEnvDumpForms:
+    @pytest.mark.parametrize("command", [
+        "cat /proc/self/envi*", "cat /proc/self/env*", "cat /proc/*/environ", "cat /proc/*/en?iron",
+        "strings /proc/[0-9]*/e[n]viron", "cat /proc/self/e*", "cat /proc/self/{environ,cmdline}",
+        'cat /proc/self/env"iron"', "cat /proc/self/en\\viron", "cat /proc/$$/envi*", "xxd /proc/$PPID/env*",
+        "cat /proc/self/task/*/envir*", "bash -c 'cat /proc/self/envi*'", "tr '\\0' '\\n' < /proc/self/envi*",
+        "head -c 4096 /proc/thread-self/e*",
+    ])
+    def test_globbed_proc_environ_is_blocked(self, command):
+        """Regresi: `cat /proc/self/envi*` lolos (hanya path persis yang dikenali)."""
+        assert guard.check_tool_call("terminal", {"command": command}), command
+
+    @pytest.mark.parametrize("value", ["/proc/self/envi*", "/proc/*/environ", "/proc/self/e?viron"])
+    def test_globbed_proc_environ_in_file_tool_arguments_is_blocked(self, value):
+        assert guard.check_tool_call("search_files", {"pattern": value})
+        assert guard.check_tool_call("execute_code", {"code": f"import glob\nfor p in glob.glob('{value}'): print(open(p).read())"})
+
+    @pytest.mark.parametrize("command", [
+        "cat /proc/cpuinfo", "cat /proc/meminfo", "ls /proc/*", "ls /proc/self/fd/*", "cat /proc/self/status",
+        "cat /proc/*/cmdline", "cat /proc/$$/status", "cat /proc/sys/kernel/*", "cat /proc/self/stat*",
+        "grep -c processor /proc/cpu*", "cat /proc/loadavg | awk '{print $1}'", "ls /proc/self/task/*/comm",
+    ])
+    def test_other_proc_paths_are_not_blocked(self, command):
+        assert guard.check_tool_call("terminal", {"command": command}) is None, command
+
+    @pytest.mark.parametrize("code", [
+        "import os\ne=os.environ;print(e)", "import os\ne = os.environ\nprint(e)",
+        "import os\nsemua = dict(os.environ)\nprint(semua)", "from os import environ as E\nprint(E)",
+        "from os import path, environ as lingkungan\nimport json\nprint(json.dumps(dict(lingkungan)))",
+        "import os\ne = getattr(os, 'environ')\nprint(e)", "import os\nprint(getattr(os, \"environ\"))",
+        "import os\ncfg: dict = os.environ\nfor k in cfg: print(k, cfg[k])",
+        "import os\ne = os.environ\nprint(sorted(e.items()))",
+        "import os\nprint('-'.join(os.environ['GH_PAT']))", "import os\nprint(' '.join(os.environ.get('GH_PAT')))",
+        "import os\nprint(\"|\".join(os.getenv('DB_PASSWORD')))",
+    ])
+    def test_whole_environ_alias_and_char_joined_secret_are_blocked(self, code):
+        """Regresi: `e=os.environ;print(e)` dan `'-'.join(os.environ[...])` lolos."""
+        assert guard.check_tool_call("execute_code", {"code": code}), code
+
+    def test_alias_dump_inside_a_shell_command_is_blocked(self):
+        assert guard.check_tool_call("terminal", {"command": 'python3 -c "import os;e=os.environ;print(e)"'})
+        assert guard.check_tool_call("terminal", {"command": "python3 -c \"import os;print('-'.join(os.environ['K']))\""})
+
+    @pytest.mark.parametrize("code", [
+        "import os, subprocess\nenv = dict(os.environ, DEBUG='1')\nsubprocess.run(['make'], env=env)",
+        "import os, subprocess\ne = os.environ\nsubprocess.run(['make'], env=e)",
+        "import os\nhome = os.environ['HOME']\nprint(home)", "import os\nx = os.environ.get('LANG')\nprint(x)",
+        "import os\np = os.path.join(os.environ['HOME'], 'data')\nprint(p)",
+        "import os\nprint(os.pathsep.join([os.environ['PATH'], '/opt/bin']))",
+        "import os\nprint(', '.join(sorted(['a', 'b'])))", "e = 5\nprint(e)",
+        "import os\nsubprocess.run(['ls'], env=os.environ)\nprint('selesai')",
+    ])
+    def test_ordinary_environment_use_is_not_blocked(self, code):
+        assert guard.check_tool_call("execute_code", {"code": code}) is None, code
+
+
+# ============================================================================= audit: probe untuk tiap internal Hermes
+# Parameter metode HermesGateway yang merupakan OBJEK HERMES (atributnya = internal hulu) vs data biasa.
+UPSTREAM_OBJECT_PARAMS = {"gateway", "runner", "adapter", "event", "config", "source"}
+PLAIN_DATA_PARAMS = {"self", "raw", "routes", "kwargs", "home", "parsed", "allowed", "free", "which", "names",
+                     "values", "limit", "wall", "state_dir", "platform"}
+# Metode wadah bawaan Python pada objek hulu (dict adapters, enum Platform) — bukan API Hermes.
+GENERIC_ATTRS = {"get", "items", "keys", "values", "value", "lower"}
+
+
+def _upstream_method_usage(source, class_name="HermesGateway"):
+    """{metode: (kunci @uses, nama internal yang disentuh, parameter)} untuk satu kelas, lewat AST.
+    "Disentuh" = nama yang diimpor dari paket Hermes; string argumen kedua getattr/hasattr; string literal
+    berawalan "_" (nama privat yang dipanggil tak langsung); dan atribut pada objek hulu (parameter di
+    UPSTREAM_OBJECT_PARAMS atau variabel lokal yang diturunkan darinya)."""
+    import ast
+    tree = ast.parse(source)
+    cls = next(n for n in ast.walk(tree) if isinstance(n, ast.ClassDef) and n.name == class_name)
+    out = {}
+    for fn in [n for n in cls.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]:
+        declared = []
+        for deco in fn.decorator_list:
+            if isinstance(deco, ast.Call) and getattr(deco.func, "id", "") == "uses":
+                declared += [a.value for a in deco.args if isinstance(a, ast.Constant)]
+        params = [a.arg for a in fn.args.args + fn.args.kwonlyargs] + \
+                 [a.arg for a in (fn.args.vararg, fn.args.kwarg) if a is not None]
+        tainted = {p for p in params if p in UPSTREAM_OBJECT_PARAMS}
+
+        def rooted(node):
+            return any(isinstance(n, ast.Name) and n.id in tainted for n in ast.walk(node))
+
+        for _ in range(3):                                                     # sebar ke variabel lokal turunan
+            for node in ast.walk(fn):
+                targets, value = [], None
+                if isinstance(node, ast.Assign):
+                    targets, value = node.targets, node.value
+                elif isinstance(node, (ast.For, ast.comprehension)):
+                    targets, value = [node.target], node.iter
+                if value is not None and rooted(value):
+                    for target in targets:
+                        tainted |= {n.id for n in ast.walk(target) if isinstance(n, ast.Name)}
+        touched = set()
+        for node in ast.walk(fn):
+            if isinstance(node, ast.ImportFrom) and node.level == 0 and node.module \
+                    and node.module.split(".")[0] in FORBIDDEN_IMPORT_ROOTS:
+                touched |= {a.name for a in node.names}
+            elif isinstance(node, ast.Call) and getattr(node.func, "id", "") in ("getattr", "hasattr") \
+                    and len(node.args) >= 2 and isinstance(node.args[1], ast.Constant):
+                touched.add(node.args[1].value)
+            elif isinstance(node, ast.Constant) and isinstance(node.value, str) \
+                    and re.fullmatch(r"_[a-z]\w*", node.value):
+                touched.add(node.value)
+            elif isinstance(node, ast.Attribute) and rooted(node.value):
+                touched.add(node.attr)
+        out[fn.name] = (declared, touched - GENERIC_ATTRS, params)
+    return out
+
+
+class TestUpstreamProbeCoverage:
+    SOURCE = (S.PLUGIN_DIR / "upstream.py").read_text(encoding="utf-8")
+
+    def test_every_internal_touched_by_a_gateway_method_has_a_declared_probe(self):
+        """Gagal bila `HermesGateway` mendapat metode yang menyentuh internal Hermes tanpa entri `_PROBES`
+        (dulu `runner.config.profile_routes`, `adapter.config.extra`, `gateway.adapters` dipakai tanpa probe)."""
+        probes = {entry[0] for entry in upstreammod._PROBES}
+        problems, used = [], set()
+        for name, (declared, touched, params) in sorted(_upstream_method_usage(self.SOURCE).items()):
+            unknown = [p for p in params if p not in UPSTREAM_OBJECT_PARAMS | PLAIN_DATA_PARAMS]
+            if unknown:
+                problems.append(f"{name}: parameter {unknown} belum digolongkan (objek Hermes atau data biasa?)")
+            used |= set(declared)
+            covered = set().union(*[upstreammod.probe_names(k) for k in declared]) if declared else set()
+            missing = sorted(touched - covered)
+            if missing:
+                problems.append(f"{name}: menyentuh {missing} tanpa probe (tambahkan ke _PROBES + @uses)")
+            if set(declared) - probes:
+                problems.append(f"{name}: @uses menyebut kunci di luar _PROBES: {sorted(set(declared) - probes)}")
+        assert problems == []
+        assert used == probes, f"probe tanpa pemakai: {sorted(probes - used)}"
+
+    def test_runtime_declarations_match_the_source(self):
+        usage = _upstream_method_usage(self.SOURCE)
+        for name, (declared, _touched, _params) in usage.items():
+            assert tuple(declared) == getattr(getattr(upstreammod.HermesGateway, name), "__upstream_uses__", ()), name
+        with pytest.raises(KeyError):
+            upstreammod.uses("GatewayRunner.tidak_ada")
+
+    def test_the_three_previously_unprobed_internals_are_probed_and_reported(self):
+        caps = upstreammod.HermesGateway().capabilities()
+        for key in ("GatewayRunner.config.profile_routes", "DiscordAdapter.config.extra", "GatewayRunner.adapters"):
+            assert key in caps and set(caps[key]) == {"available", "reason"}, key
+        assert len(upstreammod._PROBES) >= 21
+
+    def test_scanner_catches_a_new_method_that_touches_an_unprobed_internal(self):
+        source = self.SOURCE + (
+            "\n\nclass Baru(HermesGateway):\n"
+            "    def sesi(self, gateway):\n        return gateway.session_store.list()\n"
+            "    def privat(self, adapter):\n        return getattr(adapter, '_voice_clients', None)\n"
+            "    def impor(self):\n        from gateway.session import SessionStore\n        return SessionStore\n"
+            "    def turunan(self, runner):\n        cfg = runner.config\n        return cfg.multiplex_profiles\n"
+            "    def tak_langsung(self, adapter):\n        return getattr(adapter, {'a': '_secret_getter'}['a'])()\n"
+            "    @uses('GatewayRunner.adapters')\n"
+            "    def sah(self, gateway):\n        return gateway.adapters.get('x')\n"
+            "    def murni(self, names):\n        return sorted(names)\n"
+            "    def asing(self, penyedia):\n        return penyedia\n")
+        usage = _upstream_method_usage(source, "Baru")
+        covered = lambda name: set().union(*[upstreammod.probe_names(k) for k in usage[name][0]] or [set()])  # noqa: E731
+        assert usage["sesi"][1] - covered("sesi") == {"session_store", "list"}
+        assert usage["privat"][1] == {"_voice_clients"} and usage["impor"][1] == {"SessionStore"}
+        assert usage["turunan"][1] == {"config", "multiplex_profiles"}
+        assert usage["tak_langsung"][1] == {"_secret_getter"}
+        assert usage["sah"][1] - covered("sah") == set() and usage["murni"][1] == set()
+        assert [p for p in usage["asing"][2] if p not in UPSTREAM_OBJECT_PARAMS | PLAIN_DATA_PARAMS] == ["penyedia"]
+
+    def test_no_other_plugin_module_reads_gateway_adapters_or_config_internals(self):
+        import ast
+        offenders = {}
+        for path in sorted(S.PLUGIN_DIR.glob("*.py")):
+            if path.name == "upstream.py":
+                continue
+            names = set()
+            for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+                if isinstance(node, ast.Attribute) and node.attr == "adapters":
+                    names.add("adapters")
+                elif isinstance(node, ast.Constant) and node.value == "adapters":
+                    names.add("adapters")
+            if names:
+                offenders[path.name] = sorted(names)
+        assert offenders == {}, f"`gateway.adapters` hanya boleh dibaca lewat upstream.discord_adapter: {offenders}"
+
+    def test_data_attribute_probe_searches_the_listed_sources(self, tmp_path, monkeypatch):
+        pkg = tmp_path / "gateway"
+        pkg.mkdir()
+        (pkg / "__init__.py").write_text("")
+        (pkg / "run.py").write_text("class GatewayRunner:\n    def f(self):\n        return self.config.profile_routes\n")
+        monkeypatch.setattr(sys, "path", [str(tmp_path)])
+        probe = upstreammod._probe
+        assert probe(("gateway.run", "gateway.config"), "GatewayRunner.config", "profile_routes")["available"] is True
+        assert probe(("gateway.run",), "GatewayRunner.config", "rute_yang_hilang")["available"] is False
+        (pkg / "config.py").write_text("class GatewayConfig:\n    rute_yang_hilang: list = []\n")
+        assert probe(("gateway.run", "gateway.config"), "GatewayRunner.config", "rute_yang_hilang")["available"] is True
+
+    def test_discord_adapter_lookup_prefers_the_source_platform_then_any_discord(self, env):
+        up = upstreammod.HermesGateway()
+        assert up.discord_adapter(env.runner, S.DISCORD) is env.adapter
+        assert up.discord_adapter(env.runner, S.TELEGRAM) is env.adapter and up.discord_adapter(env.runner) is env.adapter
+        for gateway in (None, object(), type("G", (), {"adapters": None})(), type("G", (), {"adapters": []})()):
+            assert up.discord_adapter(gateway, S.DISCORD) is None
+
+
+# ============================================================================= audit: anggaran tidak ditegakkan
+class TestBudgetNotEnforcedIsVisible(ScaleBase):
+    @pytest.fixture
+    def ledger(self, d):
+        path = self.env.state_dir / "usage.db"
+        self.env.roster["usage"] = {"timezone": "UTC", "ledger": str(path)}
+        self.env.set("settings", daily_token_budget=1000, rate_per_minute=0)
+        return path
+
+    def caps(self):
+        path = self.env.state_dir / "capabilities.json"
+        return json.loads(path.read_text())["capabilities"] if path.exists() else {}
+
+    def test_unreadable_ledger_is_logged_once_and_surfaced(self, d, ledger, caplog):
+        """Regresi: buku besar tidak terbaca → penegakan dilewati tanpa jejak di metrik/kapabilitas."""
+        ledger.write_bytes(b"bukan sqlite sama sekali" * 50)
+        with caplog.at_level(logging.WARNING, logger="team-guard"):
+            for _ in range(4):
+                assert self.go(d, event(S.U_BUDI, S.CH_BUDI)) is None         # tetap tidak memblokir
+                self.clock.advance(61)
+        assert sum("anggaran token TIDAK ditegakkan" in r.getMessage() for r in caplog.records) == 1
+        assert self.rt.budget.ledger_ok is False and "tidak terbaca" in self.rt.budget.ledger_error
+        entry = self.caps()["budget.ledger"]
+        assert entry["available"] is False and "tidak terbaca" in entry["reason"]
+        assert scale.build_metrics(self.rt, self.env.runner, d.probe)["budget"]["stale"] is True   # seketika
+
+    def test_missing_ledger_file_and_missing_roster_section_are_surfaced(self, d, ledger):
+        assert self.go(d, event(S.U_BUDI, S.CH_BUDI)) is None                 # berkas belum ada
+        assert self.caps()["budget.ledger"]["available"] is False and self.rt.budget.ledger_ok is False
+        self.env.roster["usage"] = {}
+        self.env.save()
+        self.clock.advance(61)
+        assert self.go(d, event(S.U_BUDI, S.CH_BUDI)) is None
+        assert "usage.ledger" in self.caps()["budget.ledger"]["reason"]
+
+    def test_recovery_is_recorded_and_enforcement_resumes(self, d, ledger):
+        ledger.write_bytes(b"rusak" * 100)
+        assert self.go(d, event(S.U_BUDI, S.CH_BUDI)) is None
+        assert self.caps()["budget.ledger"]["available"] is False
+        ledger.unlink()
+        S.ledger_add(ledger, TODAY, S.U_BUDI, 600, 600)
+        self.clock.advance(61)
+        assert self.go(d, event(S.U_BUDI, S.CH_BUDI))["action"] == "skip"
+        assert self.rt.budget.ledger_ok is True and self.caps()["budget.ledger"]["available"] is True
+
+    def test_readable_ledger_reports_healthy_and_metrics_keep_their_keys(self, d, ledger):
+        S.ledger_add(ledger, TODAY, S.U_BE1, 10, 10)
+        assert self.go(d, event(S.U_BUDI, S.CH_BUDI)) is None
+        assert self.rt.budget.ledger_ok is True and self.caps()["budget.ledger"]["available"] is True
+        budget_part = scale.build_metrics(self.rt, self.env.runner, d.probe)["budget"]
+        assert set(budget_part) == {"day", "used_by_user", "team_used", "stale", "last_collect"}
+
+    def test_no_budget_configured_means_no_health_entry_and_no_stale_flag(self, d):
+        self.env.roster["usage"] = {"timezone": "UTC", "ledger": str(self.env.state_dir / "tidak-ada.db")}
+        self.env.set("settings", rate_per_minute=0)
+        assert self.go(d, event(S.U_BUDI, S.CH_BUDI)) is None
+        metrics = scale.build_metrics(self.rt, self.env.runner, d.probe)
+        assert metrics["budget"]["stale"] is False and self.rt.budget.ledger_ok is None
+        assert "budget.ledger" not in self.caps()
+
+    def test_monitor_snapshot_alone_surfaces_an_unreadable_ledger(self, d, ledger):
+        ledger.write_bytes(b"rusak" * 100)
+        assert scale.build_metrics(self.rt, self.env.runner, d.probe)["budget"]["stale"] is True
+        assert self.caps()["budget.ledger"]["available"] is False

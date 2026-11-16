@@ -15,6 +15,7 @@ from typing import Any, Optional, Union
 import hermes_team as ht
 
 from .confirm import Plan, PlanFn, _clean, _q
+from .discord_guard import _untrusted_block
 from .errors import ToolError
 from .registry import tool
 
@@ -275,7 +276,10 @@ def usage_report(ctl, args: dict) -> str:
                          fmt=str(args.get("format") or "markdown"), people=people, tz=tz)
     except ul.LedgerError as exc:
         raise ToolError(str(exc))
-    return text + note
+    # Label orang di laporan = nama tampilan (dari nick Discord) atau, untuk pemakai tak dikenal, kunci user yang
+    # dibaca dari state.db profile — keduanya bisa ditulis anggota → data berlabel, untuk semua format (termasuk json).
+    return _untrusted_block(f"laporan pemakaian LLM (format {_clean(args.get('format') or 'markdown', 12)})",
+                            text + note)
 
 
 @tool(
@@ -331,7 +335,7 @@ def set_usage_budget_extra(ctl, args: dict) -> PlanFn:
         def run() -> str:
             ctl._require_same_day(team, day)
             ctl._write_override(team, member["user_id"], day, extra)
-            return (f"Jatah token {member['display_name']} untuk {day} sekarang "
+            return (f"Jatah token {_q(member['display_name'], 64)} untuk {day} sekarang "
                     f"{_tokens(base + extra)} (batas harian {_tokens(base)} + tambahan {_tokens(extra)}). "
                     "Plugin membacanya dalam ±1 menit; hari berikutnya kembali ke batas harian. "
                     "Anggaran tim tidak berubah.")
@@ -373,7 +377,7 @@ def clear_usage_budget_extra(ctl, args: dict) -> PlanFn:
         def run() -> str:
             ctl._require_same_day(team, day)
             ctl._write_override(team, member["user_id"], day, None)
-            return (f"Tambahan jatah token {member['display_name']} untuk {day} dicabut "
+            return (f"Tambahan jatah token {_q(member['display_name'], 64)} untuk {day} dicabut "
                     f"(sebelumnya +{_tokens(previous)}).")
 
         return Plan(team, preview, run, member=member["name"], user=member["user_id"], day=day,

@@ -180,6 +180,10 @@ def _plugin(path: str, type: str, default: Any, desc: str, key: str = "", sectio
     return Field(path, type, default, desc, plugin_key=key or path.rpartition(".")[2], plugin_section=section, **kw)
 
 
+def _optional_note(kind: str) -> str:
+    return " Jenis opsional: tanpa blok ini jenis itu tidak dipakai tim." if PROFILE_KINDS[kind].optional else ""
+
+
 def _build_fields() -> tuple[Field, ...]:
     """Seluruh tabel. Baris per jenis profile (`<kind>.*`, `llm.<kind>_model`) DIBANGUN dari registri
     kit.profiles setiap dipanggil, jadi jenis yang terdaftar ikut dapat blok + baris model tanpa baris manual."""
@@ -198,8 +202,11 @@ def _build_fields() -> tuple[Field, ...]:
     _row("template_profile", "profile", _prefixed("template"), "Profile sumber clone untuk profile pribadi.",
          team_key="template"),
     *(f for kind in SYSTEM_KINDS for f in (
-        _row(f"{kind}.profile", "profile", f"team-{kind}", f"Nama profile {kind}."),
-        _row(f"{kind}.channel_id", "id", None, f"ID channel profile {kind}."),
+        _row(f"{kind}.profile", "profile", f"team-{kind}", f"Nama profile {kind}." + _optional_note(kind)),
+        # Jenis `optional` (kit.profiles.ProfileKind.optional): blok boleh tidak ada → jenis tidak diprovisi.
+        # Bila bloknya diisi, channel_id tetap wajib (lihat parse_section).
+        _row(f"{kind}.channel_id", "id", "" if PROFILE_KINDS[kind].optional else None,
+             f"ID channel profile {kind}." + _optional_note(kind)),
         _row(f"{kind}.auto_skills", "strs", [], f"Skill yang dimuat tiap sesi baru di channel {kind}."),
     )),
     _row("team_skills_dir", "str", "", "Folder skill tim (read-only untuk anggota); kosong = tidak ada."),
@@ -237,6 +244,8 @@ def _build_fields() -> tuple[Field, ...]:
     _row("sandbox.network", "str", "", "Jaringan Docker untuk sandbox; kosong = bawaan."),
     _row("sandbox.http_proxy", "str", "", "Proxy HTTP(S) untuk sandbox; kosong = tanpa proxy."),
     _row("sandbox.no_proxy", "str", "localhost,127.0.0.1,::1", "Daftar NO_PROXY sandbox.", strip=False),
+    _row("sandbox.allow_unmanaged", "bool", False, "BERBAHAYA. true = apply/onboarding tetap jalan walau "
+         "/etc/hermes/config.yaml belum mem-pin sandbox Docker (anggota bisa mendapat shell HOST)."),
     # --- scale (sebagian ditegakkan plugin lewat roster.json → settings)
     _plugin("scale.max_concurrent_sessions", "int", 8, "Slot sesi aktif bersamaan untuk anggota (seluruh gateway).",
             key="max_active", min=0),
@@ -344,7 +353,7 @@ def rebuild_schema() -> None:
     assert len(FIELD_BY_PATH) == len(FIELDS), "path ganda di FIELDS"
     SECTIONS = {
         "roles": Section(),
-        **{kind: Section() for kind in SYSTEM_KINDS},
+        **{kind: Section(falsy_ok=PROFILE_KINDS[kind].optional) for kind in SYSTEM_KINDS},
         "threads": Section(hint=True),
         "sandbox": Section(),
         "scale": Section(),
@@ -480,6 +489,10 @@ def parse_section(section: str, raw: Any, ctx: Optional[dict] = None) -> dict:
                             f"{', '.join(known) if section != 'usage.reports' else ', '.join(REPORT_KINDS)})")
     ctx = ctx if ctx is not None else {}
     out: dict = {}
+    if not mapping and section in SYSTEM_KINDS and PROFILE_KINDS[section].optional:
+        # Jenis opsional yang tidak dikonfigurasi: blok kosong ("" / []) supaya `team[kind]` tetap ada untuk
+        # kode lama, tetapi kit.profiles.active_system_kinds(team) tidak memuatnya → tidak diprovisi.
+        return {f.path: ([] if f.type == "strs" else "") for f in fields_in(section)}
     for f in fields_in(section):
         if f.type == "custom":
             continue

@@ -51,6 +51,7 @@ Key yang salah ketik tidak diabaikan diam-diam: `check`, `apply`, dan `status` m
 | `sandbox.network` | str | `""` |  | Jaringan Docker untuk sandbox; kosong = bawaan. |
 | `sandbox.http_proxy` | str | `""` |  | Proxy HTTP(S) untuk sandbox; kosong = tanpa proxy. |
 | `sandbox.no_proxy` | str | `"localhost,127.0.0.1,::1"` |  | Daftar NO_PROXY sandbox. |
+| `sandbox.allow_unmanaged` | bool | `false` |  | BERBAHAYA. true = apply/onboarding tetap jalan walau /etc/hermes/config.yaml belum mem-pin sandbox Docker (anggota bisa mendapat shell HOST). |
 | `scale.max_concurrent_sessions` | int | `8` | settings.max_active | Slot sesi aktif bersamaan untuk anggota (seluruh gateway). |
 | `scale.admin_reserved_slots` | int | `2` |  | Slot tambahan khusus admin (tidak ikut antre). |
 | `scale.user_rate_per_minute` | int | `6` | settings.rate_per_minute | Pesan per menit per orang (0 = tanpa batas). |
