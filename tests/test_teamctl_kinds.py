@@ -66,7 +66,7 @@ def test_registered_kind_channel_refuses_rename_and_permission_removal(tc, ops):
 
 def test_admin_role_kind_channel_blocks_assign_role_like_the_builtin_admin_channel(tc, register_kind):
     """Penjaga channel admin mengikuti `role="admin"` di registri: role yang membuka channel jenis itu tidak bisa diberikan."""
-    from teamctl_helpers import overwrite, set_overwrites, mutating
+    from teamctl_helpers import overwrite, mutating
     from teamctl.discord_guard import VIEW
     register_kind(kit_profiles.ProfileKind(
         "oncall", ht.SOUL_SHARED, kit_profiles._shared_settings, needs_channel=True, reserved=True,

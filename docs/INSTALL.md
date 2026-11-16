@@ -295,8 +295,10 @@ python3 $H apply --dry-run        # lihat apa yang akan dilakukan, tanpa menguba
 python3 $H apply                  # pertama kali: beberapa menit
 ```
 
-`apply` membuat profile template, shared, admin, dan anggota; menulis rute gateway; memasang plugin
-`team-guard`. Aman diulang: hanya nilai yang berbeda yang ditulis.
+`apply` pertama membuat profile template, shared, admin, dan anggota serta memasang plugin `team-guard`, tetapi BELUM
+menulis rute gateway dan roster: selama `/etc/hermes/config.yaml` belum mem-pin sandbox Docker, `apply` berhenti dengan
+pesan "BELUM SELESAI" (kode keluar 0) dan mencetak perintah `sudo … managed --install` persisnya. Rute ditulis oleh
+`apply` kedua di bawah. Aman diulang: hanya nilai yang berbeda yang ditulis.
 
 Pasang kebijakan *managed* (dipin untuk semua profile, tidak bisa diubah anggota). Perintah ini
 menjalankan kode kit sebagai root, jadi kit harus berada di tempat milik root dan tidak bisa ditulis
@@ -411,6 +413,7 @@ Bila semua lolos, mulai beri role `backend` ke anggota tim.
 | Semua onboarding "ditahan" | Bot tidak punya **View Audit Log** | Tambah izin itu, atau set `onboarding.verify_actor: false` (siapa pun yang bisa memberi role dipercaya) |
 | Channel pribadi tidak dibuat | Tidak ada Manage Channels di kategori, atau kategori sudah 50 channel | Periksa izin kategori; buat kategori baru dan ganti `category_id` |
 | Sambutan tidak muncul, admin diminta `/restart` | Live reload gagal diverifikasi (biasanya setelah update Hermes) | Jalankan `/restart` sekali, lalu `bash tests/selftest.sh` dan laporkan uji yang gagal |
+| `apply` / onboarding: "ditolak: /etc/hermes/config.yaml belum ada / tidak mem-pin terminal.backend: docker" | Managed config belum terpasang atau diubah | Jalankan perintah `sudo … managed --install` yang dicetak, lalu `apply` |
 | `apply` menolak key di `llm.providers` | API key ditulis di `team.yaml` | Pindahkan ke `/etc/hermes/.env`, pakai `key_env` |
 | AI menjawab "tidak ada kredensial" | `TD_API_KEY` tidak terbaca | Nama variabel = `key_env`; berkas `/etc/hermes/.env` grup `hermes`, mode 0640 |
 | Perintah terminal gagal di sandbox | User `hermes` bukan anggota grup `docker`, atau image belum ada | `id hermes`; `docker images` |

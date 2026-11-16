@@ -22,7 +22,7 @@ for _p in (str(KIT), str(HERE)):
         sys.path.insert(0, _p)
 
 import fake_discord as fd  # noqa: E402
-import hermes_team as ht  # noqa: E402
+import hermes_team as ht  # noqa: E402, F401  (diekspor ulang untuk berkas uji lain)
 import teamctl_mcp as tm  # noqa: E402
 
 TOKEN = "FAKE-bot-token-JANGAN-BOCOR-0123456789"

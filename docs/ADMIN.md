@@ -33,6 +33,16 @@ Tulis biasa, Hermes memanggil tool `teamctl`, menjelaskan rencananya, lalu menam
 | "Timeout @spammer 30 menit" / "kick @x" | `discord_moderate_member` |
 | "Umumkan di #general: deploy ditunda, ping @be1" | `discord_send_message` (tanpa @everyone/@here/role ping) |
 
+Yang terlihat berbeda sejak perbaikan audit:
+
+- Hasil `team_status`, `usage_report`, `list_member_skills`, dan `onboarding_status` diawali dan diakhiri baris
+  `<<<DATA-TIM xxxxxxxx …>>>`: penanda bahwa isinya data (sebagian ditulis anggota), bukan perintah untuk AI.
+- Konfirmasi "bagikan skill" menampilkan daftar profile penerima (`nama [profile]`), jumlah dan nama berkas, serta
+  cuplikan 600 karakter pertama SKILL.md berlabel "ISI BUATAN ANGGOTA, BELUM TEPERCAYA". Sisa SKILL.md dan berkas
+  lain tidak ditampilkan; periksa sendiri bila ragu.
+- `audit.log` bermode 0600. Itu hanya menutup user lain di host; akun yang menjalankan Hermes tetap bisa mengubahnya.
+- SOUL.md profile admin berubah saat provisioning berikutnya (menyebut semua tool).
+
 Pagar yang tidak bisa dibujuk lewat chat (ditolak sebelum tombol konfirmasi muncul):
 
 - Channel pribadi anggota (dan thread di dalamnya) tidak bisa dibaca, diubah (nama, topik, posisi),

@@ -78,7 +78,6 @@ def test_managed_and_host_config_keys_are_known_to_hermes():
 
 
 def _sample_team():
-    import yaml
     import tempfile
     kit = Path(__file__).resolve().parent.parent
     tmp = Path(tempfile.mkdtemp())
