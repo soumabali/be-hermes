@@ -12,6 +12,8 @@ yang tersisa. Centang hanya setelah perintahnya benar-benar dijalankan dan kelua
 | Titik masuk jalan dari salinan lain / `python -I` | `tests/test_entrypoints.py` |
 | `sandbox_idle` memakai Docker dengan benar: hentikan yang diam, biarkan yang sibuk, tidak pernah `rm` | Dijalankan terhadap container berlabel sungguhan (Docker 29.9.2); lihat docstring `tools/sandbox_idle.py` |
 | POST dan PATCH tidak diulang pada 5xx Discord | `tests/test_kit_units.py` (`test_post_is_not_retried_on_5xx`, `test_patch_is_not_retried_on_5xx`) |
+| Installer Hermes sungguhan menerima perintah persis seperti yang dirangkai wizard (user tanpa sudo, lingkungan bersih), commit `HERMES_REF` dihormati, launcher ada di `~/.local/bin/hermes`, dan semua subperintah/flag Hermes yang dipakai kit ada | CI job wajib `installer-contract` (`tools/hermes_contract.py`). Gateway TIDAK dijalankan di sana |
+| Kit lulus uji terhadap Hermes pada commit yang sama dengan yang dipasang wizard | `HERMES_REF` dibaca CI dan wizard; job `integration (pinned)` |
 
 ## B. Menunggu server uji (butuh Discord, Hermes, systemd, Docker sungguhan)
 
